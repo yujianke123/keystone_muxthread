@@ -53,6 +53,18 @@ unsigned long sbi_sm_resume_enclave(struct sbi_trap_regs *regs, unsigned long ei
   return 0;
 }
 
+unsigned long sbi_sm_enter_slot(unsigned long *out_val, unsigned long eid, unsigned long slot_id, unsigned long flags)
+{
+  (void) eid;
+  (void) slot_id;
+  (void) flags;
+
+  if (out_val)
+    *out_val = 0;
+
+  return SBI_ERR_SM_NOT_IMPLEMENTED;
+}
+
 unsigned long sbi_sm_exit_enclave(struct sbi_trap_regs *regs, unsigned long retval)
 {
   regs->a0 = exit_enclave(regs, cpu_get_enclave_id());

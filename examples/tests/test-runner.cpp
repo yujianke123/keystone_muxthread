@@ -7,6 +7,7 @@
 #include <iostream>
 #include "edge_wrapper.h"
 #include "host/keystone.h"
+#include "shared/sm_err.h"
 #include "verifier/report.h"
 #include "verifier/test_dev_key.h"
 
@@ -55,16 +56,18 @@ copy_report(void* buffer) {
 
 int
 main(int argc, char** argv) {
-  if (argc < 4 || argc > 9) {
+  if (argc < 4 || argc > 10) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
-        "SIZE(K)] [--time] [--load-only] [--utm-ptr 0xPTR] [--retval EXPECTED]\n",
+        "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] [--utm-ptr 0xPTR] "
+        "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
   }
 
   int self_timing = 0;
   int load_only   = 0;
+  int enter_slot_stub = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -74,6 +77,7 @@ main(int argc, char** argv) {
   static struct option long_options[] = {
       {"time", no_argument, &self_timing, 1},
       {"load-only", no_argument, &load_only, 1},
+      {"enter-slot-stub", no_argument, &enter_slot_stub, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -118,6 +122,22 @@ main(int argc, char** argv) {
   }
 
   enclave.init(eapp_file, rt_file, ld_file, params);
+
+  if (enter_slot_stub) {
+    uintptr_t enter_slot_status = 0;
+    uintptr_t enter_slot_value = 0;
+    Keystone::Error enter_slot_ret = enclave.enterSlot(1, &enter_slot_status, &enter_slot_value);
+    if (enter_slot_ret != Keystone::Error::Success) {
+      printf("[FAIL] ENTER_SLOT ioctl failed\n");
+      return 1;
+    }
+    printf("ENTER_SLOT stub returned %lu value %lu\n", enter_slot_status, enter_slot_value);
+    if (enter_slot_status != SBI_ERR_SM_NOT_IMPLEMENTED) {
+      printf("[FAIL] ENTER_SLOT stub returned unexpected status (%lu != %u)\n",
+          enter_slot_status, SBI_ERR_SM_NOT_IMPLEMENTED);
+      return 1;
+    }
+  }
 
   if (self_timing) {
     asm volatile("rdcycle %0" : "=r"(cycles2));

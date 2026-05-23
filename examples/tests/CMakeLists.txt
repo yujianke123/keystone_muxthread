@@ -70,7 +70,10 @@ target_link_libraries(test-data-sealing ${KEYSTONE_LIB_EAPP} ${KEYSTONE_LIB_EDGE
 set(test_script_tmp ${CMAKE_CURRENT_BINARY_DIR}/tmp/run-test.sh)
 set(test_script ${CMAKE_CURRENT_BINARY_DIR}/run-test.sh)
 
-file(WRITE ${test_script_tmp} "")
+file(WRITE ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-stub\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-stack eyrie-rt loader.bin --load-only --enter-slot-stub\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
 foreach (test IN ITEMS ${all_test_bins})
   file(APPEND ${test_script_tmp} "echo 'testing ${test}'\n")
   if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${test}/retval)

@@ -66,6 +66,7 @@ class Enclave {
       uintptr_t alternatePhysAddr);
   Error destroy();
   Error run(uintptr_t* ret = nullptr);
+  Error enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value = nullptr);
 };
 
 uint64_t

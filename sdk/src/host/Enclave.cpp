@@ -252,6 +252,11 @@ Enclave::run(uintptr_t* retval) {
   return Error::Success;
 }
 
+Error
+Enclave::enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value) {
+  return pDevice->enterSlot(slotId, status, value);
+}
+
 void*
 Enclave::getSharedBuffer() {
   return shared_buffer;

@@ -3,6 +3,7 @@
 // All Rights Reserved. See LICENSE for license details.
 //------------------------------------------------------------------------------
 #include "KeystoneDevice.hpp"
+#include "shared/sm_err.h"
 #include <sys/mman.h>
 
 namespace Keystone {
@@ -122,6 +123,29 @@ KeystoneDevice::resume(uintptr_t* ret) {
   return __run(true, ret);
 }
 
+Error
+KeystoneDevice::enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value) {
+  struct keystone_ioctl_enter_slot encl;
+  encl.eid     = eid;
+  encl.slot_id = slotId;
+  encl.flags   = 0;
+  encl.error   = 0;
+  encl.value   = 0;
+
+  if (ioctl(fd, KEYSTONE_IOC_ENTER_SLOT, &encl)) {
+    return Error::IoctlErrorEnterSlot;
+  }
+
+  if (status) {
+    *status = encl.error;
+  }
+  if (value) {
+    *value = encl.value;
+  }
+
+  return Error::Success;
+}
+
 void*
 KeystoneDevice::map(uintptr_t addr, size_t size) {
   assert(fd >= 0);
@@ -172,6 +196,19 @@ MockKeystoneDevice::run(uintptr_t* ret) {
 
 Error
 MockKeystoneDevice::resume(uintptr_t* ret) {
+  return Error::Success;
+}
+
+Error
+MockKeystoneDevice::enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value) {
+  (void) slotId;
+
+  if (status) {
+    *status = SBI_ERR_SM_NOT_IMPLEMENTED;
+  }
+  if (value) {
+    *value = 0;
+  }
   return Error::Success;
 }
 
