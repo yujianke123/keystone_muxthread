@@ -72,6 +72,7 @@ KeystoneDevice::destroy() {
     return Error::IoctlErrorDestroy;
   }
 
+  eid = -1;
   return Error::Success;
 }
 

@@ -25,6 +25,19 @@ extern void save_host_regs(void);
 extern void restore_host_regs(void);
 extern byte dev_public_key[PUBLIC_KEY_SIZE];
 
+static void clear_enclave_slot_leases(enclave_id eid)
+{
+  size_t slot;
+
+  enclaves[eid].next_slot_lease_id = 1;
+  for(slot = 0; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    enclaves[eid].slot_leases[slot].slot_id = slot;
+    enclaves[eid].slot_leases[slot].lease_id = 0;
+    enclaves[eid].slot_leases[slot].epoch = 0;
+    enclaves[eid].slot_leases[slot].state = SLOT_LEASE_FREE;
+  }
+}
+
 /****************************
  *
  * Enclave utility functions
@@ -154,6 +167,7 @@ void enclave_init_metadata(void){
     for(i=0; i < ENCLAVE_REGIONS_MAX; i++){
       enclaves[eid].regions[i].type = REGION_INVALID;
     }
+    clear_enclave_slot_leases(eid);
     /* Fire all platform specific init for each enclave */
     platform_init_enclave(&(enclaves[eid]));
   }
@@ -399,6 +413,7 @@ unsigned long create_enclave(unsigned long *eidptr, struct keystone_sbi_create_t
 #endif
   enclaves[eid].n_thread = 0;
   enclaves[eid].params = params;
+  clear_enclave_slot_leases(eid);
 
   /* Init enclave state (regs etc) */
   clean_state(&enclaves[eid].threads[0]);
@@ -495,6 +510,7 @@ unsigned long destroy_enclave(enclave_id eid)
   enclaves[eid].encl_satp = 0;
   enclaves[eid].n_thread = 0;
   enclaves[eid].params = (struct runtime_params_t) {0};
+  clear_enclave_slot_leases(eid);
   for(i=0; i < ENCLAVE_REGIONS_MAX; i++){
     enclaves[eid].regions[i].type = REGION_INVALID;
   }
@@ -503,6 +519,40 @@ unsigned long destroy_enclave(enclave_id eid)
   encl_free_eid(eid);
 
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+unsigned long reserve_enclave_slot(enclave_id eid, uintptr_t slot_id, uintptr_t *lease_id)
+{
+  unsigned long ret = SBI_ERR_SM_NOT_IMPLEMENTED;
+  struct slot_lease_t *lease;
+
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+
+  if (!ENCLAVE_EXISTS(eid) || enclaves[eid].state < FRESH) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+    goto out;
+  }
+
+  lease = &enclaves[eid].slot_leases[slot_id];
+  if (lease->state != SLOT_LEASE_FREE) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  lease->slot_id = slot_id;
+  lease->lease_id = enclaves[eid].next_slot_lease_id++;
+  lease->epoch = 0;
+  lease->state = SLOT_LEASE_RESERVED;
+
+  if (lease_id)
+    *lease_id = lease->lease_id;
+
+out:
+  spin_unlock(&encl_lock);
+  return ret;
 }
 
 unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid)

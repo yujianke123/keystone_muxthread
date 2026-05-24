@@ -77,7 +77,8 @@ main(int argc, char** argv) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
-        "[--enter-slot-negative] [--utm-ptr 0xPTR] "
+        "[--enter-slot-negative] [--enter-slot-lease] "
+        "[--enter-slot-destroy-recreate] [--utm-ptr 0xPTR] "
         "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -87,6 +88,8 @@ main(int argc, char** argv) {
   int load_only   = 0;
   int enter_slot_stub = 0;
   int enter_slot_negative = 0;
+  int enter_slot_lease = 0;
+  int enter_slot_destroy_recreate = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -98,6 +101,8 @@ main(int argc, char** argv) {
       {"load-only", no_argument, &load_only, 1},
       {"enter-slot-stub", no_argument, &enter_slot_stub, 1},
       {"enter-slot-negative", no_argument, &enter_slot_negative, 1},
+      {"enter-slot-lease", no_argument, &enter_slot_lease, 1},
+      {"enter-slot-destroy-recreate", no_argument, &enter_slot_destroy_recreate, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -177,6 +182,71 @@ main(int argc, char** argv) {
             enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
       return 1;
     }
+
+    enter_slot_ret = enclave.enterSlot(SLOTTEE_MAX_SLOTS, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT range", enter_slot_ret, enter_slot_status,
+            enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+  }
+
+  if (enter_slot_lease) {
+    uintptr_t enter_slot_status = 0;
+    uintptr_t first_lease = 0;
+    Keystone::Error enter_slot_ret = enclave.enterSlot(1, &enter_slot_status, &first_lease);
+    if (expect_enter_slot_status("ENTER_SLOT lease first", enter_slot_ret, enter_slot_status,
+            first_lease, SBI_ERR_SM_NOT_IMPLEMENTED)) {
+      return 1;
+    }
+    if (first_lease == 0) {
+      printf("[FAIL] ENTER_SLOT lease first returned zero lease id\n");
+      return 1;
+    }
+
+    uintptr_t second_value = 0;
+    enter_slot_ret = enclave.enterSlot(1, &enter_slot_status, &second_value);
+    if (expect_enter_slot_status("ENTER_SLOT lease duplicate", enter_slot_ret,
+            enter_slot_status, second_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+  }
+
+  if (enter_slot_destroy_recreate) {
+    uintptr_t enter_slot_status = 0;
+    uintptr_t first_lease = 0;
+    Keystone::Error enter_slot_ret = enclave.enterSlot(1, &enter_slot_status, &first_lease);
+    if (expect_enter_slot_status("ENTER_SLOT recreate first", enter_slot_ret,
+            enter_slot_status, first_lease, SBI_ERR_SM_NOT_IMPLEMENTED)) {
+      return 1;
+    }
+    if (first_lease == 0) {
+      printf("[FAIL] ENTER_SLOT recreate first returned zero lease id\n");
+      return 1;
+    }
+
+    if (enclave.destroy() != Keystone::Error::Success) {
+      printf("[FAIL] failed to destroy first enclave\n");
+      return 1;
+    }
+
+    Keystone::Enclave recreated;
+    if (recreated.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+      printf("[FAIL] failed to recreate enclave\n");
+      return 1;
+    }
+
+    uintptr_t recreated_lease = 0;
+    enter_slot_ret = recreated.enterSlot(1, &enter_slot_status, &recreated_lease);
+    if (expect_enter_slot_status("ENTER_SLOT recreate second", enter_slot_ret,
+            enter_slot_status, recreated_lease, SBI_ERR_SM_NOT_IMPLEMENTED)) {
+      return 1;
+    }
+    if (recreated_lease == 0) {
+      printf("[FAIL] ENTER_SLOT recreate second returned zero lease id\n");
+      return 1;
+    }
+
+    return 0;
   }
 
   if (self_timing) {

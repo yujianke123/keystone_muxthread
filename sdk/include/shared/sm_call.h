@@ -20,6 +20,7 @@
 
 #define SLOTTEE_ENTER_SLOT_VERSION     1
 #define SLOTTEE_ENTER_SLOT_FLAG_NONE   0
+#define SLOTTEE_MAX_SLOTS              8
 
 /* 3000-3999 are called by enclave */
 #define SBI_SM_RANDOM            3001

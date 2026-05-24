@@ -33,6 +33,19 @@ typedef enum {
 /* For now, eid's are a simple unsigned int */
 typedef unsigned int enclave_id;
 
+typedef enum {
+  SLOT_LEASE_FREE = 0,
+  SLOT_LEASE_RESERVED = 1,
+} slot_lease_state;
+
+struct slot_lease_t
+{
+  uintptr_t slot_id;
+  uintptr_t lease_id;
+  uintptr_t epoch;
+  slot_lease_state state;
+};
+
 /* Metadata around memory regions associate with this enclave
  * EPM is the 'home' for the enclave, contains runtime code/etc
  * UTM is the untrusted shared pages
@@ -74,6 +87,9 @@ struct enclave
   unsigned int n_thread;
   struct thread_state threads[MAX_ENCL_THREADS];
 
+  uintptr_t next_slot_lease_id;
+  struct slot_lease_t slot_leases[SLOTTEE_MAX_SLOTS];
+
   struct platform_enclave_data ped;
 };
 
@@ -112,6 +128,7 @@ unsigned long create_enclave(unsigned long *eid, struct keystone_sbi_create_t cr
 unsigned long destroy_enclave(enclave_id eid);
 unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid);
+unsigned long reserve_enclave_slot(enclave_id eid, uintptr_t slot_id, uintptr_t *lease_id);
 // callables from the enclave
 unsigned long exit_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave_id eid);
