@@ -18,6 +18,9 @@
 #define SBI_SM_ENTER_SLOT        2006
 #define FID_RANGE_HOST           2999
 
+#define SLOTTEE_ENTER_SLOT_VERSION     1
+#define SLOTTEE_ENTER_SLOT_FLAG_NONE   0
+
 /* 3000-3999 are called by enclave */
 #define SBI_SM_RANDOM            3001
 #define SBI_SM_ATTEST_ENCLAVE    3002
@@ -65,6 +68,32 @@ struct keystone_sbi_create_t {
   uintptr_t user_paddr;
   uintptr_t free_paddr;
   uintptr_t free_requested;
+};
+
+struct slot_cap_t {
+  uintptr_t version;
+  uintptr_t eid;
+  uintptr_t slot_id;
+  uintptr_t epoch;
+  uintptr_t rights;
+  uintptr_t max_lease_cycles;
+  uintptr_t cap_mac[4];
+};
+
+struct enter_slot_req_t {
+  uintptr_t version;
+  struct slot_cap_t cap;
+  uintptr_t flags;
+  uintptr_t host_nonce;
+  uintptr_t rt_nonce;
+};
+
+struct enter_slot_resp_t {
+  uintptr_t status;
+  uintptr_t value;
+  uintptr_t lease_id;
+  uintptr_t bound_hart;
+  uintptr_t expiry_cycle;
 };
 
 #endif  // __SM_CALL_H__

@@ -257,6 +257,18 @@ Enclave::enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value) {
   return pDevice->enterSlot(slotId, status, value);
 }
 
+Error
+Enclave::enterSlot(uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value) {
+  return pDevice->enterSlot(slotId, flags, status, value);
+}
+
+Error
+Enclave::enterSlotWithVersion(
+    uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+    uintptr_t* value) {
+  return pDevice->enterSlotWithVersion(version, slotId, flags, status, value);
+}
+
 void*
 Enclave::getSharedBuffer() {
   return shared_buffer;

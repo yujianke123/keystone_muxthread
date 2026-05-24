@@ -47,6 +47,11 @@ class KeystoneDevice {
   virtual Error run(uintptr_t* ret);
   virtual Error resume(uintptr_t* ret);
   virtual Error enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value);
+  virtual Error enterSlot(
+      uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value);
+  virtual Error enterSlotWithVersion(
+      uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t* value);
   virtual void* map(uintptr_t addr, size_t size);
 };
 
@@ -68,6 +73,10 @@ class MockKeystoneDevice : public KeystoneDevice {
   Error run(uintptr_t* ret);
   Error resume(uintptr_t* ret);
   Error enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value);
+  Error enterSlot(uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value);
+  Error enterSlotWithVersion(
+      uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t* value);
   void* map(uintptr_t addr, size_t size);
 };
 

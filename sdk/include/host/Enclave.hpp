@@ -67,6 +67,11 @@ class Enclave {
   Error destroy();
   Error run(uintptr_t* ret = nullptr);
   Error enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value = nullptr);
+  Error enterSlot(
+      uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value = nullptr);
+  Error enterSlotWithVersion(
+      uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t* value = nullptr);
 };
 
 uint64_t

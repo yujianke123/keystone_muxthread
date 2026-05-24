@@ -54,12 +54,30 @@ copy_report(void* buffer) {
   }
 }
 
+static int
+expect_enter_slot_status(const char* label, Keystone::Error ret, uintptr_t status,
+    uintptr_t value, uintptr_t expected) {
+  if (ret != Keystone::Error::Success) {
+    printf("[FAIL] %s ioctl failed\n", label);
+    return 1;
+  }
+
+  printf("%s returned %lu value %lu\n", label, status, value);
+  if (status != expected) {
+    printf("[FAIL] %s returned unexpected status (%lu != %lu)\n", label, status, expected);
+    return 1;
+  }
+
+  return 0;
+}
+
 int
 main(int argc, char** argv) {
   if (argc < 4 || argc > 10) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
-        "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] [--utm-ptr 0xPTR] "
+        "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
+        "[--enter-slot-negative] [--utm-ptr 0xPTR] "
         "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -68,6 +86,7 @@ main(int argc, char** argv) {
   int self_timing = 0;
   int load_only   = 0;
   int enter_slot_stub = 0;
+  int enter_slot_negative = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -78,6 +97,7 @@ main(int argc, char** argv) {
       {"time", no_argument, &self_timing, 1},
       {"load-only", no_argument, &load_only, 1},
       {"enter-slot-stub", no_argument, &enter_slot_stub, 1},
+      {"enter-slot-negative", no_argument, &enter_slot_negative, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -127,14 +147,34 @@ main(int argc, char** argv) {
     uintptr_t enter_slot_status = 0;
     uintptr_t enter_slot_value = 0;
     Keystone::Error enter_slot_ret = enclave.enterSlot(1, &enter_slot_status, &enter_slot_value);
-    if (enter_slot_ret != Keystone::Error::Success) {
-      printf("[FAIL] ENTER_SLOT ioctl failed\n");
+    if (expect_enter_slot_status("ENTER_SLOT stub", enter_slot_ret, enter_slot_status,
+            enter_slot_value, SBI_ERR_SM_NOT_IMPLEMENTED)) {
       return 1;
     }
-    printf("ENTER_SLOT stub returned %lu value %lu\n", enter_slot_status, enter_slot_value);
-    if (enter_slot_status != SBI_ERR_SM_NOT_IMPLEMENTED) {
-      printf("[FAIL] ENTER_SLOT stub returned unexpected status (%lu != %u)\n",
-          enter_slot_status, SBI_ERR_SM_NOT_IMPLEMENTED);
+  }
+
+  if (enter_slot_negative) {
+    uintptr_t enter_slot_status = 0;
+    uintptr_t enter_slot_value = 0;
+    Keystone::Error enter_slot_ret =
+        enclave.enterSlot(0, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT slot0", enter_slot_ret, enter_slot_status,
+            enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+
+    enter_slot_ret = enclave.enterSlot(
+        1, SLOTTEE_ENTER_SLOT_FLAG_NONE + 1, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT flags", enter_slot_ret, enter_slot_status,
+            enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+
+    enter_slot_ret = enclave.enterSlotWithVersion(
+        SLOTTEE_ENTER_SLOT_VERSION + 1, 1, SLOTTEE_ENTER_SLOT_FLAG_NONE,
+        &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT version", enter_slot_ret, enter_slot_status,
+            enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
       return 1;
     }
   }

@@ -53,14 +53,23 @@ unsigned long sbi_sm_resume_enclave(struct sbi_trap_regs *regs, unsigned long ei
   return 0;
 }
 
-unsigned long sbi_sm_enter_slot(unsigned long *out_val, unsigned long eid, unsigned long slot_id, unsigned long flags)
+unsigned long sbi_sm_enter_slot(
+    unsigned long *out_val, unsigned long eid, unsigned long version, unsigned long slot_id,
+    unsigned long flags)
 {
   (void) eid;
-  (void) slot_id;
-  (void) flags;
 
   if (out_val)
     *out_val = 0;
+
+  if (version != SLOTTEE_ENTER_SLOT_VERSION)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (slot_id == 0)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (flags != SLOTTEE_ENTER_SLOT_FLAG_NONE)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   return SBI_ERR_SM_NOT_IMPLEMENTED;
 }
