@@ -69,8 +69,11 @@ class Enclave {
   Error enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value = nullptr);
   Error enterSlot(
       uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value = nullptr);
+  Error enterSlotWithEpoch(
+      uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t* value = nullptr);
   Error enterSlotWithVersion(
-      uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
       uintptr_t* value = nullptr);
 };
 

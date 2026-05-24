@@ -55,7 +55,7 @@ unsigned long sbi_sm_resume_enclave(struct sbi_trap_regs *regs, unsigned long ei
 
 unsigned long sbi_sm_enter_slot(
     unsigned long *out_val, unsigned long eid, unsigned long version, unsigned long slot_id,
-    unsigned long flags)
+    unsigned long epoch, unsigned long flags)
 {
   uintptr_t lease_id = 0;
   unsigned long ret;
@@ -72,7 +72,7 @@ unsigned long sbi_sm_enter_slot(
   if (flags != SLOTTEE_ENTER_SLOT_FLAG_NONE)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
-  ret = reserve_enclave_slot((enclave_id) eid, slot_id, &lease_id);
+  ret = reserve_enclave_slot((enclave_id) eid, slot_id, epoch, &lease_id);
   if (out_val)
     *out_val = lease_id;
 

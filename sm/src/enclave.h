@@ -88,6 +88,7 @@ struct enclave
   struct thread_state threads[MAX_ENCL_THREADS];
 
   uintptr_t next_slot_lease_id;
+  uintptr_t current_slot_epoch;
   struct slot_lease_t slot_leases[SLOTTEE_MAX_SLOTS];
 
   struct platform_enclave_data ped;
@@ -128,7 +129,8 @@ unsigned long create_enclave(unsigned long *eid, struct keystone_sbi_create_t cr
 unsigned long destroy_enclave(enclave_id eid);
 unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid);
-unsigned long reserve_enclave_slot(enclave_id eid, uintptr_t slot_id, uintptr_t *lease_id);
+unsigned long reserve_enclave_slot(
+    enclave_id eid, uintptr_t slot_id, uintptr_t epoch, uintptr_t *lease_id);
 // callables from the enclave
 unsigned long exit_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave_id eid);

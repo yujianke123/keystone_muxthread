@@ -263,10 +263,17 @@ Enclave::enterSlot(uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr
 }
 
 Error
-Enclave::enterSlotWithVersion(
-    uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+Enclave::enterSlotWithEpoch(
+    uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
     uintptr_t* value) {
-  return pDevice->enterSlotWithVersion(version, slotId, flags, status, value);
+  return pDevice->enterSlotWithEpoch(epoch, slotId, flags, status, value);
+}
+
+Error
+Enclave::enterSlotWithVersion(
+    uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+    uintptr_t* value) {
+  return pDevice->enterSlotWithVersion(version, epoch, slotId, flags, status, value);
 }
 
 void*

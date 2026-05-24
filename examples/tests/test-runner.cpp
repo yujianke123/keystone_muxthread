@@ -78,7 +78,8 @@ main(int argc, char** argv) {
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
         "[--enter-slot-negative] [--enter-slot-lease] "
-        "[--enter-slot-destroy-recreate] [--utm-ptr 0xPTR] "
+        "[--enter-slot-destroy-recreate] [--enter-slot-epoch] "
+        "[--enter-slot-multislot] [--utm-ptr 0xPTR] "
         "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -90,6 +91,8 @@ main(int argc, char** argv) {
   int enter_slot_negative = 0;
   int enter_slot_lease = 0;
   int enter_slot_destroy_recreate = 0;
+  int enter_slot_epoch = 0;
+  int enter_slot_multislot = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -103,6 +106,8 @@ main(int argc, char** argv) {
       {"enter-slot-negative", no_argument, &enter_slot_negative, 1},
       {"enter-slot-lease", no_argument, &enter_slot_lease, 1},
       {"enter-slot-destroy-recreate", no_argument, &enter_slot_destroy_recreate, 1},
+      {"enter-slot-epoch", no_argument, &enter_slot_epoch, 1},
+      {"enter-slot-multislot", no_argument, &enter_slot_multislot, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -176,7 +181,7 @@ main(int argc, char** argv) {
     }
 
     enter_slot_ret = enclave.enterSlotWithVersion(
-        SLOTTEE_ENTER_SLOT_VERSION + 1, 1, SLOTTEE_ENTER_SLOT_FLAG_NONE,
+        SLOTTEE_ENTER_SLOT_VERSION + 1, SLOTTEE_INITIAL_EPOCH, 1, SLOTTEE_ENTER_SLOT_FLAG_NONE,
         &enter_slot_status, &enter_slot_value);
     if (expect_enter_slot_status("ENTER_SLOT version", enter_slot_ret, enter_slot_status,
             enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
@@ -207,6 +212,61 @@ main(int argc, char** argv) {
     enter_slot_ret = enclave.enterSlot(1, &enter_slot_status, &second_value);
     if (expect_enter_slot_status("ENTER_SLOT lease duplicate", enter_slot_ret,
             enter_slot_status, second_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+  }
+
+  if (enter_slot_epoch) {
+    uintptr_t enter_slot_status = 0;
+    uintptr_t enter_slot_value = 0;
+    Keystone::Error enter_slot_ret = enclave.enterSlotWithEpoch(
+        SLOTTEE_INITIAL_EPOCH + 1, 1, SLOTTEE_ENTER_SLOT_FLAG_NONE,
+        &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT epoch stale", enter_slot_ret, enter_slot_status,
+            enter_slot_value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+      return 1;
+    }
+
+    enter_slot_ret = enclave.enterSlot(
+        1, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT epoch valid", enter_slot_ret, enter_slot_status,
+            enter_slot_value, SBI_ERR_SM_NOT_IMPLEMENTED)) {
+      return 1;
+    }
+    if (enter_slot_value == 0) {
+      printf("[FAIL] ENTER_SLOT epoch valid returned zero lease id\n");
+      return 1;
+    }
+  }
+
+  if (enter_slot_multislot) {
+    uintptr_t enter_slot_status = 0;
+    uintptr_t slot1_lease = 0;
+    uintptr_t slot2_lease = 0;
+
+    Keystone::Error enter_slot_ret = enclave.enterSlot(1, &enter_slot_status, &slot1_lease);
+    if (expect_enter_slot_status("ENTER_SLOT multislot slot1", enter_slot_ret,
+            enter_slot_status, slot1_lease, SBI_ERR_SM_NOT_IMPLEMENTED)) {
+      return 1;
+    }
+    if (slot1_lease == 0) {
+      printf("[FAIL] ENTER_SLOT multislot slot1 returned zero lease id\n");
+      return 1;
+    }
+
+    enter_slot_ret = enclave.enterSlot(2, &enter_slot_status, &slot2_lease);
+    if (expect_enter_slot_status("ENTER_SLOT multislot slot2", enter_slot_ret,
+            enter_slot_status, slot2_lease, SBI_ERR_SM_NOT_IMPLEMENTED)) {
+      return 1;
+    }
+    if (slot2_lease == 0 || slot2_lease == slot1_lease) {
+      printf("[FAIL] ENTER_SLOT multislot slot2 returned invalid lease id\n");
+      return 1;
+    }
+
+    enter_slot_ret = enclave.enterSlot(1, &enter_slot_status, &slot1_lease);
+    if (expect_enter_slot_status("ENTER_SLOT multislot duplicate", enter_slot_ret,
+            enter_slot_status, slot1_lease, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
       return 1;
     }
   }

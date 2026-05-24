@@ -126,23 +126,33 @@ KeystoneDevice::resume(uintptr_t* ret) {
 
 Error
 KeystoneDevice::enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value) {
-  return enterSlot(slotId, SLOTTEE_ENTER_SLOT_FLAG_NONE, status, value);
+  return enterSlotWithEpoch(
+      SLOTTEE_INITIAL_EPOCH, slotId, SLOTTEE_ENTER_SLOT_FLAG_NONE, status, value);
 }
 
 Error
 KeystoneDevice::enterSlot(
     uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value) {
-  return enterSlotWithVersion(SLOTTEE_ENTER_SLOT_VERSION, slotId, flags, status, value);
+  return enterSlotWithEpoch(SLOTTEE_INITIAL_EPOCH, slotId, flags, status, value);
+}
+
+Error
+KeystoneDevice::enterSlotWithEpoch(
+    uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+    uintptr_t* value) {
+  return enterSlotWithVersion(
+      SLOTTEE_ENTER_SLOT_VERSION, epoch, slotId, flags, status, value);
 }
 
 Error
 KeystoneDevice::enterSlotWithVersion(
-    uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
-    uintptr_t* value) {
+    uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags,
+    uintptr_t* status, uintptr_t* value) {
   struct keystone_ioctl_enter_slot encl;
   encl.eid      = eid;
   encl.version  = version;
   encl.slot_id  = slotId;
+  encl.epoch    = epoch;
   encl.flags    = flags;
   encl.error    = 0;
   encl.value    = 0;
@@ -216,23 +226,34 @@ MockKeystoneDevice::resume(uintptr_t* ret) {
 
 Error
 MockKeystoneDevice::enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value) {
-  return enterSlot(slotId, SLOTTEE_ENTER_SLOT_FLAG_NONE, status, value);
+  return enterSlotWithEpoch(
+      SLOTTEE_INITIAL_EPOCH, slotId, SLOTTEE_ENTER_SLOT_FLAG_NONE, status, value);
 }
 
 Error
 MockKeystoneDevice::enterSlot(
     uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value) {
-  return enterSlotWithVersion(SLOTTEE_ENTER_SLOT_VERSION, slotId, flags, status, value);
+  return enterSlotWithEpoch(SLOTTEE_INITIAL_EPOCH, slotId, flags, status, value);
+}
+
+Error
+MockKeystoneDevice::enterSlotWithEpoch(
+    uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+    uintptr_t* value) {
+  return enterSlotWithVersion(
+      SLOTTEE_ENTER_SLOT_VERSION, epoch, slotId, flags, status, value);
 }
 
 Error
 MockKeystoneDevice::enterSlotWithVersion(
-    uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
-    uintptr_t* value) {
+    uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags,
+    uintptr_t* status, uintptr_t* value) {
   if (status) {
     if (version != SLOTTEE_ENTER_SLOT_VERSION || slotId == 0 ||
-        flags != SLOTTEE_ENTER_SLOT_FLAG_NONE) {
+        slotId >= SLOTTEE_MAX_SLOTS || flags != SLOTTEE_ENTER_SLOT_FLAG_NONE) {
       *status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    } else if (epoch != SLOTTEE_INITIAL_EPOCH) {
+      *status = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
     } else {
       *status = SBI_ERR_SM_NOT_IMPLEMENTED;
     }

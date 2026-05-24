@@ -49,8 +49,11 @@ class KeystoneDevice {
   virtual Error enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value);
   virtual Error enterSlot(
       uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value);
+  virtual Error enterSlotWithEpoch(
+      uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t* value);
   virtual Error enterSlotWithVersion(
-      uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
       uintptr_t* value);
   virtual void* map(uintptr_t addr, size_t size);
 };
@@ -74,8 +77,11 @@ class MockKeystoneDevice : public KeystoneDevice {
   Error resume(uintptr_t* ret);
   Error enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value);
   Error enterSlot(uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value);
+  Error enterSlotWithEpoch(
+      uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t* value);
   Error enterSlotWithVersion(
-      uintptr_t version, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
       uintptr_t* value);
   void* map(uintptr_t addr, size_t size);
 };

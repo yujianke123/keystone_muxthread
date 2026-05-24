@@ -30,6 +30,7 @@ static void clear_enclave_slot_leases(enclave_id eid)
   size_t slot;
 
   enclaves[eid].next_slot_lease_id = 1;
+  enclaves[eid].current_slot_epoch = SLOTTEE_INITIAL_EPOCH;
   for(slot = 0; slot < SLOTTEE_MAX_SLOTS; slot++) {
     enclaves[eid].slot_leases[slot].slot_id = slot;
     enclaves[eid].slot_leases[slot].lease_id = 0;
@@ -521,7 +522,8 @@ unsigned long destroy_enclave(enclave_id eid)
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
 }
 
-unsigned long reserve_enclave_slot(enclave_id eid, uintptr_t slot_id, uintptr_t *lease_id)
+unsigned long reserve_enclave_slot(
+    enclave_id eid, uintptr_t slot_id, uintptr_t epoch, uintptr_t *lease_id)
 {
   unsigned long ret = SBI_ERR_SM_NOT_IMPLEMENTED;
   struct slot_lease_t *lease;
@@ -536,6 +538,11 @@ unsigned long reserve_enclave_slot(enclave_id eid, uintptr_t slot_id, uintptr_t 
     goto out;
   }
 
+  if (epoch != enclaves[eid].current_slot_epoch) {
+    ret = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
+    goto out;
+  }
+
   lease = &enclaves[eid].slot_leases[slot_id];
   if (lease->state != SLOT_LEASE_FREE) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
@@ -544,7 +551,7 @@ unsigned long reserve_enclave_slot(enclave_id eid, uintptr_t slot_id, uintptr_t 
 
   lease->slot_id = slot_id;
   lease->lease_id = enclaves[eid].next_slot_lease_id++;
-  lease->epoch = 0;
+  lease->epoch = epoch;
   lease->state = SLOT_LEASE_RESERVED;
 
   if (lease_id)

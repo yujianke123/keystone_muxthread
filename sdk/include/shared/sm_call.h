@@ -19,6 +19,7 @@
 #define FID_RANGE_HOST           2999
 
 #define SLOTTEE_ENTER_SLOT_VERSION     1
+#define SLOTTEE_INITIAL_EPOCH          1
 #define SLOTTEE_ENTER_SLOT_FLAG_NONE   0
 #define SLOTTEE_MAX_SLOTS              8
 

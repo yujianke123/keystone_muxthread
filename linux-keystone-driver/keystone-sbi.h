@@ -15,6 +15,7 @@ struct sbiret sbi_sm_destroy_enclave(unsigned long eid);
 struct sbiret sbi_sm_run_enclave(unsigned long eid);
 struct sbiret sbi_sm_resume_enclave(unsigned long eid);
 struct sbiret sbi_sm_enter_slot(
-    unsigned long eid, unsigned long version, unsigned long slot_id, unsigned long flags);
+    unsigned long eid, unsigned long version, unsigned long slot_id, unsigned long epoch,
+    unsigned long flags);
 
 #endif

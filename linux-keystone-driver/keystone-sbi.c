@@ -25,8 +25,9 @@ struct sbiret sbi_sm_resume_enclave(unsigned long eid) {
 }
 
 struct sbiret sbi_sm_enter_slot(
-    unsigned long eid, unsigned long version, unsigned long slot_id, unsigned long flags) {
+    unsigned long eid, unsigned long version, unsigned long slot_id, unsigned long epoch,
+    unsigned long flags) {
   return sbi_ecall(SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE,
       SBI_SM_ENTER_SLOT,
-      eid, version, slot_id, flags, 0, 0);
+      eid, version, slot_id, epoch, flags, 0);
 }
