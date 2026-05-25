@@ -31,6 +31,7 @@ get_host_string() {
 }
 
 static struct report_t report;
+static const uintptr_t enter_slot_bench_iters = 3;
 
 void
 print_hex(void* buffer, size_t len) {
@@ -94,16 +95,165 @@ wait_for_enter_slot_ttl(uintptr_t cycles) {
   } while ((now - start) < cycles);
 }
 
+static uintptr_t
+read_cycle_counter() {
+  uintptr_t cycles = 0;
+
+  asm volatile("rdcycle %0" : "=r"(cycles));
+  return cycles;
+}
+
+static int
+expect_enter_slot_bench_row(const char* bench, uintptr_t iter, Keystone::Error ret,
+    uintptr_t status, uintptr_t value, uintptr_t expected, uintptr_t cycles) {
+  printf("%s,%lu,%lu,%lu,%lu\n", bench, iter, status, value, cycles);
+  fflush(stdout);
+
+  if (ret != Keystone::Error::Success) {
+    printf("[FAIL] %s bench ioctl failed at iter %lu\n", bench, iter);
+    return 1;
+  }
+
+  if (status != expected) {
+    printf("[FAIL] %s bench iter %lu returned unexpected status (%lu != %lu)\n",
+        bench, iter, status, expected);
+    return 1;
+  }
+
+  return 0;
+}
+
+static int
+init_enter_slot_bench_enclave(Keystone::Enclave& enclave, const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params) {
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT bench failed to init enclave\n");
+    return 1;
+  }
+
+  return 0;
+}
+
+static int
+run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params) {
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  printf("bench,iter,status,value,cycles\n");
+  fflush(stdout);
+
+  for (uintptr_t iter = 0; iter < enter_slot_bench_iters; iter++) {
+    Keystone::Enclave enclave;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+
+    if (init_enter_slot_bench_enclave(enclave, eapp_file, rt_file, ld_file, params))
+      return 1;
+
+    uintptr_t start = read_cycle_counter();
+    Keystone::Error ret = enclave.enterSlot(1, &status, &value);
+    uintptr_t cycles = read_cycle_counter() - start;
+
+    if (expect_enter_slot_bench_row("null_enter", iter, ret, status, value,
+            SBI_ERR_SM_NOT_IMPLEMENTED, cycles)) {
+      enclave.destroy();
+      return 1;
+    }
+  }
+
+  for (uintptr_t iter = 0; iter < enter_slot_bench_iters; iter++) {
+    Keystone::Enclave enclave;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+
+    if (init_enter_slot_bench_enclave(enclave, eapp_file, rt_file, ld_file, params))
+      return 1;
+
+    Keystone::Error ret = enclave.enterSlot(1, &status, &value);
+    if (ret != Keystone::Error::Success || status != SBI_ERR_SM_NOT_IMPLEMENTED) {
+      printf("[FAIL] ENTER_SLOT duplicate bench setup failed at iter %lu\n", iter);
+      enclave.destroy();
+      return 1;
+    }
+
+    value = 0;
+    uintptr_t start = read_cycle_counter();
+    ret = enclave.enterSlot(1, &status, &value);
+    uintptr_t cycles = read_cycle_counter() - start;
+
+    if (expect_enter_slot_bench_row("duplicate_reject", iter, ret, status, value,
+            SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT, cycles)) {
+      enclave.destroy();
+      return 1;
+    }
+  }
+
+  for (uintptr_t iter = 0; iter < enter_slot_bench_iters; iter++) {
+    Keystone::Enclave enclave;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+
+    if (init_enter_slot_bench_enclave(enclave, eapp_file, rt_file, ld_file, params))
+      return 1;
+
+    uintptr_t start = read_cycle_counter();
+    Keystone::Error ret = enclave.enterSlotWithEpoch(
+        SLOTTEE_INITIAL_EPOCH + 1, 1, SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value);
+    uintptr_t cycles = read_cycle_counter() - start;
+
+    if (expect_enter_slot_bench_row("stale_epoch_reject", iter, ret, status, value,
+            SBI_ERR_SM_ENCLAVE_NOT_FRESH, cycles)) {
+      enclave.destroy();
+      return 1;
+    }
+  }
+
+  for (uintptr_t iter = 0; iter < enter_slot_bench_iters; iter++) {
+    Keystone::Enclave enclave;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+    slot_cap_t cap = make_enter_slot_test_cap(1);
+    cap.max_lease_cycles = SLOTTEE_TEST_MAX_LEASE_CYCLES;
+
+    if (init_enter_slot_bench_enclave(enclave, eapp_file, rt_file, ld_file, params))
+      return 1;
+
+    Keystone::Error ret = enclave.enterSlotWithCap(
+        cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value);
+    if (ret != Keystone::Error::Success || status != SBI_ERR_SM_NOT_IMPLEMENTED) {
+      printf("[FAIL] ENTER_SLOT revoke replay bench setup failed at iter %lu\n", iter);
+      enclave.destroy();
+      return 1;
+    }
+
+    wait_for_enter_slot_ttl(SLOTTEE_TEST_MAX_LEASE_CYCLES * 32);
+
+    value = 0;
+    uintptr_t start = read_cycle_counter();
+    ret = enclave.enterSlotWithCap(
+        cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value);
+    uintptr_t cycles = read_cycle_counter() - start;
+
+    if (expect_enter_slot_bench_row("revoke_replay_reject", iter, ret, status, value,
+            SBI_ERR_SM_ENCLAVE_NOT_FRESH, cycles)) {
+      enclave.destroy();
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
 int
 main(int argc, char** argv) {
-  if (argc < 4 || argc > 11) {
+  if (argc < 4 || argc > 12) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
         "[--enter-slot-negative] [--enter-slot-lease] "
         "[--enter-slot-destroy-recreate] [--enter-slot-epoch] "
         "[--enter-slot-multislot] [--enter-slot-capability] "
-        "[--enter-slot-revoke-replay] [--utm-ptr 0xPTR] "
+        "[--enter-slot-revoke-replay] [--enter-slot-bench] [--utm-ptr 0xPTR] "
         "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -119,6 +269,7 @@ main(int argc, char** argv) {
   int enter_slot_multislot = 0;
   int enter_slot_capability = 0;
   int enter_slot_revoke_replay = 0;
+  int enter_slot_bench = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -136,6 +287,7 @@ main(int argc, char** argv) {
       {"enter-slot-multislot", no_argument, &enter_slot_multislot, 1},
       {"enter-slot-capability", no_argument, &enter_slot_capability, 1},
       {"enter-slot-revoke-replay", no_argument, &enter_slot_revoke_replay, 1},
+      {"enter-slot-bench", no_argument, &enter_slot_bench, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -168,12 +320,17 @@ main(int argc, char** argv) {
     }
   }
 
-  Keystone::Enclave enclave;
   Keystone::Params params;
   unsigned long cycles1, cycles2, cycles3, cycles4;
 
   params.setFreeMemSize(freemem_size);
   params.setUntrustedSize(untrusted_size);
+
+  if (enter_slot_bench) {
+    return run_enter_slot_bench(eapp_file, rt_file, ld_file, params);
+  }
+
+  Keystone::Enclave enclave;
 
   if (self_timing) {
     asm volatile("rdcycle %0" : "=r"(cycles1));
