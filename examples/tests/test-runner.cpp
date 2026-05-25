@@ -3,6 +3,7 @@
 // All Rights Reserved. See LICENSE for license details.
 //------------------------------------------------------------------------------
 #include <getopt.h>
+#include <pthread.h>
 #include <cstdio>
 #include <iostream>
 #include "edge_wrapper.h"
@@ -32,6 +33,7 @@ get_host_string() {
 
 static struct report_t report;
 static const uintptr_t enter_slot_bench_iters = 3;
+static const uintptr_t enter_slot_pool_workers = 2;
 
 void
 print_hex(void* buffer, size_t len) {
@@ -277,16 +279,97 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
   return 0;
 }
 
+struct enter_slot_pool_worker_arg {
+  const char* eapp_file;
+  const char* rt_file;
+  const char* ld_file;
+  Keystone::Params params;
+  uintptr_t slot_id;
+  Keystone::Error ret;
+  uintptr_t status;
+  uintptr_t value;
+};
+
+static void*
+enter_slot_pool_worker(void* opaque) {
+  enter_slot_pool_worker_arg* arg = (enter_slot_pool_worker_arg*)opaque;
+  Keystone::Enclave enclave;
+
+  arg->ret = Keystone::Error::DeviceError;
+  arg->status = 0;
+  arg->value = 0;
+
+  if (enclave.init(arg->eapp_file, arg->rt_file, arg->ld_file, arg->params) !=
+      Keystone::Error::Success) {
+    return NULL;
+  }
+
+  arg->ret = enclave.enterSlot(
+      arg->slot_id, SLOTTEE_ENTER_SLOT_FLAG_REAL, &arg->status, &arg->value);
+  enclave.destroy();
+  return NULL;
+}
+
+static int
+run_enter_slot_pthread_pool(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  pthread_t threads[enter_slot_pool_workers];
+  enter_slot_pool_worker_arg args[enter_slot_pool_workers];
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  printf("pool_worker,slot,status,value\n");
+  fflush(stdout);
+
+  for (uintptr_t worker = 0; worker < enter_slot_pool_workers; worker++) {
+    args[worker].eapp_file = eapp_file;
+    args[worker].rt_file = rt_file;
+    args[worker].ld_file = ld_file;
+    args[worker].params = params;
+    args[worker].slot_id = worker + 1;
+    args[worker].ret = Keystone::Error::DeviceError;
+    args[worker].status = 0;
+    args[worker].value = 0;
+
+    if (pthread_create(&threads[worker], NULL, enter_slot_pool_worker, &args[worker]) != 0) {
+      printf("[FAIL] ENTER_SLOT pthread pool failed to create worker %lu\n", worker);
+      return 1;
+    }
+  }
+
+  for (uintptr_t worker = 0; worker < enter_slot_pool_workers; worker++) {
+    if (pthread_join(threads[worker], NULL) != 0) {
+      printf("[FAIL] ENTER_SLOT pthread pool failed to join worker %lu\n", worker);
+      return 1;
+    }
+  }
+
+  for (uintptr_t worker = 0; worker < enter_slot_pool_workers; worker++) {
+    printf("pool_worker,%lu,%lu,%lu\n",
+        args[worker].slot_id, args[worker].status, args[worker].value);
+    if (expect_enter_slot_status("ENTER_SLOT pthread pool", args[worker].ret,
+            args[worker].status, args[worker].value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+        expect_enter_slot_bench_value(
+            "pthread_pool", worker, args[worker].value, SLOTTEE_SLOT_MAGIC)) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
 int
 main(int argc, char** argv) {
-  if (argc < 4 || argc > 13) {
+  if (argc < 4 || argc > 14) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
         "[--enter-slot-real] [--enter-slot-negative] [--enter-slot-lease] "
         "[--enter-slot-destroy-recreate] [--enter-slot-epoch] "
         "[--enter-slot-multislot] [--enter-slot-capability] "
-        "[--enter-slot-revoke-replay] [--enter-slot-bench] [--utm-ptr 0xPTR] "
+        "[--enter-slot-revoke-replay] [--enter-slot-bench] "
+        "[--enter-slot-pthread-pool] [--utm-ptr 0xPTR] "
         "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -304,6 +387,7 @@ main(int argc, char** argv) {
   int enter_slot_capability = 0;
   int enter_slot_revoke_replay = 0;
   int enter_slot_bench = 0;
+  int enter_slot_pthread_pool = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -323,6 +407,7 @@ main(int argc, char** argv) {
       {"enter-slot-capability", no_argument, &enter_slot_capability, 1},
       {"enter-slot-revoke-replay", no_argument, &enter_slot_revoke_replay, 1},
       {"enter-slot-bench", no_argument, &enter_slot_bench, 1},
+      {"enter-slot-pthread-pool", no_argument, &enter_slot_pthread_pool, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -363,6 +448,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_bench) {
     return run_enter_slot_bench(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_pthread_pool) {
+    return run_enter_slot_pthread_pool(eapp_file, rt_file, ld_file, params);
   }
 
   Keystone::Enclave enclave;

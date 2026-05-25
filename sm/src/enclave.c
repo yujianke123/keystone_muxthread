@@ -711,7 +711,7 @@ unsigned long activate_enclave_slot(
   if (!cap)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
-  if (cap->slot_id != 1)
+  if (cap->slot_id == 0 || cap->slot_id >= SLOTTEE_MAX_SLOTS)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   spin_lock(&encl_lock);
@@ -772,9 +772,9 @@ out:
 }
 
 void enter_activated_enclave_slot(
-    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t lease_id)
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id)
 {
-  context_switch_to_enclave(regs, eid, 1, lease_id);
+  context_switch_to_enclave(regs, eid, 1, SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id));
 }
 
 unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid)
@@ -828,7 +828,7 @@ unsigned long exit_enclave_slot(
   int exitable;
   struct slot_lease_t *lease;
 
-  if (slot_id != 1)
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   spin_lock(&encl_lock);

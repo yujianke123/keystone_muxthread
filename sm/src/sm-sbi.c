@@ -87,7 +87,7 @@ unsigned long sbi_sm_enter_slot(
     if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
       return ret;
 
-    enter_activated_enclave_slot(regs, (enclave_id) eid, resp.lease_id);
+    enter_activated_enclave_slot(regs, (enclave_id) eid, req.cap.slot_id, resp.lease_id);
     regs->mepc += 4;
     sbi_trap_exit(regs);
     return 0;

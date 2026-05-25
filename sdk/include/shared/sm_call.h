@@ -28,6 +28,14 @@
 #define SLOTTEE_TEST_MAX_LEASE_CYCLES  1024
 #define SLOTTEE_CAP_MAC_WORDS          4
 #define SLOTTEE_MAX_SLOTS              8
+#define SLOTTEE_SLOT_TOKEN_SLOT_BITS   8
+#define SLOTTEE_SLOT_TOKEN_SLOT_MASK   (((uintptr_t)1 << SLOTTEE_SLOT_TOKEN_SLOT_BITS) - 1)
+#define SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id) \
+  ((((uintptr_t)(lease_id)) << SLOTTEE_SLOT_TOKEN_SLOT_BITS) | ((uintptr_t)(slot_id)))
+#define SLOTTEE_SLOT_TOKEN_SLOT_ID(token) \
+  ((uintptr_t)(token) & SLOTTEE_SLOT_TOKEN_SLOT_MASK)
+#define SLOTTEE_SLOT_TOKEN_LEASE_ID(token) \
+  ((uintptr_t)(token) >> SLOTTEE_SLOT_TOKEN_SLOT_BITS)
 #define SLOTTEE_SLOT_EXIT_NORMAL       0
 #define SLOTTEE_SLOT_MAGIC             0x51515151
 

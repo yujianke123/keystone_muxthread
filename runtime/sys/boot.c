@@ -23,7 +23,7 @@ size_t utm_size;
 
 /* defined in entry.S */
 extern void* encl_trap_handler;
-void slottee_slot_trampoline(uintptr_t lease_id);
+void slottee_slot_trampoline(uintptr_t slot_token);
 
 int verify_and_load_elf_file(uintptr_t ptr, size_t file_size, bool is_eapp) {
   int ret = 0;

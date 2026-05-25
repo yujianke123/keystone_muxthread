@@ -110,6 +110,10 @@ file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-bench\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-stack eyrie-rt loader.bin --load-only --enter-slot-bench\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-pthread-pool\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-stack eyrie-rt loader.bin --load-only --enter-slot-pthread-pool\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
 foreach (test IN ITEMS ${all_test_bins})
   file(APPEND ${test_script_tmp} "echo 'testing ${test}'\n")
   if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${test}/retval)
@@ -132,7 +136,7 @@ set_target_properties(${all_test_bins}
 # host
 
 add_executable(${host_bin} ${host_src})
-target_link_libraries(${host_bin} ${KEYSTONE_LIB_HOST} ${KEYSTONE_LIB_EDGE} ${KEYSTONE_LIB_VERIFIER})
+target_link_libraries(${host_bin} ${KEYSTONE_LIB_HOST} ${KEYSTONE_LIB_EDGE} ${KEYSTONE_LIB_VERIFIER} pthread)
 
 # add target for Eyrie runtime (see keystone.cmake)
 
