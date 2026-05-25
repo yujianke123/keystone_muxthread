@@ -25,6 +25,22 @@ extern void save_host_regs(void);
 extern void restore_host_regs(void);
 extern byte dev_public_key[PUBLIC_KEY_SIZE];
 
+static uintptr_t read_cycle(void)
+{
+  uintptr_t cycle;
+
+  asm volatile ("rdcycle %0" : "=r" (cycle));
+  return cycle;
+}
+
+static uintptr_t slot_lease_expiry(uintptr_t now, uintptr_t ttl)
+{
+  if (((uintptr_t)-1) - now < ttl)
+    return (uintptr_t)-1;
+
+  return now + ttl;
+}
+
 static void clear_enclave_slot_leases(enclave_id eid)
 {
   size_t slot;
@@ -42,6 +58,47 @@ static void clear_enclave_slot_leases(enclave_id eid)
     enclaves[eid].slot_leases[slot].expiry_cycle = 0;
     enclaves[eid].slot_leases[slot].state = SLOT_LEASE_FREE;
   }
+}
+
+static void revoke_enclave_slot_lease(struct slot_lease_t *lease)
+{
+  lease->rights = 0;
+  lease->max_lease_cycles = 0;
+  lease->state = SLOT_LEASE_REVOKED;
+}
+
+static void revoke_all_enclave_slot_leases(enclave_id eid)
+{
+  size_t slot;
+  int revoked = 0;
+
+  for(slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    if (enclaves[eid].slot_leases[slot].state == SLOT_LEASE_RESERVED) {
+      revoke_enclave_slot_lease(&enclaves[eid].slot_leases[slot]);
+      revoked = 1;
+    }
+  }
+
+  if (revoked)
+    enclaves[eid].current_slot_epoch++;
+}
+
+static void reclaim_expired_enclave_slot_leases(enclave_id eid, uintptr_t now)
+{
+  size_t slot;
+  int revoked = 0;
+
+  for(slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    struct slot_lease_t *lease = &enclaves[eid].slot_leases[slot];
+
+    if (lease->state == SLOT_LEASE_RESERVED && now >= lease->expiry_cycle) {
+      revoke_enclave_slot_lease(lease);
+      revoked = 1;
+    }
+  }
+
+  if (revoked)
+    enclaves[eid].current_slot_epoch++;
 }
 
 /****************************
@@ -482,6 +539,9 @@ unsigned long destroy_enclave(enclave_id eid)
   if(!destroyable)
     return SBI_ERR_SM_ENCLAVE_NOT_DESTROYABLE;
 
+  spin_lock(&encl_lock);
+  revoke_all_enclave_slot_leases(eid);
+  spin_unlock(&encl_lock);
 
   // 0. Let the platform specifics do cleanup/modifications
   platform_destroy_enclave(&enclaves[eid]);
@@ -544,6 +604,7 @@ unsigned long reserve_enclave_slot(
 {
   unsigned long ret = SBI_ERR_SM_NOT_IMPLEMENTED;
   struct slot_lease_t *lease;
+  uintptr_t now;
 
   if (!cap)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
@@ -558,6 +619,9 @@ unsigned long reserve_enclave_slot(
     goto out;
   }
 
+  now = read_cycle();
+  reclaim_expired_enclave_slot_leases(eid, now);
+
   if (cap->eid != eid || cap->epoch != enclaves[eid].current_slot_epoch) {
     ret = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
     goto out;
@@ -570,7 +634,7 @@ unsigned long reserve_enclave_slot(
   }
 
   lease = &enclaves[eid].slot_leases[cap->slot_id];
-  if (lease->state != SLOT_LEASE_FREE) {
+  if (lease->state == SLOT_LEASE_RESERVED) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
@@ -582,7 +646,7 @@ unsigned long reserve_enclave_slot(
   lease->rights = cap->rights;
   lease->max_lease_cycles = cap->max_lease_cycles;
   lease->bound_hart = csr_read(mhartid);
-  lease->expiry_cycle = cap->max_lease_cycles;
+  lease->expiry_cycle = slot_lease_expiry(now, cap->max_lease_cycles);
   lease->state = SLOT_LEASE_RESERVED;
 
   if (resp) {

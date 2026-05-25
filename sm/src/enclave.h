@@ -36,6 +36,7 @@ typedef unsigned int enclave_id;
 typedef enum {
   SLOT_LEASE_FREE = 0,
   SLOT_LEASE_RESERVED = 1,
+  SLOT_LEASE_REVOKED = 2,
 } slot_lease_state;
 
 struct slot_lease_t

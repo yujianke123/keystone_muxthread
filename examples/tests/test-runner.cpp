@@ -83,15 +83,27 @@ make_enter_slot_test_cap(uintptr_t slot_id) {
   return cap;
 }
 
+static void
+wait_for_enter_slot_ttl(uintptr_t cycles) {
+  uintptr_t start = 0;
+  uintptr_t now = 0;
+
+  asm volatile("rdcycle %0" : "=r"(start));
+  do {
+    asm volatile("rdcycle %0" : "=r"(now));
+  } while ((now - start) < cycles);
+}
+
 int
 main(int argc, char** argv) {
-  if (argc < 4 || argc > 10) {
+  if (argc < 4 || argc > 11) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
         "[--enter-slot-negative] [--enter-slot-lease] "
         "[--enter-slot-destroy-recreate] [--enter-slot-epoch] "
-        "[--enter-slot-multislot] [--enter-slot-capability] [--utm-ptr 0xPTR] "
+        "[--enter-slot-multislot] [--enter-slot-capability] "
+        "[--enter-slot-revoke-replay] [--utm-ptr 0xPTR] "
         "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -106,6 +118,7 @@ main(int argc, char** argv) {
   int enter_slot_epoch = 0;
   int enter_slot_multislot = 0;
   int enter_slot_capability = 0;
+  int enter_slot_revoke_replay = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -122,6 +135,7 @@ main(int argc, char** argv) {
       {"enter-slot-epoch", no_argument, &enter_slot_epoch, 1},
       {"enter-slot-multislot", no_argument, &enter_slot_multislot, 1},
       {"enter-slot-capability", no_argument, &enter_slot_capability, 1},
+      {"enter-slot-revoke-replay", no_argument, &enter_slot_revoke_replay, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -334,6 +348,34 @@ main(int argc, char** argv) {
     }
     if (enter_slot_value == 0) {
       printf("[FAIL] ENTER_SLOT cap valid returned zero lease id\n");
+      return 1;
+    }
+  }
+
+  if (enter_slot_revoke_replay) {
+    uintptr_t enter_slot_status = 0;
+    uintptr_t enter_slot_value = 0;
+    slot_cap_t cap = make_enter_slot_test_cap(1);
+    cap.max_lease_cycles = SLOTTEE_TEST_MAX_LEASE_CYCLES;
+
+    Keystone::Error enter_slot_ret = enclave.enterSlotWithCap(
+        cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT revoke first", enter_slot_ret,
+            enter_slot_status, enter_slot_value, SBI_ERR_SM_NOT_IMPLEMENTED)) {
+      return 1;
+    }
+    if (enter_slot_value == 0) {
+      printf("[FAIL] ENTER_SLOT revoke first returned zero lease id\n");
+      return 1;
+    }
+
+    wait_for_enter_slot_ttl(SLOTTEE_TEST_MAX_LEASE_CYCLES * 32);
+
+    enter_slot_value = 0;
+    enter_slot_ret = enclave.enterSlotWithCap(
+        cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT revoke replay", enter_slot_ret,
+            enter_slot_status, enter_slot_value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
       return 1;
     }
   }
