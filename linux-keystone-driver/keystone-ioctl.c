@@ -239,10 +239,15 @@ int keystone_enter_slot(unsigned long data)
     return -EINVAL;
   }
 
-  ret = sbi_sm_enter_slot(enclave->eid, arg->version, arg->slot_id, arg->epoch, arg->flags);
+  arg->req.cap.eid = enclave->eid;
+  memset(&arg->resp, 0, sizeof(arg->resp));
 
-  arg->error = ret.error;
-  arg->value = ret.value;
+  ret = sbi_sm_enter_slot(enclave->eid, &arg->req, &arg->resp);
+
+  if (!arg->resp.status)
+    arg->resp.status = ret.error;
+  if (!arg->resp.value)
+    arg->resp.value = ret.value;
 
   return 0;
 }

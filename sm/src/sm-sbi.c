@@ -5,6 +5,7 @@
 #include "sm-sbi.h"
 #include "pmp.h"
 #include "enclave.h"
+#include "mprv.h"
 #include "page.h"
 #include "cpu.h"
 #include "platform-hook.h"
@@ -54,28 +55,35 @@ unsigned long sbi_sm_resume_enclave(struct sbi_trap_regs *regs, unsigned long ei
 }
 
 unsigned long sbi_sm_enter_slot(
-    unsigned long *out_val, unsigned long eid, unsigned long version, unsigned long slot_id,
-    unsigned long epoch, unsigned long flags)
+    unsigned long *out_val, unsigned long eid, uintptr_t enter_slot_req,
+    uintptr_t enter_slot_resp)
 {
-  uintptr_t lease_id = 0;
+  struct enter_slot_req_t req;
+  struct enter_slot_resp_t resp = {0};
   unsigned long ret;
 
   if (out_val)
     *out_val = 0;
 
-  if (version != SLOTTEE_ENTER_SLOT_VERSION)
+  if (copy_to_sm(&req, enter_slot_req, sizeof(req)))
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
-  if (slot_id == 0)
-    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  if (req.version != SLOTTEE_ENTER_SLOT_VERSION ||
+      req.cap.version != SLOTTEE_ENTER_SLOT_VERSION ||
+      req.flags != SLOTTEE_ENTER_SLOT_FLAG_NONE) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
 
-  if (flags != SLOTTEE_ENTER_SLOT_FLAG_NONE)
-    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
-
-  ret = reserve_enclave_slot((enclave_id) eid, slot_id, epoch, &lease_id);
+  req.cap.eid = eid;
+  ret = reserve_enclave_slot((enclave_id) eid, &req.cap, &resp);
   if (out_val)
-    *out_val = lease_id;
+    *out_val = resp.value;
 
+out:
+  resp.status = ret;
+  if (enter_slot_resp && copy_from_sm(enter_slot_resp, &resp, sizeof(resp)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   return ret;
 }
 

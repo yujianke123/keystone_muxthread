@@ -276,6 +276,17 @@ Enclave::enterSlotWithVersion(
   return pDevice->enterSlotWithVersion(version, epoch, slotId, flags, status, value);
 }
 
+Error
+Enclave::enterSlotWithCap(
+    const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value) {
+  return pDevice->enterSlotWithCap(cap, flags, status, value);
+}
+
+Error
+Enclave::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp) {
+  return pDevice->enterSlotWithRequest(req, resp);
+}
+
 void*
 Enclave::getSharedBuffer() {
   return shared_buffer;

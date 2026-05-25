@@ -62,12 +62,8 @@ struct keystone_ioctl_run_enclave {
 
 struct keystone_ioctl_enter_slot {
   uintptr_t eid;
-  uintptr_t version;
-  uintptr_t slot_id;
-  uintptr_t epoch;
-  uintptr_t flags;
-  uintptr_t error;
-  uintptr_t value;
+  struct enter_slot_req_t req;
+  struct enter_slot_resp_t resp;
 };
 
 #endif

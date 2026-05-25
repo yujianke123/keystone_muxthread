@@ -10,6 +10,39 @@ namespace Keystone {
 
 KeystoneDevice::KeystoneDevice() { eid = -1; }
 
+static slot_cap_t
+makeEnterSlotCap(uintptr_t version, uintptr_t epoch, uintptr_t slotId) {
+  slot_cap_t cap;
+  memset(&cap, 0, sizeof(cap));
+  cap.version = version;
+  cap.slot_id = slotId;
+  cap.epoch = epoch;
+  cap.cap_seq = SLOTTEE_DEFAULT_CAP_SEQ;
+  cap.rights = SLOTTEE_CAP_RIGHT_ENTER;
+  cap.max_lease_cycles = SLOTTEE_DEFAULT_MAX_LEASE_CYCLES;
+  return cap;
+}
+
+static enter_slot_req_t
+makeEnterSlotReq(const slot_cap_t& cap, uintptr_t flags) {
+  enter_slot_req_t req;
+  memset(&req, 0, sizeof(req));
+  req.version = cap.version;
+  req.cap = cap;
+  req.flags = flags;
+  return req;
+}
+
+static bool
+isSlotCapMacZero(const slot_cap_t& cap) {
+  for (size_t word = 0; word < SLOTTEE_CAP_MAC_WORDS; word++) {
+    if (cap.cap_mac[word] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 Error
 KeystoneDevice::create(uint64_t minPages) {
   struct keystone_ioctl_create_enclave encl;
@@ -148,24 +181,40 @@ Error
 KeystoneDevice::enterSlotWithVersion(
     uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags,
     uintptr_t* status, uintptr_t* value) {
+  slot_cap_t cap = makeEnterSlotCap(version, epoch, slotId);
+  return enterSlotWithCap(cap, flags, status, value);
+}
+
+Error
+KeystoneDevice::enterSlotWithCap(
+    const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value) {
+  enter_slot_req_t req = makeEnterSlotReq(cap, flags);
+  enter_slot_resp_t resp;
+
+  Error ret = enterSlotWithRequest(req, &resp);
+  if (status) {
+    *status = resp.status;
+  }
+  if (value) {
+    *value = resp.value;
+  }
+
+  return ret;
+}
+
+Error
+KeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp) {
   struct keystone_ioctl_enter_slot encl;
-  encl.eid      = eid;
-  encl.version  = version;
-  encl.slot_id  = slotId;
-  encl.epoch    = epoch;
-  encl.flags    = flags;
-  encl.error    = 0;
-  encl.value    = 0;
+  memset(&encl, 0, sizeof(encl));
+  encl.eid = eid;
+  encl.req = req;
 
   if (ioctl(fd, KEYSTONE_IOC_ENTER_SLOT, &encl)) {
     return Error::IoctlErrorEnterSlot;
   }
 
-  if (status) {
-    *status = encl.error;
-  }
-  if (value) {
-    *value = encl.value;
+  if (resp) {
+    *resp = encl.resp;
   }
 
   return Error::Success;
@@ -248,18 +297,50 @@ Error
 MockKeystoneDevice::enterSlotWithVersion(
     uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags,
     uintptr_t* status, uintptr_t* value) {
+  slot_cap_t cap = makeEnterSlotCap(version, epoch, slotId);
+  return enterSlotWithCap(cap, flags, status, value);
+}
+
+Error
+MockKeystoneDevice::enterSlotWithCap(
+    const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value) {
+  enter_slot_req_t req = makeEnterSlotReq(cap, flags);
+  enter_slot_resp_t resp;
+
+  Error ret = enterSlotWithRequest(req, &resp);
   if (status) {
-    if (version != SLOTTEE_ENTER_SLOT_VERSION || slotId == 0 ||
-        slotId >= SLOTTEE_MAX_SLOTS || flags != SLOTTEE_ENTER_SLOT_FLAG_NONE) {
-      *status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
-    } else if (epoch != SLOTTEE_INITIAL_EPOCH) {
-      *status = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
-    } else {
-      *status = SBI_ERR_SM_NOT_IMPLEMENTED;
-    }
+    *status = resp.status;
   }
   if (value) {
-    *value = 0;
+    *value = resp.value;
+  }
+
+  return ret;
+}
+
+Error
+MockKeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp) {
+  enter_slot_resp_t local_resp;
+  memset(&local_resp, 0, sizeof(local_resp));
+
+  if (req.version != SLOTTEE_ENTER_SLOT_VERSION ||
+      req.cap.version != SLOTTEE_ENTER_SLOT_VERSION || req.cap.slot_id == 0 ||
+      req.cap.slot_id >= SLOTTEE_MAX_SLOTS || req.flags != SLOTTEE_ENTER_SLOT_FLAG_NONE) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  } else if (req.cap.epoch != SLOTTEE_INITIAL_EPOCH) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
+  } else if (req.cap.rights != SLOTTEE_CAP_RIGHT_ENTER || req.cap.cap_seq == 0 ||
+             req.cap.max_lease_cycles == 0 || !isSlotCapMacZero(req.cap)) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  } else {
+    local_resp.status = SBI_ERR_SM_NOT_IMPLEMENTED;
+    local_resp.value = 1;
+    local_resp.lease_id = 1;
+    local_resp.expiry_cycle = req.cap.max_lease_cycles;
+  }
+
+  if (resp) {
+    *resp = local_resp;
   }
   return Error::Success;
 }

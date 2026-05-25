@@ -43,6 +43,11 @@ struct slot_lease_t
   uintptr_t slot_id;
   uintptr_t lease_id;
   uintptr_t epoch;
+  uintptr_t cap_seq;
+  uintptr_t rights;
+  uintptr_t max_lease_cycles;
+  uintptr_t bound_hart;
+  uintptr_t expiry_cycle;
   slot_lease_state state;
 };
 
@@ -130,7 +135,7 @@ unsigned long destroy_enclave(enclave_id eid);
 unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long reserve_enclave_slot(
-    enclave_id eid, uintptr_t slot_id, uintptr_t epoch, uintptr_t *lease_id);
+    enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp);
 // callables from the enclave
 unsigned long exit_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave_id eid);

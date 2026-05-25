@@ -28,8 +28,8 @@ sbi_sm_resume_enclave(struct sbi_trap_regs *regs, unsigned long eid);
 
 unsigned long
 sbi_sm_enter_slot(
-    unsigned long *out_val, unsigned long eid, unsigned long version, unsigned long slot_id,
-    unsigned long epoch, unsigned long flags);
+    unsigned long *out_val, unsigned long eid, uintptr_t enter_slot_req,
+    uintptr_t enter_slot_resp);
 
 unsigned long
 sbi_sm_attest_enclave(uintptr_t report, uintptr_t data, uintptr_t size);

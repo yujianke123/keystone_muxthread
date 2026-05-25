@@ -75,6 +75,9 @@ class Enclave {
   Error enterSlotWithVersion(
       uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
       uintptr_t* value = nullptr);
+  Error enterSlotWithCap(
+      const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value = nullptr);
+  Error enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp);
 };
 
 uint64_t

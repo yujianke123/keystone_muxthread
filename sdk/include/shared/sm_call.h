@@ -21,6 +21,10 @@
 #define SLOTTEE_ENTER_SLOT_VERSION     1
 #define SLOTTEE_INITIAL_EPOCH          1
 #define SLOTTEE_ENTER_SLOT_FLAG_NONE   0
+#define SLOTTEE_CAP_RIGHT_ENTER        1
+#define SLOTTEE_DEFAULT_CAP_SEQ        1
+#define SLOTTEE_DEFAULT_MAX_LEASE_CYCLES 1048576
+#define SLOTTEE_CAP_MAC_WORDS          4
 #define SLOTTEE_MAX_SLOTS              8
 
 /* 3000-3999 are called by enclave */
@@ -77,9 +81,10 @@ struct slot_cap_t {
   uintptr_t eid;
   uintptr_t slot_id;
   uintptr_t epoch;
+  uintptr_t cap_seq;
   uintptr_t rights;
   uintptr_t max_lease_cycles;
-  uintptr_t cap_mac[4];
+  uintptr_t cap_mac[SLOTTEE_CAP_MAC_WORDS];
 };
 
 struct enter_slot_req_t {

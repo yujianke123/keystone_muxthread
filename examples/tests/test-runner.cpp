@@ -71,6 +71,18 @@ expect_enter_slot_status(const char* label, Keystone::Error ret, uintptr_t statu
   return 0;
 }
 
+static slot_cap_t
+make_enter_slot_test_cap(uintptr_t slot_id) {
+  slot_cap_t cap = {};
+  cap.version = SLOTTEE_ENTER_SLOT_VERSION;
+  cap.slot_id = slot_id;
+  cap.epoch = SLOTTEE_INITIAL_EPOCH;
+  cap.cap_seq = SLOTTEE_DEFAULT_CAP_SEQ;
+  cap.rights = SLOTTEE_CAP_RIGHT_ENTER;
+  cap.max_lease_cycles = SLOTTEE_DEFAULT_MAX_LEASE_CYCLES;
+  return cap;
+}
+
 int
 main(int argc, char** argv) {
   if (argc < 4 || argc > 10) {
@@ -79,7 +91,7 @@ main(int argc, char** argv) {
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
         "[--enter-slot-negative] [--enter-slot-lease] "
         "[--enter-slot-destroy-recreate] [--enter-slot-epoch] "
-        "[--enter-slot-multislot] [--utm-ptr 0xPTR] "
+        "[--enter-slot-multislot] [--enter-slot-capability] [--utm-ptr 0xPTR] "
         "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -93,6 +105,7 @@ main(int argc, char** argv) {
   int enter_slot_destroy_recreate = 0;
   int enter_slot_epoch = 0;
   int enter_slot_multislot = 0;
+  int enter_slot_capability = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -108,6 +121,7 @@ main(int argc, char** argv) {
       {"enter-slot-destroy-recreate", no_argument, &enter_slot_destroy_recreate, 1},
       {"enter-slot-epoch", no_argument, &enter_slot_epoch, 1},
       {"enter-slot-multislot", no_argument, &enter_slot_multislot, 1},
+      {"enter-slot-capability", no_argument, &enter_slot_capability, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -267,6 +281,59 @@ main(int argc, char** argv) {
     enter_slot_ret = enclave.enterSlot(1, &enter_slot_status, &slot1_lease);
     if (expect_enter_slot_status("ENTER_SLOT multislot duplicate", enter_slot_ret,
             enter_slot_status, slot1_lease, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+  }
+
+  if (enter_slot_capability) {
+    uintptr_t enter_slot_status = 0;
+    uintptr_t enter_slot_value = 0;
+    slot_cap_t cap = make_enter_slot_test_cap(1);
+
+    cap.rights = 0;
+    Keystone::Error enter_slot_ret = enclave.enterSlotWithCap(
+        cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT cap rights", enter_slot_ret,
+            enter_slot_status, enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+
+    cap = make_enter_slot_test_cap(1);
+    cap.cap_seq = 0;
+    enter_slot_ret = enclave.enterSlotWithCap(
+        cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT cap seq", enter_slot_ret,
+            enter_slot_status, enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+
+    cap = make_enter_slot_test_cap(1);
+    cap.max_lease_cycles = 0;
+    enter_slot_ret = enclave.enterSlotWithCap(
+        cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT cap lease", enter_slot_ret,
+            enter_slot_status, enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+
+    cap = make_enter_slot_test_cap(1);
+    cap.cap_mac[0] = 1;
+    enter_slot_ret = enclave.enterSlotWithCap(
+        cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT cap mac", enter_slot_ret,
+            enter_slot_status, enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+      return 1;
+    }
+
+    cap = make_enter_slot_test_cap(1);
+    enter_slot_ret = enclave.enterSlotWithCap(
+        cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT cap valid", enter_slot_ret,
+            enter_slot_status, enter_slot_value, SBI_ERR_SM_NOT_IMPLEMENTED)) {
+      return 1;
+    }
+    if (enter_slot_value == 0) {
+      printf("[FAIL] ENTER_SLOT cap valid returned zero lease id\n");
       return 1;
     }
   }

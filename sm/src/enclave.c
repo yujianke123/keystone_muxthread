@@ -35,6 +35,11 @@ static void clear_enclave_slot_leases(enclave_id eid)
     enclaves[eid].slot_leases[slot].slot_id = slot;
     enclaves[eid].slot_leases[slot].lease_id = 0;
     enclaves[eid].slot_leases[slot].epoch = 0;
+    enclaves[eid].slot_leases[slot].cap_seq = 0;
+    enclaves[eid].slot_leases[slot].rights = 0;
+    enclaves[eid].slot_leases[slot].max_lease_cycles = 0;
+    enclaves[eid].slot_leases[slot].bound_hart = 0;
+    enclaves[eid].slot_leases[slot].expiry_cycle = 0;
     enclaves[eid].slot_leases[slot].state = SLOT_LEASE_FREE;
   }
 }
@@ -522,13 +527,28 @@ unsigned long destroy_enclave(enclave_id eid)
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
 }
 
+static int is_slot_cap_mac_zero(const struct slot_cap_t *cap)
+{
+  size_t word;
+
+  for (word = 0; word < SLOTTEE_CAP_MAC_WORDS; word++) {
+    if (cap->cap_mac[word] != 0)
+      return 0;
+  }
+
+  return 1;
+}
+
 unsigned long reserve_enclave_slot(
-    enclave_id eid, uintptr_t slot_id, uintptr_t epoch, uintptr_t *lease_id)
+    enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp)
 {
   unsigned long ret = SBI_ERR_SM_NOT_IMPLEMENTED;
   struct slot_lease_t *lease;
 
-  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+  if (!cap)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (cap->slot_id == 0 || cap->slot_id >= SLOTTEE_MAX_SLOTS)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   spin_lock(&encl_lock);
@@ -538,26 +558,43 @@ unsigned long reserve_enclave_slot(
     goto out;
   }
 
-  if (epoch != enclaves[eid].current_slot_epoch) {
+  if (cap->eid != eid || cap->epoch != enclaves[eid].current_slot_epoch) {
     ret = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
     goto out;
   }
 
-  lease = &enclaves[eid].slot_leases[slot_id];
+  if (cap->rights != SLOTTEE_CAP_RIGHT_ENTER || cap->cap_seq == 0 ||
+      cap->max_lease_cycles == 0 || !is_slot_cap_mac_zero(cap)) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  lease = &enclaves[eid].slot_leases[cap->slot_id];
   if (lease->state != SLOT_LEASE_FREE) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
 
-  lease->slot_id = slot_id;
+  lease->slot_id = cap->slot_id;
   lease->lease_id = enclaves[eid].next_slot_lease_id++;
-  lease->epoch = epoch;
+  lease->epoch = cap->epoch;
+  lease->cap_seq = cap->cap_seq;
+  lease->rights = cap->rights;
+  lease->max_lease_cycles = cap->max_lease_cycles;
+  lease->bound_hart = csr_read(mhartid);
+  lease->expiry_cycle = cap->max_lease_cycles;
   lease->state = SLOT_LEASE_RESERVED;
 
-  if (lease_id)
-    *lease_id = lease->lease_id;
+  if (resp) {
+    resp->value = lease->lease_id;
+    resp->lease_id = lease->lease_id;
+    resp->bound_hart = lease->bound_hart;
+    resp->expiry_cycle = lease->expiry_cycle;
+  }
 
 out:
+  if (resp)
+    resp->status = ret;
   spin_unlock(&encl_lock);
   return ret;
 }

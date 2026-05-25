@@ -49,7 +49,7 @@ static int sbi_ecall_keystone_enclave_handler(unsigned long extid, unsigned long
       __builtin_unreachable();
       break;
     case SBI_SM_ENTER_SLOT:
-      retval = sbi_sm_enter_slot(out_val, regs->a0, regs->a1, regs->a2, regs->a3, regs->a4);
+      retval = sbi_sm_enter_slot(out_val, regs->a0, regs->a1, regs->a2);
       break;
     case SBI_SM_RANDOM:
       *out_val = sbi_sm_random();
