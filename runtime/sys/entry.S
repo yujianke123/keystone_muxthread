@@ -116,6 +116,7 @@ _start:
   csrw sscratch, x0
 
   sfence.vma
+  mv a0, t6
   jal eyrie_boot
   sfence.vma
 

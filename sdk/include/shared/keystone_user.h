@@ -47,6 +47,7 @@ struct keystone_ioctl_create_enclave {
   uintptr_t user_paddr;
   uintptr_t free_paddr;
   uintptr_t free_requested;
+  uintptr_t slot_entry;
 
   // driver -> host
   uintptr_t epm_paddr;

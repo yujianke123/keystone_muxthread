@@ -55,7 +55,7 @@ unsigned long sbi_sm_resume_enclave(struct sbi_trap_regs *regs, unsigned long ei
 }
 
 unsigned long sbi_sm_enter_slot(
-    unsigned long *out_val, unsigned long eid, uintptr_t enter_slot_req,
+    struct sbi_trap_regs *regs, unsigned long *out_val, unsigned long eid, uintptr_t enter_slot_req,
     uintptr_t enter_slot_resp)
 {
   struct enter_slot_req_t req;
@@ -70,12 +70,29 @@ unsigned long sbi_sm_enter_slot(
 
   if (req.version != SLOTTEE_ENTER_SLOT_VERSION ||
       req.cap.version != SLOTTEE_ENTER_SLOT_VERSION ||
-      req.flags != SLOTTEE_ENTER_SLOT_FLAG_NONE) {
+      (req.flags != SLOTTEE_ENTER_SLOT_FLAG_NONE &&
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL)) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
 
   req.cap.eid = eid;
+  if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL) {
+    ret = activate_enclave_slot((enclave_id) eid, &req.cap, &resp);
+    resp.value = 0;
+    if (out_val)
+      *out_val = 0;
+    if (enter_slot_resp && copy_from_sm(enter_slot_resp, &resp, sizeof(resp)))
+      return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
+      return ret;
+
+    enter_activated_enclave_slot(regs, (enclave_id) eid, resp.lease_id);
+    regs->mepc += 4;
+    sbi_trap_exit(regs);
+    return 0;
+  }
+
   ret = reserve_enclave_slot((enclave_id) eid, &req.cap, &resp);
   if (out_val)
     *out_val = resp.value;
@@ -85,6 +102,21 @@ out:
   if (enter_slot_resp && copy_from_sm(enter_slot_resp, &resp, sizeof(resp)))
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   return ret;
+}
+
+unsigned long sbi_sm_exit_slot(
+    struct sbi_trap_regs *regs, uintptr_t slot_id, uintptr_t lease_id,
+    uintptr_t exit_reason, uintptr_t value)
+{
+  unsigned long ret;
+
+  ret = exit_enclave_slot(
+      regs, cpu_get_enclave_id(), slot_id, lease_id, exit_reason, value);
+  regs->a0 = ret;
+  regs->a1 = (ret == SBI_ERR_SM_ENCLAVE_SUCCESS) ? value : 0;
+  regs->mepc += 4;
+  sbi_trap_exit(regs);
+  return 0;
 }
 
 unsigned long sbi_sm_exit_enclave(struct sbi_trap_regs *regs, unsigned long retval)

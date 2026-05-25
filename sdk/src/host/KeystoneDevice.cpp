@@ -46,6 +46,7 @@ isSlotCapMacZero(const slot_cap_t& cap) {
 Error
 KeystoneDevice::create(uint64_t minPages) {
   struct keystone_ioctl_create_enclave encl;
+  memset(&encl, 0, sizeof(encl));
   encl.min_pages = minPages;
 
   if (ioctl(fd, KEYSTONE_IOC_CREATE_ENCLAVE, &encl)) {
@@ -63,6 +64,7 @@ KeystoneDevice::create(uint64_t minPages) {
 uintptr_t
 KeystoneDevice::initUTM(size_t size) {
   struct keystone_ioctl_create_enclave encl;
+  memset(&encl, 0, sizeof(encl));
   encl.eid      = eid;
   encl.utm_size = size;
   if (ioctl(fd, KEYSTONE_IOC_UTM_INIT, &encl)) {
@@ -77,11 +79,13 @@ KeystoneDevice::finalize(
     uintptr_t runtimePhysAddr, uintptr_t eappPhysAddr, uintptr_t freePhysAddr,
     uintptr_t freeRequested) {
   struct keystone_ioctl_create_enclave encl;
+  memset(&encl, 0, sizeof(encl));
   encl.eid            = eid;
   encl.runtime_paddr  = runtimePhysAddr;
   encl.user_paddr     = eappPhysAddr;
   encl.free_paddr     = freePhysAddr;
   encl.free_requested = freeRequested;
+  encl.slot_entry     = 0;
 
   if (ioctl(fd, KEYSTONE_IOC_FINALIZE_ENCLAVE, &encl)) {
     perror("ioctl error");
@@ -93,6 +97,7 @@ KeystoneDevice::finalize(
 Error
 KeystoneDevice::destroy() {
   struct keystone_ioctl_create_enclave encl;
+  memset(&encl, 0, sizeof(encl));
   encl.eid = eid;
 
   /* if the enclave has never created */
@@ -112,6 +117,7 @@ KeystoneDevice::destroy() {
 Error
 KeystoneDevice::__run(bool resume, uintptr_t* ret) {
   struct keystone_ioctl_run_enclave encl;
+  memset(&encl, 0, sizeof(encl));
   encl.eid = eid;
 
   Error error;
@@ -325,13 +331,20 @@ MockKeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot
 
   if (req.version != SLOTTEE_ENTER_SLOT_VERSION ||
       req.cap.version != SLOTTEE_ENTER_SLOT_VERSION || req.cap.slot_id == 0 ||
-      req.cap.slot_id >= SLOTTEE_MAX_SLOTS || req.flags != SLOTTEE_ENTER_SLOT_FLAG_NONE) {
+      req.cap.slot_id >= SLOTTEE_MAX_SLOTS ||
+      (req.flags != SLOTTEE_ENTER_SLOT_FLAG_NONE &&
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL)) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   } else if (req.cap.epoch != SLOTTEE_INITIAL_EPOCH) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
   } else if (req.cap.rights != SLOTTEE_CAP_RIGHT_ENTER || req.cap.cap_seq == 0 ||
              req.cap.max_lease_cycles == 0 || !isSlotCapMacZero(req.cap)) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  } else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_SUCCESS;
+    local_resp.value = SLOTTEE_SLOT_MAGIC;
+    local_resp.lease_id = 1;
+    local_resp.expiry_cycle = req.cap.max_lease_cycles;
   } else {
     local_resp.status = SBI_ERR_SM_NOT_IMPLEMENTED;
     local_resp.value = 1;

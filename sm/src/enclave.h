@@ -36,7 +36,9 @@ typedef unsigned int enclave_id;
 typedef enum {
   SLOT_LEASE_FREE = 0,
   SLOT_LEASE_RESERVED = 1,
-  SLOT_LEASE_REVOKED = 2,
+  SLOT_LEASE_ACTIVE = 2,
+  SLOT_LEASE_EXITING = 3,
+  SLOT_LEASE_REVOKED = 4,
 } slot_lease_state;
 
 struct slot_lease_t
@@ -49,6 +51,9 @@ struct slot_lease_t
   uintptr_t max_lease_cycles;
   uintptr_t bound_hart;
   uintptr_t expiry_cycle;
+  uintptr_t entry_pc;
+  uintptr_t exit_reason;
+  uintptr_t active_hart;
   slot_lease_state state;
 };
 
@@ -137,8 +142,15 @@ unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long reserve_enclave_slot(
     enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp);
+unsigned long activate_enclave_slot(
+    enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp);
+void enter_activated_enclave_slot(
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t lease_id);
 // callables from the enclave
 unsigned long exit_enclave(struct sbi_trap_regs *regs, enclave_id eid);
+unsigned long exit_enclave_slot(
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
+    uintptr_t exit_reason, uintptr_t value);
 unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave_id eid);
 unsigned long attest_enclave(uintptr_t report, uintptr_t data, uintptr_t size, enclave_id eid);
 // attestation

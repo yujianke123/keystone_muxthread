@@ -124,6 +124,18 @@ expect_enter_slot_bench_row(const char* bench, uintptr_t iter, Keystone::Error r
 }
 
 static int
+expect_enter_slot_bench_value(const char* bench, uintptr_t iter, uintptr_t value,
+    uintptr_t expected) {
+  if (value != expected) {
+    printf("[FAIL] %s bench iter %lu returned unexpected value (%lu != %lu)\n",
+        bench, iter, value, expected);
+    return 1;
+  }
+
+  return 0;
+}
+
+static int
 init_enter_slot_bench_enclave(Keystone::Enclave& enclave, const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params) {
   if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
@@ -241,16 +253,37 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
     }
   }
 
+  for (uintptr_t iter = 0; iter < enter_slot_bench_iters; iter++) {
+    Keystone::Enclave enclave;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+
+    if (init_enter_slot_bench_enclave(enclave, eapp_file, rt_file, ld_file, params))
+      return 1;
+
+    uintptr_t start = read_cycle_counter();
+    Keystone::Error ret = enclave.enterSlot(
+        1, SLOTTEE_ENTER_SLOT_FLAG_REAL, &status, &value);
+    uintptr_t cycles = read_cycle_counter() - start;
+
+    if (expect_enter_slot_bench_row("real_enter", iter, ret, status, value,
+            SBI_ERR_SM_ENCLAVE_SUCCESS, cycles) ||
+        expect_enter_slot_bench_value("real_enter", iter, value, SLOTTEE_SLOT_MAGIC)) {
+      enclave.destroy();
+      return 1;
+    }
+  }
+
   return 0;
 }
 
 int
 main(int argc, char** argv) {
-  if (argc < 4 || argc > 12) {
+  if (argc < 4 || argc > 13) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
-        "[--enter-slot-negative] [--enter-slot-lease] "
+        "[--enter-slot-real] [--enter-slot-negative] [--enter-slot-lease] "
         "[--enter-slot-destroy-recreate] [--enter-slot-epoch] "
         "[--enter-slot-multislot] [--enter-slot-capability] "
         "[--enter-slot-revoke-replay] [--enter-slot-bench] [--utm-ptr 0xPTR] "
@@ -262,6 +295,7 @@ main(int argc, char** argv) {
   int self_timing = 0;
   int load_only   = 0;
   int enter_slot_stub = 0;
+  int enter_slot_real = 0;
   int enter_slot_negative = 0;
   int enter_slot_lease = 0;
   int enter_slot_destroy_recreate = 0;
@@ -280,6 +314,7 @@ main(int argc, char** argv) {
       {"time", no_argument, &self_timing, 1},
       {"load-only", no_argument, &load_only, 1},
       {"enter-slot-stub", no_argument, &enter_slot_stub, 1},
+      {"enter-slot-real", no_argument, &enter_slot_real, 1},
       {"enter-slot-negative", no_argument, &enter_slot_negative, 1},
       {"enter-slot-lease", no_argument, &enter_slot_lease, 1},
       {"enter-slot-destroy-recreate", no_argument, &enter_slot_destroy_recreate, 1},
@@ -348,6 +383,24 @@ main(int argc, char** argv) {
     }
   }
 
+  if (enter_slot_real) {
+    uintptr_t enter_slot_status = 0;
+    uintptr_t enter_slot_value = 0;
+    Keystone::Error enter_slot_ret = enclave.enterSlot(
+        1, SLOTTEE_ENTER_SLOT_FLAG_REAL, &enter_slot_status, &enter_slot_value);
+    if (expect_enter_slot_status("ENTER_SLOT real", enter_slot_ret, enter_slot_status,
+            enter_slot_value, SBI_ERR_SM_ENCLAVE_SUCCESS)) {
+      return 1;
+    }
+    if (enter_slot_value != SLOTTEE_SLOT_MAGIC) {
+      printf("[FAIL] ENTER_SLOT real returned unexpected value (%lu != %lu)\n",
+          enter_slot_value, (uintptr_t)SLOTTEE_SLOT_MAGIC);
+      return 1;
+    }
+    printf("ENTER_SLOT real slot state cleaned\n");
+    return 0;
+  }
+
   if (enter_slot_negative) {
     uintptr_t enter_slot_status = 0;
     uintptr_t enter_slot_value = 0;
@@ -359,7 +412,7 @@ main(int argc, char** argv) {
     }
 
     enter_slot_ret = enclave.enterSlot(
-        1, SLOTTEE_ENTER_SLOT_FLAG_NONE + 1, &enter_slot_status, &enter_slot_value);
+        1, SLOTTEE_ENTER_SLOT_FLAG_REAL + 1, &enter_slot_status, &enter_slot_value);
     if (expect_enter_slot_status("ENTER_SLOT flags", enter_slot_ret, enter_slot_status,
             enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
       return 1;

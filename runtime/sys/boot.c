@@ -23,6 +23,7 @@ size_t utm_size;
 
 /* defined in entry.S */
 extern void* encl_trap_handler;
+void slottee_slot_trampoline(uintptr_t lease_id);
 
 int verify_and_load_elf_file(uintptr_t ptr, size_t file_size, bool is_eapp) {
   int ret = 0;
@@ -136,6 +137,10 @@ eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
 
   /* Enable the FPU */
   csr_write(sstatus, csr_read(sstatus) | 0x6000);
+
+  if (dummy != 0) {
+    slottee_slot_trampoline(dummy);
+  }
 
   debug("eyrie boot finished. drop to the user land ...");
   /* booting all finished, droping to the user land */

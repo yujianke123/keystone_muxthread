@@ -5,6 +5,7 @@
 
 .section .text
 _start:
+  // a0: SlotTEE slot token. Zero means the original slot 0 run path.
   // a1: dram_base
   // a2: dram_size
   // a3: runtime_base
@@ -17,14 +18,15 @@ _start:
   la sp, _estack
 
   // save all args to stack 
-  addi sp, sp, -(REGBYTES*7)
-  STORE a1, 0(sp)
-  STORE a2, 1*REGBYTES(sp)
-  STORE a3, 2*REGBYTES(sp)
-  STORE a4, 3*REGBYTES(sp)
-  STORE a5, 4*REGBYTES(sp)
-  STORE a6, 5*REGBYTES(sp)
-  STORE a7, 6*REGBYTES(sp)
+  addi sp, sp, -(REGBYTES*8)
+  STORE a0, 0(sp)
+  STORE a1, 1*REGBYTES(sp)
+  STORE a2, 2*REGBYTES(sp)
+  STORE a3, 3*REGBYTES(sp)
+  STORE a4, 4*REGBYTES(sp)
+  STORE a5, 5*REGBYTES(sp)
+  STORE a6, 6*REGBYTES(sp)
+  STORE a7, 7*REGBYTES(sp)
 
   // call load_runtime
   call load_runtime 
@@ -49,14 +51,16 @@ _start:
   fence.i
   sfence.vma
 
+  // keep a0 as the new satp value until csrw satp below.
+  LOAD t6, 0(sp)
   // set arguments for eyrie_boot
-  LOAD a1, 0(sp)
-  LOAD a2, 1*REGBYTES(sp)
-  LOAD a3, 2*REGBYTES(sp)
-  LOAD a4, 3*REGBYTES(sp)
+  LOAD a1, 1*REGBYTES(sp)
+  LOAD a2, 2*REGBYTES(sp)
+  LOAD a3, 3*REGBYTES(sp)
+  LOAD a4, 4*REGBYTES(sp)
   LOAD a5, free_base_final
-  LOAD a6, 5*REGBYTES(sp)
-  LOAD a7, 6*REGBYTES(sp)
+  LOAD a6, 6*REGBYTES(sp)
+  LOAD a7, 7*REGBYTES(sp)
 
   // flush TLB's just in case
   fence.i

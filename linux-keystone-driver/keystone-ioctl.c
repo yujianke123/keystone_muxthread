@@ -53,6 +53,8 @@ int keystone_finalize_enclave(unsigned long arg)
 
   enclave->is_init = false;
 
+  memset(&create_args, 0, sizeof(create_args));
+
   /* SBI Call */
   create_args.epm_region.paddr = enclave->epm->pa;
   create_args.epm_region.size = enclave->epm->size;
@@ -72,6 +74,7 @@ int keystone_finalize_enclave(unsigned long arg)
   create_args.user_paddr = enclp->user_paddr;
   create_args.free_paddr = enclp->free_paddr;
   create_args.free_requested = enclp->free_requested;
+  create_args.slot_entry = enclp->slot_entry;
 
   ret = sbi_sm_create_enclave(&create_args);
 

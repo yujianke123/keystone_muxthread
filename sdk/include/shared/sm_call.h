@@ -21,18 +21,22 @@
 #define SLOTTEE_ENTER_SLOT_VERSION     1
 #define SLOTTEE_INITIAL_EPOCH          1
 #define SLOTTEE_ENTER_SLOT_FLAG_NONE   0
+#define SLOTTEE_ENTER_SLOT_FLAG_REAL   1
 #define SLOTTEE_CAP_RIGHT_ENTER        1
 #define SLOTTEE_DEFAULT_CAP_SEQ        1
 #define SLOTTEE_DEFAULT_MAX_LEASE_CYCLES ((uintptr_t)-1 / 4)
 #define SLOTTEE_TEST_MAX_LEASE_CYCLES  1024
 #define SLOTTEE_CAP_MAC_WORDS          4
 #define SLOTTEE_MAX_SLOTS              8
+#define SLOTTEE_SLOT_EXIT_NORMAL       0
+#define SLOTTEE_SLOT_MAGIC             0x51515151
 
 /* 3000-3999 are called by enclave */
 #define SBI_SM_RANDOM            3001
 #define SBI_SM_ATTEST_ENCLAVE    3002
 #define SBI_SM_GET_SEALING_KEY   3003
 #define SBI_SM_STOP_ENCLAVE      3004
+#define SBI_SM_EXIT_SLOT         3005
 #define SBI_SM_EXIT_ENCLAVE      3006
 #define FID_RANGE_ENCLAVE        3999
 
@@ -60,6 +64,7 @@ struct runtime_params_t {
   uintptr_t untrusted_base;
   uintptr_t untrusted_size;
   uintptr_t free_requested; // for attestation
+  uintptr_t slot_entry;
 };
 
 struct keystone_sbi_pregion_t {
@@ -75,6 +80,7 @@ struct keystone_sbi_create_t {
   uintptr_t user_paddr;
   uintptr_t free_paddr;
   uintptr_t free_requested;
+  uintptr_t slot_entry;
 };
 
 struct slot_cap_t {
@@ -102,6 +108,19 @@ struct enter_slot_resp_t {
   uintptr_t lease_id;
   uintptr_t bound_hart;
   uintptr_t expiry_cycle;
+};
+
+struct exit_slot_req_t {
+  uintptr_t version;
+  uintptr_t slot_id;
+  uintptr_t lease_id;
+  uintptr_t exit_reason;
+  uintptr_t value;
+};
+
+struct exit_slot_resp_t {
+  uintptr_t status;
+  uintptr_t value;
 };
 
 #endif  // __SM_CALL_H__

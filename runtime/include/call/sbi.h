@@ -19,6 +19,8 @@ sbi_stop_enclave(uint64_t request);
 void
 sbi_exit_enclave(uint64_t retval);
 uintptr_t
+sbi_exit_slot(uintptr_t slot_id, uintptr_t lease_id, uintptr_t exit_reason, uintptr_t value);
+uintptr_t
 sbi_random();
 uintptr_t
 sbi_query_multimem(size_t *size);
