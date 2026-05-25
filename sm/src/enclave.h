@@ -145,7 +145,8 @@ unsigned long reserve_enclave_slot(
 unsigned long activate_enclave_slot(
     enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp);
 void enter_activated_enclave_slot(
-    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id);
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
+    uintptr_t slot_mode);
 // callables from the enclave
 unsigned long exit_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long exit_enclave_slot(

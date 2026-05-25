@@ -22,6 +22,7 @@
 #define SLOTTEE_INITIAL_EPOCH          1
 #define SLOTTEE_ENTER_SLOT_FLAG_NONE   0
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL   1
+#define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT 2
 #define SLOTTEE_CAP_RIGHT_ENTER        1
 #define SLOTTEE_DEFAULT_CAP_SEQ        1
 #define SLOTTEE_DEFAULT_MAX_LEASE_CYCLES ((uintptr_t)-1 / 4)
@@ -29,15 +30,26 @@
 #define SLOTTEE_CAP_MAC_WORDS          4
 #define SLOTTEE_MAX_SLOTS              8
 #define SLOTTEE_SLOT_TOKEN_SLOT_BITS   8
+#define SLOTTEE_SLOT_TOKEN_MODE_BITS   8
+#define SLOTTEE_SLOT_TOKEN_MODE_SHIFT  SLOTTEE_SLOT_TOKEN_SLOT_BITS
+#define SLOTTEE_SLOT_TOKEN_LEASE_SHIFT \
+  (SLOTTEE_SLOT_TOKEN_SLOT_BITS + SLOTTEE_SLOT_TOKEN_MODE_BITS)
 #define SLOTTEE_SLOT_TOKEN_SLOT_MASK   (((uintptr_t)1 << SLOTTEE_SLOT_TOKEN_SLOT_BITS) - 1)
-#define SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id) \
-  ((((uintptr_t)(lease_id)) << SLOTTEE_SLOT_TOKEN_SLOT_BITS) | ((uintptr_t)(slot_id)))
+#define SLOTTEE_SLOT_TOKEN_MODE_MASK   (((uintptr_t)1 << SLOTTEE_SLOT_TOKEN_MODE_BITS) - 1)
+#define SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE 0
+#define SLOTTEE_SLOT_TOKEN_MODE_LT_SCHED   1
+#define SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id, mode) \
+  ((((uintptr_t)(lease_id)) << SLOTTEE_SLOT_TOKEN_LEASE_SHIFT) | \
+   (((uintptr_t)(mode)) << SLOTTEE_SLOT_TOKEN_MODE_SHIFT) | ((uintptr_t)(slot_id)))
 #define SLOTTEE_SLOT_TOKEN_SLOT_ID(token) \
   ((uintptr_t)(token) & SLOTTEE_SLOT_TOKEN_SLOT_MASK)
+#define SLOTTEE_SLOT_TOKEN_MODE(token) \
+  (((uintptr_t)(token) >> SLOTTEE_SLOT_TOKEN_MODE_SHIFT) & SLOTTEE_SLOT_TOKEN_MODE_MASK)
 #define SLOTTEE_SLOT_TOKEN_LEASE_ID(token) \
-  ((uintptr_t)(token) >> SLOTTEE_SLOT_TOKEN_SLOT_BITS)
+  ((uintptr_t)(token) >> SLOTTEE_SLOT_TOKEN_LEASE_SHIFT)
 #define SLOTTEE_SLOT_EXIT_NORMAL       0
 #define SLOTTEE_SLOT_MAGIC             0x51515151
+#define SLOTTEE_LT_SCHED_MAGIC         0x51515152
 
 /* 3000-3999 are called by enclave */
 #define SBI_SM_RANDOM            3001

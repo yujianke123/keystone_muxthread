@@ -253,6 +253,11 @@ Enclave::run(uintptr_t* retval) {
 }
 
 Error
+Enclave::resume(uintptr_t* retval) {
+  return pDevice->resume(retval);
+}
+
+Error
 Enclave::enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value) {
   return pDevice->enterSlot(slotId, status, value);
 }

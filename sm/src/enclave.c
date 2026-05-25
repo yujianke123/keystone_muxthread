@@ -772,9 +772,11 @@ out:
 }
 
 void enter_activated_enclave_slot(
-    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id)
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
+    uintptr_t slot_mode)
 {
-  context_switch_to_enclave(regs, eid, 1, SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id));
+  context_switch_to_enclave(
+      regs, eid, 1, SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id, slot_mode));
 }
 
 unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid)

@@ -34,6 +34,7 @@ get_host_string() {
 static struct report_t report;
 static const uintptr_t enter_slot_bench_iters = 3;
 static const uintptr_t enter_slot_pool_workers = 2;
+static const uintptr_t enter_slot_resume_limit = 8;
 
 void
 print_hex(void* buffer, size_t len) {
@@ -285,6 +286,7 @@ struct enter_slot_pool_worker_arg {
   const char* ld_file;
   Keystone::Params params;
   uintptr_t slot_id;
+  uintptr_t flags;
   Keystone::Error ret;
   uintptr_t status;
   uintptr_t value;
@@ -304,22 +306,38 @@ enter_slot_pool_worker(void* opaque) {
     return NULL;
   }
 
-  arg->ret = enclave.enterSlot(
-      arg->slot_id, SLOTTEE_ENTER_SLOT_FLAG_REAL, &arg->status, &arg->value);
+  arg->ret = enclave.enterSlot(arg->slot_id, arg->flags, &arg->status, &arg->value);
+  for (uintptr_t retry = 0;
+       arg->ret == Keystone::Error::Success &&
+       arg->status == SBI_ERR_SM_ENCLAVE_INTERRUPTED &&
+       retry < enter_slot_resume_limit;
+       retry++) {
+    uintptr_t resume_value = 0;
+    Keystone::Error resume_ret = enclave.resume(&resume_value);
+    if (resume_ret == Keystone::Error::Success) {
+      arg->status = SBI_ERR_SM_ENCLAVE_SUCCESS;
+      arg->value = resume_value;
+      break;
+    }
+    if (resume_ret != Keystone::Error::EnclaveInterrupted) {
+      arg->ret = resume_ret;
+      break;
+    }
+  }
   enclave.destroy();
   return NULL;
 }
 
 static int
-run_enter_slot_pthread_pool(const char* eapp_file, const char* rt_file,
-    const char* ld_file, Keystone::Params params) {
+run_enter_slot_pool_case(const char* label, uintptr_t flags, uintptr_t expected_value,
+    const char* eapp_file, const char* rt_file, const char* ld_file, Keystone::Params params) {
   pthread_t threads[enter_slot_pool_workers];
   enter_slot_pool_worker_arg args[enter_slot_pool_workers];
 
   params.setFreeMemSize(8 * 1024 * 1024);
   params.setUntrustedSize(64 * 1024);
 
-  printf("pool_worker,slot,status,value\n");
+  printf("%s_worker,slot,status,value\n", label);
   fflush(stdout);
 
   for (uintptr_t worker = 0; worker < enter_slot_pool_workers; worker++) {
@@ -328,30 +346,31 @@ run_enter_slot_pthread_pool(const char* eapp_file, const char* rt_file,
     args[worker].ld_file = ld_file;
     args[worker].params = params;
     args[worker].slot_id = worker + 1;
+    args[worker].flags = flags;
     args[worker].ret = Keystone::Error::DeviceError;
     args[worker].status = 0;
     args[worker].value = 0;
 
     if (pthread_create(&threads[worker], NULL, enter_slot_pool_worker, &args[worker]) != 0) {
-      printf("[FAIL] ENTER_SLOT pthread pool failed to create worker %lu\n", worker);
+      printf("[FAIL] ENTER_SLOT %s failed to create worker %lu\n", label, worker);
       return 1;
     }
   }
 
   for (uintptr_t worker = 0; worker < enter_slot_pool_workers; worker++) {
     if (pthread_join(threads[worker], NULL) != 0) {
-      printf("[FAIL] ENTER_SLOT pthread pool failed to join worker %lu\n", worker);
+      printf("[FAIL] ENTER_SLOT %s failed to join worker %lu\n", label, worker);
       return 1;
     }
   }
 
   for (uintptr_t worker = 0; worker < enter_slot_pool_workers; worker++) {
-    printf("pool_worker,%lu,%lu,%lu\n",
+    printf("%s_worker,%lu,%lu,%lu\n", label,
         args[worker].slot_id, args[worker].status, args[worker].value);
-    if (expect_enter_slot_status("ENTER_SLOT pthread pool", args[worker].ret,
+    if (expect_enter_slot_status("ENTER_SLOT pool", args[worker].ret,
             args[worker].status, args[worker].value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
         expect_enter_slot_bench_value(
-            "pthread_pool", worker, args[worker].value, SLOTTEE_SLOT_MAGIC)) {
+            label, worker, args[worker].value, expected_value)) {
       return 1;
     }
   }
@@ -359,9 +378,23 @@ run_enter_slot_pthread_pool(const char* eapp_file, const char* rt_file,
   return 0;
 }
 
+static int
+run_enter_slot_pthread_pool(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  return run_enter_slot_pool_case("pool", SLOTTEE_ENTER_SLOT_FLAG_REAL,
+      SLOTTEE_SLOT_MAGIC, eapp_file, rt_file, ld_file, params);
+}
+
+static int
+run_enter_slot_lt_scheduler(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  return run_enter_slot_pool_case("lt_sched", SLOTTEE_ENTER_SLOT_FLAG_REAL_LT,
+      SLOTTEE_LT_SCHED_MAGIC, eapp_file, rt_file, ld_file, params);
+}
+
 int
 main(int argc, char** argv) {
-  if (argc < 4 || argc > 14) {
+  if (argc < 4 || argc > 15) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
@@ -369,7 +402,7 @@ main(int argc, char** argv) {
         "[--enter-slot-destroy-recreate] [--enter-slot-epoch] "
         "[--enter-slot-multislot] [--enter-slot-capability] "
         "[--enter-slot-revoke-replay] [--enter-slot-bench] "
-        "[--enter-slot-pthread-pool] [--utm-ptr 0xPTR] "
+        "[--enter-slot-pthread-pool] [--enter-slot-lt-scheduler] [--utm-ptr 0xPTR] "
         "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -388,6 +421,7 @@ main(int argc, char** argv) {
   int enter_slot_revoke_replay = 0;
   int enter_slot_bench = 0;
   int enter_slot_pthread_pool = 0;
+  int enter_slot_lt_scheduler = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -408,6 +442,7 @@ main(int argc, char** argv) {
       {"enter-slot-revoke-replay", no_argument, &enter_slot_revoke_replay, 1},
       {"enter-slot-bench", no_argument, &enter_slot_bench, 1},
       {"enter-slot-pthread-pool", no_argument, &enter_slot_pthread_pool, 1},
+      {"enter-slot-lt-scheduler", no_argument, &enter_slot_lt_scheduler, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -452,6 +487,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_pthread_pool) {
     return run_enter_slot_pthread_pool(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_lt_scheduler) {
+    return run_enter_slot_lt_scheduler(eapp_file, rt_file, ld_file, params);
   }
 
   Keystone::Enclave enclave;
@@ -501,7 +540,7 @@ main(int argc, char** argv) {
     }
 
     enter_slot_ret = enclave.enterSlot(
-        1, SLOTTEE_ENTER_SLOT_FLAG_REAL + 1, &enter_slot_status, &enter_slot_value);
+        1, SLOTTEE_ENTER_SLOT_FLAG_REAL_LT + 1, &enter_slot_status, &enter_slot_value);
     if (expect_enter_slot_status("ENTER_SLOT flags", enter_slot_ret, enter_slot_status,
             enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
       return 1;

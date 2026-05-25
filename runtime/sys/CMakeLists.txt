@@ -1,5 +1,5 @@
 
-set(SYS_SOURCES entry.S boot.c env.c interrupt.c slottee.c)
+set(SYS_SOURCES entry.S boot.c env.c interrupt.c slottee.c slottee_sched.c)
 add_executable(eyrie-build EXCLUDE_FROM_ALL ${SYS_SOURCES})
 
 # The ordering of these libraries is important, make sure that any symbols which may be

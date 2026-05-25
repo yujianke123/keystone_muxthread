@@ -71,13 +71,18 @@ unsigned long sbi_sm_enter_slot(
   if (req.version != SLOTTEE_ENTER_SLOT_VERSION ||
       req.cap.version != SLOTTEE_ENTER_SLOT_VERSION ||
       (req.flags != SLOTTEE_ENTER_SLOT_FLAG_NONE &&
-       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL)) {
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL &&
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT)) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
 
   req.cap.eid = eid;
-  if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL) {
+  if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL ||
+      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT) {
+    uintptr_t slot_mode = (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT) ?
+        SLOTTEE_SLOT_TOKEN_MODE_LT_SCHED : SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
+
     ret = activate_enclave_slot((enclave_id) eid, &req.cap, &resp);
     resp.value = 0;
     if (out_val)
@@ -87,7 +92,8 @@ unsigned long sbi_sm_enter_slot(
     if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
       return ret;
 
-    enter_activated_enclave_slot(regs, (enclave_id) eid, req.cap.slot_id, resp.lease_id);
+    enter_activated_enclave_slot(
+        regs, (enclave_id) eid, req.cap.slot_id, resp.lease_id, slot_mode);
     regs->mepc += 4;
     sbi_trap_exit(regs);
     return 0;
