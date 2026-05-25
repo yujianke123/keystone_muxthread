@@ -4,5 +4,6 @@
 #include <stdint.h>
 
 uintptr_t slottee_lt_scheduler_run(uintptr_t slot_id, uintptr_t lease_id);
+uintptr_t slottee_lt_context_run(uintptr_t slot_id, uintptr_t lease_id);
 
 #endif

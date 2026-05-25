@@ -11,6 +11,8 @@ slottee_slot_trampoline(uintptr_t slot_token)
 
   if (slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_SCHED) {
     value = slottee_lt_scheduler_run(slot_id, lease_id);
+  } else if (slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_CONTEXT) {
+    value = slottee_lt_context_run(slot_id, lease_id);
   }
 
   sbi_exit_slot(slot_id, lease_id, SLOTTEE_SLOT_EXIT_NORMAL, value);
