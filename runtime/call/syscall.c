@@ -164,6 +164,7 @@ void handle_syscall(struct encl_ctx* ctx)
   uintptr_t ret = 0;
 
   ctx->regs.sepc += 4;
+  slottee_active_user_record_syscall(ctx, n);
 
   switch (n) {
   case(RUNTIME_SYSCALL_EXIT):
@@ -172,7 +173,9 @@ void handle_syscall(struct encl_ctx* ctx)
     sbi_exit_enclave(arg0);
     break;
   case(RUNTIME_SYSCALL_OCALL):
+    slottee_active_user_record_ocall(ctx);
     ret = dispatch_edgecall_ocall(arg0, (void*)arg1, arg2, (void*)arg3, arg4);
+    slottee_active_user_record_ocall_resume(ret);
     break;
   case(RUNTIME_SYSCALL_SHAREDCOPY):
     ret = handle_copy_from_shared((void*)arg0, arg1, arg2);

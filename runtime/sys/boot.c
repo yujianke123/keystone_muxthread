@@ -8,6 +8,7 @@
 #include "call/sbi.h"
 #include "mm/freemem.h"
 #include "mm/mm.h"
+#include "sys/slottee.h"
 #include "sys/env.h"
 #include "mm/paging.h"
 #include "loader/elf.h"
@@ -23,7 +24,6 @@ size_t utm_size;
 
 /* defined in entry.S */
 extern void* encl_trap_handler;
-void slottee_slot_trampoline(uintptr_t slot_token);
 
 int verify_and_load_elf_file(uintptr_t ptr, size_t file_size, bool is_eapp) {
   int ret = 0;
@@ -140,6 +140,7 @@ eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
 
   if (dummy != 0) {
     slottee_slot_trampoline(dummy);
+    slottee_active_user_prepare_user_entry();
   }
 
   debug("eyrie boot finished. drop to the user land ...");

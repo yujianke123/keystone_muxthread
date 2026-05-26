@@ -7,6 +7,7 @@
 #include "util/printf.h"
 #include "uaccess.h"
 #include "mm/vm.h"
+#include "sys/slottee.h"
 
 // Statically allocated copy-buffer
 unsigned char rt_copy_buffer_1[RISCV_PAGE_SIZE];
@@ -46,6 +47,9 @@ void not_implemented_fatal(struct encl_ctx* ctx){
     printf("[runtime] non-handlable interrupt/exception at 0x%lx on 0x%lx (scause: 0x%lx)\r\n", pc, addr, cause);
 #endif
 
+    if (slottee_active_user_fault_exit(ctx, SLOTTEE_LT_USER_ILLEGAL_MAGIC))
+      return;
+
     // Bail to m-mode
     __asm__ volatile("csrr a0, scause\r\nli a7, 1111\r\n ecall");
 
@@ -61,6 +65,9 @@ void rt_page_fault(struct encl_ctx* ctx)
   cause = ctx->scause;
   printf("[runtime] page fault at 0x%lx on 0x%lx (scause: 0x%lx)\r\n", pc, addr, cause);
 #endif
+
+  if (slottee_active_user_fault_exit(ctx, SLOTTEE_LT_USER_PAGE_FAULT_MAGIC))
+    return;
 
   sbi_exit_enclave(-1);
 

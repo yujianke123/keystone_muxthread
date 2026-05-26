@@ -437,9 +437,185 @@ run_enter_slot_lt_user(const char* eapp_file, const char* rt_file,
       12345, eapp_file, rt_file, ld_file, params);
 }
 
+struct enter_slot_ocall_worker_arg {
+  const char* eapp_file;
+  const char* rt_file;
+  const char* ld_file;
+  Keystone::Params params;
+  uintptr_t slot_id;
+  Keystone::Error ret;
+  uintptr_t status;
+  uintptr_t value;
+  uintptr_t ocall_count;
+  uintptr_t resume_count;
+};
+
+static pthread_mutex_t enter_slot_ocall_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static Keystone::Error
+enter_slot_resume_once(Keystone::Enclave& enclave, uintptr_t* status, uintptr_t* value)
+{
+  uintptr_t resume_value = 0;
+  Keystone::Error resume_ret = enclave.resume(&resume_value);
+
+  if (resume_ret == Keystone::Error::Success) {
+    *status = SBI_ERR_SM_ENCLAVE_SUCCESS;
+    *value = resume_value;
+  } else if (resume_ret == Keystone::Error::EdgeCallHost) {
+    *status = SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST;
+    *value = 0;
+  } else if (resume_ret == Keystone::Error::EnclaveInterrupted) {
+    *status = SBI_ERR_SM_ENCLAVE_INTERRUPTED;
+    *value = 0;
+  }
+
+  return resume_ret;
+}
+
+static void*
+enter_slot_ocall_worker(void* opaque) {
+  enter_slot_ocall_worker_arg* arg = (enter_slot_ocall_worker_arg*)opaque;
+  Keystone::Enclave enclave;
+
+  arg->ret = Keystone::Error::DeviceError;
+  arg->status = 0;
+  arg->value = 0;
+  arg->ocall_count = 0;
+  arg->resume_count = 0;
+
+  pthread_mutex_lock(&enter_slot_ocall_lock);
+
+  if (enclave.init(arg->eapp_file, arg->rt_file, arg->ld_file, arg->params) !=
+      Keystone::Error::Success) {
+    pthread_mutex_unlock(&enter_slot_ocall_lock);
+    return NULL;
+  }
+
+  edge_init(&enclave);
+
+  arg->ret = enclave.enterSlot(arg->slot_id,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &arg->status, &arg->value);
+  for (uintptr_t retry = 0; arg->ret == Keystone::Error::Success &&
+       retry < enter_slot_resume_limit; retry++) {
+    if (arg->status == SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      arg->ocall_count++;
+      arg->ret = enter_slot_resume_once(enclave, &arg->status, &arg->value);
+      arg->resume_count++;
+      if (arg->ret == Keystone::Error::Success &&
+          arg->status == SBI_ERR_SM_ENCLAVE_SUCCESS)
+        break;
+      if (arg->ret != Keystone::Error::EdgeCallHost &&
+          arg->ret != Keystone::Error::EnclaveInterrupted)
+        break;
+      arg->ret = Keystone::Error::Success;
+      continue;
+    }
+
+    if (arg->status == SBI_ERR_SM_ENCLAVE_INTERRUPTED) {
+      arg->ret = enter_slot_resume_once(enclave, &arg->status, &arg->value);
+      arg->resume_count++;
+      if (arg->ret == Keystone::Error::Success &&
+          arg->status == SBI_ERR_SM_ENCLAVE_SUCCESS)
+        break;
+      if (arg->ret != Keystone::Error::EnclaveInterrupted)
+        break;
+      arg->ret = Keystone::Error::Success;
+      continue;
+    }
+
+    break;
+  }
+
+  enclave.destroy();
+  pthread_mutex_unlock(&enter_slot_ocall_lock);
+  return NULL;
+}
+
+static int
+run_enter_slot_lt_user_probe(const char* label, uintptr_t expected_value,
+    uintptr_t expected_ocalls, uintptr_t expected_resumes, const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params) {
+  pthread_t threads[enter_slot_pool_workers];
+  enter_slot_ocall_worker_arg args[enter_slot_pool_workers];
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  printf("%s_worker,slot,status,value,ocalls,resumes\n", label);
+  fflush(stdout);
+
+  for (uintptr_t worker = 0; worker < enter_slot_pool_workers; worker++) {
+    args[worker].eapp_file = eapp_file;
+    args[worker].rt_file = rt_file;
+    args[worker].ld_file = ld_file;
+    args[worker].params = params;
+    args[worker].slot_id = worker + 1;
+    args[worker].ret = Keystone::Error::DeviceError;
+    args[worker].status = 0;
+    args[worker].value = 0;
+    args[worker].ocall_count = 0;
+    args[worker].resume_count = 0;
+
+    if (pthread_create(&threads[worker], NULL, enter_slot_ocall_worker, &args[worker]) != 0) {
+      printf("[FAIL] ENTER_SLOT %s failed to create worker %lu\n", label, worker);
+      return 1;
+    }
+  }
+
+  for (uintptr_t worker = 0; worker < enter_slot_pool_workers; worker++) {
+    if (pthread_join(threads[worker], NULL) != 0) {
+      printf("[FAIL] ENTER_SLOT %s failed to join worker %lu\n", label, worker);
+      return 1;
+    }
+  }
+
+  for (uintptr_t worker = 0; worker < enter_slot_pool_workers; worker++) {
+    printf("%s_worker,%lu,%lu,%lu,%lu,%lu\n", label,
+        args[worker].slot_id, args[worker].status, args[worker].value,
+        args[worker].ocall_count, args[worker].resume_count);
+    if (expect_enter_slot_status("ENTER_SLOT LT user probe", args[worker].ret,
+            args[worker].status, args[worker].value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+        expect_enter_slot_bench_value(label, worker, args[worker].value,
+            expected_value)) {
+      return 1;
+    }
+    if (args[worker].ocall_count != expected_ocalls ||
+        args[worker].resume_count != expected_resumes) {
+      printf("[FAIL] %s worker %lu returned unexpected ocall/resume counts (%lu/%lu != %lu/%lu)\n",
+          label, worker, args[worker].ocall_count, args[worker].resume_count,
+          expected_ocalls, expected_resumes);
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int
+run_enter_slot_lt_user_ocall(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  return run_enter_slot_lt_user_probe("lt_user_ocall",
+      SLOTTEE_LT_USER_OCALL_MAGIC, 1, 1, eapp_file, rt_file, ld_file, params);
+}
+
+static int
+run_enter_slot_lt_user_illegal(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  return run_enter_slot_lt_user_probe("lt_user_illegal",
+      SLOTTEE_LT_USER_ILLEGAL_MAGIC, 0, 0, eapp_file, rt_file, ld_file, params);
+}
+
+static int
+run_enter_slot_lt_user_page_fault(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  return run_enter_slot_lt_user_probe("lt_user_page_fault",
+      SLOTTEE_LT_USER_PAGE_FAULT_MAGIC, 0, 0, eapp_file, rt_file, ld_file, params);
+}
+
 int
 main(int argc, char** argv) {
-  if (argc < 4 || argc > 21) {
+  if (argc < 4 || argc > 24) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
@@ -451,6 +627,8 @@ main(int argc, char** argv) {
         "[--enter-slot-lt-context] [--enter-slot-lt-yield] "
         "[--enter-slot-lt-bind] [--enter-slot-lt-trap-safe] "
         "[--enter-slot-lt-ecall] [--enter-slot-lt-user] "
+        "[--enter-slot-lt-user-ocall] [--enter-slot-lt-user-illegal] "
+        "[--enter-slot-lt-user-page-fault] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -476,6 +654,9 @@ main(int argc, char** argv) {
   int enter_slot_lt_trap_safe = 0;
   int enter_slot_lt_ecall = 0;
   int enter_slot_lt_user = 0;
+  int enter_slot_lt_user_ocall = 0;
+  int enter_slot_lt_user_illegal = 0;
+  int enter_slot_lt_user_page_fault = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -503,6 +684,9 @@ main(int argc, char** argv) {
       {"enter-slot-lt-trap-safe", no_argument, &enter_slot_lt_trap_safe, 1},
       {"enter-slot-lt-ecall", no_argument, &enter_slot_lt_ecall, 1},
       {"enter-slot-lt-user", no_argument, &enter_slot_lt_user, 1},
+      {"enter-slot-lt-user-ocall", no_argument, &enter_slot_lt_user_ocall, 1},
+      {"enter-slot-lt-user-illegal", no_argument, &enter_slot_lt_user_illegal, 1},
+      {"enter-slot-lt-user-page-fault", no_argument, &enter_slot_lt_user_page_fault, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -577,6 +761,18 @@ main(int argc, char** argv) {
     return run_enter_slot_lt_user(eapp_file, rt_file, ld_file, params);
   }
 
+  if (enter_slot_lt_user_ocall) {
+    return run_enter_slot_lt_user_ocall(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_lt_user_illegal) {
+    return run_enter_slot_lt_user_illegal(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_lt_user_page_fault) {
+    return run_enter_slot_lt_user_page_fault(eapp_file, rt_file, ld_file, params);
+  }
+
   Keystone::Enclave enclave;
 
   if (self_timing) {
@@ -624,7 +820,8 @@ main(int argc, char** argv) {
     }
 
     enter_slot_ret = enclave.enterSlot(
-        1, SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER + 1, &enter_slot_status, &enter_slot_value);
+        1, SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL + 1,
+        &enter_slot_status, &enter_slot_value);
     if (expect_enter_slot_status("ENTER_SLOT flags", enter_slot_ret, enter_slot_status,
             enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
       return 1;
