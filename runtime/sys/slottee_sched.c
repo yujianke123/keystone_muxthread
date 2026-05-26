@@ -13,6 +13,9 @@
 #define SLOTTEE_LT_TLS_SCRATCH_BASE   ((uintptr_t)0x51520000)
 #define SLOTTEE_LT_BIND_STACK_SCRATCH_BASE ((uintptr_t)0x51530000)
 #define SLOTTEE_LT_BIND_TLS_SCRATCH_BASE   ((uintptr_t)0x51540000)
+#define SLOTTEE_LT_TRAP_SAFE_STACK_GUARD_BASE ((uintptr_t)0x51550000)
+#define SLOTTEE_LT_TRAP_SAFE_TLS_MARKER_BASE  ((uintptr_t)0x51560000)
+#define SLOTTEE_LT_TRAP_SAFE_BOUNDARY_BASE    ((uintptr_t)0x51570000)
 
 enum slottee_lt_state {
   SLOTTEE_LT_EMPTY = 0,
@@ -40,6 +43,15 @@ struct slottee_lt_context {
   uintptr_t stack_scratch_addr;
   uintptr_t stack_scratch;
   uintptr_t tls_scratch;
+  uintptr_t trap_entry_sp;
+  uintptr_t trap_entry_tp;
+  uintptr_t trap_exit_sp;
+  uintptr_t trap_exit_tp;
+  uintptr_t trap_guard_addr;
+  uintptr_t trap_guard_value;
+  uintptr_t trap_tls_marker;
+  uintptr_t trap_boundary_marker;
+  uintptr_t trap_probe_count;
 };
 
 struct slottee_lt_desc {
@@ -167,6 +179,15 @@ slottee_lt_context_init(struct slottee_lt_desc* lt)
   lt->context.stack_scratch_addr = 0;
   lt->context.stack_scratch = 0;
   lt->context.tls_scratch = 0;
+  lt->context.trap_entry_sp = 0;
+  lt->context.trap_entry_tp = 0;
+  lt->context.trap_exit_sp = 0;
+  lt->context.trap_exit_tp = 0;
+  lt->context.trap_guard_addr = 0;
+  lt->context.trap_guard_value = 0;
+  lt->context.trap_tls_marker = 0;
+  lt->context.trap_boundary_marker = 0;
+  lt->context.trap_probe_count = 0;
 }
 
 static int
@@ -283,6 +304,90 @@ slottee_lt_bind_probe_ok(const struct slottee_lt_desc* lt)
       stack_scratch[0] == lt->context.stack_scratch &&
       tls[2] == lt->context.tls_scratch &&
       tls[3] == lt->lease_id;
+}
+
+static int
+slottee_lt_trap_safe_boundary_probe(struct slottee_lt_desc* lt,
+    uintptr_t entry_sp, uintptr_t entry_tp,
+    uintptr_t guard_addr, uintptr_t guard_value)
+{
+  uintptr_t observed_sp = 0;
+  uintptr_t observed_tp = 0;
+  uintptr_t* tls = (uintptr_t*)entry_tp;
+
+  __asm__ volatile("mv %0, sp" : "=r"(observed_sp));
+  __asm__ volatile("mv %0, tp" : "=r"(observed_tp));
+
+  if (!slottee_addr_in_range(entry_sp, lt->context.stack_base, lt->context.stack_size) ||
+      !slottee_addr_in_range(observed_sp, lt->context.stack_base, lt->context.stack_size) ||
+      observed_tp != entry_tp ||
+      observed_tp != lt->context.tls_base ||
+      !slottee_addr_in_range(guard_addr, lt->context.stack_base, lt->context.stack_size))
+    return 0;
+
+  tls[4] = SLOTTEE_LT_TRAP_SAFE_TLS_MARKER_BASE | lt->slot_id;
+  tls[5] = lt->lease_id;
+  tls[6] = SLOTTEE_LT_TRAP_SAFE_BOUNDARY_BASE | lt->slot_id;
+
+  lt->context.trap_tls_marker = tls[4];
+  lt->context.trap_boundary_marker = tls[6];
+  lt->context.trap_probe_count++;
+
+  return *((volatile uintptr_t*)guard_addr) == guard_value;
+}
+
+static void
+slottee_lt_trap_safe_entry(void* opaque)
+{
+  struct slottee_lt_desc* lt = (struct slottee_lt_desc*)opaque;
+  volatile uintptr_t trap_guard = SLOTTEE_LT_TRAP_SAFE_STACK_GUARD_BASE | lt->slot_id;
+  uintptr_t entry_sp = 0;
+  uintptr_t entry_tp = 0;
+  uintptr_t exit_sp = 0;
+  uintptr_t exit_tp = 0;
+
+  __asm__ volatile("mv %0, sp" : "=r"(entry_sp));
+  __asm__ volatile("mv %0, tp" : "=r"(entry_tp));
+
+  lt->context.trap_entry_sp = entry_sp;
+  lt->context.trap_entry_tp = entry_tp;
+  lt->context.trap_guard_addr = (uintptr_t)&trap_guard;
+  lt->context.trap_guard_value = trap_guard;
+
+  if (!slottee_lt_trap_safe_boundary_probe(lt, entry_sp, entry_tp,
+          (uintptr_t)&trap_guard, trap_guard))
+    return;
+
+  __asm__ volatile("mv %0, sp" : "=r"(exit_sp));
+  __asm__ volatile("mv %0, tp" : "=r"(exit_tp));
+
+  lt->context.trap_exit_sp = exit_sp;
+  lt->context.trap_exit_tp = exit_tp;
+}
+
+static int
+slottee_lt_trap_safe_probe_ok(const struct slottee_lt_desc* lt)
+{
+  const uintptr_t* tls = (const uintptr_t*)lt->context.tls_base;
+  const volatile uintptr_t* guard =
+      (const volatile uintptr_t*)lt->context.trap_guard_addr;
+
+  return lt->context.runtime_sp_before != 0 &&
+      lt->context.runtime_tp_before == lt->context.runtime_tp_after &&
+      lt->context.runtime_sp_before == lt->context.runtime_sp_after &&
+      slottee_addr_in_range(lt->context.trap_entry_sp,
+          lt->context.stack_base, lt->context.stack_size) &&
+      lt->context.trap_entry_tp == lt->context.tls_base &&
+      slottee_addr_in_range(lt->context.trap_exit_sp,
+          lt->context.stack_base, lt->context.stack_size) &&
+      lt->context.trap_exit_tp == lt->context.tls_base &&
+      slottee_addr_in_range(lt->context.trap_guard_addr,
+          lt->context.stack_base, lt->context.stack_size) &&
+      guard[0] == lt->context.trap_guard_value &&
+      tls[4] == lt->context.trap_tls_marker &&
+      tls[5] == lt->lease_id &&
+      tls[6] == lt->context.trap_boundary_marker &&
+      lt->context.trap_probe_count == 1;
 }
 
 uintptr_t
@@ -412,4 +517,39 @@ slottee_lt_bind_run(uintptr_t slot_id, uintptr_t lease_id)
     return SLOTTEE_SLOT_MAGIC;
 
   return SLOTTEE_LT_BIND_MAGIC;
+}
+
+uintptr_t
+slottee_lt_trap_safe_run(uintptr_t slot_id, uintptr_t lease_id)
+{
+  struct slottee_lt_desc* lt;
+
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return SLOTTEE_SLOT_MAGIC;
+
+  lt = &slottee_lts[slot_id];
+  slottee_lt_prepare(lt, slot_id, lease_id);
+  slottee_lt_context_init(lt);
+
+  if (!slottee_lt_context_isolated(lt))
+    return SLOTTEE_SLOT_MAGIC;
+
+  slottee_lt_set_state(lt, SLOTTEE_LT_RUNNING);
+  slottee_lt_bind_switch(lt->context.saved_sp, lt->context.saved_tp,
+      slottee_lt_trap_safe_entry, lt,
+      &lt->context.runtime_sp_before, &lt->context.runtime_tp_before);
+  __asm__ volatile("mv %0, sp" : "=r"(lt->context.runtime_sp_after));
+  __asm__ volatile("mv %0, tp" : "=r"(lt->context.runtime_tp_after));
+  lt->run_count++;
+  slottee_lt_set_state(lt, SLOTTEE_LT_EXITED);
+
+  if (!slottee_lt_trap_safe_probe_ok(lt) ||
+      !slottee_lt_context_isolated(lt) ||
+      lt->trace_len != 3 ||
+      lt->state_trace[0] != SLOTTEE_LT_READY ||
+      lt->state_trace[1] != SLOTTEE_LT_RUNNING ||
+      lt->state_trace[2] != SLOTTEE_LT_EXITED)
+    return SLOTTEE_SLOT_MAGIC;
+
+  return SLOTTEE_LT_TRAP_SAFE_MAGIC;
 }

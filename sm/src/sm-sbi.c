@@ -75,7 +75,8 @@ unsigned long sbi_sm_enter_slot(
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD &&
-       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_BIND)) {
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_BIND &&
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_TRAP_SAFE)) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
@@ -85,7 +86,8 @@ unsigned long sbi_sm_enter_slot(
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD ||
-      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_BIND) {
+      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_BIND ||
+      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_TRAP_SAFE) {
     uintptr_t slot_mode = SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
 
     if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT)
@@ -96,6 +98,8 @@ unsigned long sbi_sm_enter_slot(
       slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_YIELD;
     else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_BIND)
       slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_BIND;
+    else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_TRAP_SAFE)
+      slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_TRAP_SAFE;
 
     ret = activate_enclave_slot((enclave_id) eid, &req.cap, &resp);
     resp.value = 0;
