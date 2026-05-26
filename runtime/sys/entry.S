@@ -135,6 +135,16 @@ slottee_runtime_reenter:
   mv a0, t6
   la t0, slottee_slot_trampoline
   jalr t0
+  la t0, slottee_active_user_prepare_user_entry
+  jalr t0
+  beqz a0, 1f
+
+  /* Mirror the first-boot drop from runtime S-mode into the eapp. */
+  li t0, 0x100
+  csrrc x0, sstatus, t0
+  csrrw sp, sscratch, sp
+  li a0, 0
+  sret
 1:
   j 1b
 

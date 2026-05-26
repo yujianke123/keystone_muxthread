@@ -44,6 +44,13 @@ struct slottee_active_user_context {
 };
 
 static struct slottee_active_user_context slottee_active_user;
+static uintptr_t slottee_user_entry_point;
+
+void
+slottee_set_user_entry(uintptr_t entry)
+{
+  slottee_user_entry_point = entry;
+}
 
 static int
 slottee_user_addr_in_range(uintptr_t addr, uintptr_t base, uintptr_t size)
@@ -181,20 +188,24 @@ slottee_activate_user_context(uintptr_t slot_id, uintptr_t lease_id, uintptr_t m
     slottee_prepare_user_memory(slot_id);
 }
 
-void
+int
 slottee_active_user_prepare_user_entry(void)
 {
   if (!slottee_active_user.active ||
       slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL ||
-      !slottee_active_user.user_alloc_ok)
-    return;
+      !slottee_active_user.user_alloc_ok ||
+      !slottee_user_entry_point)
+    return 0;
 
-  printf("[slottee] lt_user_entry slot=%lu sscratch=0x%lx tp=0x%lx\r\n",
-      slottee_active_user.slot_id, slottee_active_user.user_stack_top,
-      slottee_active_user.user_tls_base);
+  printf("[slottee] lt_user_entry slot=%lu sepc=0x%lx sscratch=0x%lx tp=0x%lx\r\n",
+      slottee_active_user.slot_id, slottee_user_entry_point,
+      slottee_active_user.user_stack_top, slottee_active_user.user_tls_base);
 
+  __asm__ volatile("csrw sepc, %0" :: "r"(slottee_user_entry_point));
   __asm__ volatile("csrw sscratch, %0" :: "r"(slottee_active_user.user_stack_top));
   __asm__ volatile("mv tp, %0" :: "r"(slottee_active_user.user_tls_base) : "memory");
+
+  return 1;
 }
 
 void

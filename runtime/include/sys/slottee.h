@@ -6,7 +6,8 @@
 struct encl_ctx;
 
 void slottee_slot_trampoline(uintptr_t slot_token);
-void slottee_active_user_prepare_user_entry(void);
+void slottee_set_user_entry(uintptr_t entry);
+int slottee_active_user_prepare_user_entry(void);
 void slottee_active_user_record_syscall(struct encl_ctx* ctx, uintptr_t syscall_id);
 void slottee_active_user_record_ocall(struct encl_ctx* ctx);
 void slottee_active_user_record_ocall_resume(uintptr_t value);

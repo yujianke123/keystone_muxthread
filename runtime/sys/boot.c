@@ -44,6 +44,7 @@ int verify_and_load_elf_file(uintptr_t ptr, size_t file_size, bool is_eapp) {
 
   if (is_eapp) { // setup entry point
     uintptr_t entry = elf_getEntryPoint(&elf_file);
+    slottee_set_user_entry(entry);
     csr_write(sepc, entry);
   }
   return ret;

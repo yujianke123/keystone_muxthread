@@ -745,6 +745,79 @@ run_enter_slot_lt_user_ocall(const char* eapp_file, const char* rt_file,
 }
 
 static int
+run_enter_slot_lt_user_ocall_same_enclave(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  Keystone::Enclave enclave;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t slot1_lease = 0;
+  uintptr_t slot2_lease = 0;
+  uintptr_t slot1_ocalls = 0;
+  uintptr_t slot2_ocalls = 0;
+  uintptr_t slot1_resumes = 0;
+  uintptr_t slot2_resumes = 0;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT same-enclave LT user ocall failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+
+  printf("same_enclave_lt_user_ocall,slot,status,value,lease,ocalls,resumes\n");
+  fflush(stdout);
+
+  if (enter_slot_user_ocall_round(enclave, 1, &status, &value, &slot1_lease,
+          &slot1_ocalls, &slot1_resumes) != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT same-enclave LT user ocall slot1",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("same_enclave_lt_user_ocall", 1, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC)) {
+    enclave.destroy();
+    return 1;
+  }
+  printf("same_enclave_lt_user_ocall,1,%lu,%lu,%lu,%lu,%lu\n",
+      status, value, slot1_lease, slot1_ocalls, slot1_resumes);
+  fflush(stdout);
+
+  status = 0;
+  value = 0;
+  if (enter_slot_user_ocall_round(enclave, 2, &status, &value, &slot2_lease,
+          &slot2_ocalls, &slot2_resumes) != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT same-enclave LT user ocall slot2",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("same_enclave_lt_user_ocall", 2, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC)) {
+    enclave.destroy();
+    return 1;
+  }
+  printf("same_enclave_lt_user_ocall,2,%lu,%lu,%lu,%lu,%lu\n",
+      status, value, slot2_lease, slot2_ocalls, slot2_resumes);
+  fflush(stdout);
+
+  if (slot1_lease == 0 || slot2_lease == 0 || slot1_lease == slot2_lease) {
+    printf("[FAIL] ENTER_SLOT same-enclave LT user ocall returned invalid lease ids (%lu, %lu)\n",
+        slot1_lease, slot2_lease);
+    enclave.destroy();
+    return 1;
+  }
+
+  if (slot1_ocalls != 1 || slot2_ocalls != 1 ||
+      slot1_resumes != 1 || slot2_resumes != 1) {
+    printf("[FAIL] ENTER_SLOT same-enclave LT user ocall returned unexpected ocall/resume counts (%lu/%lu, %lu/%lu)\n",
+        slot1_ocalls, slot1_resumes, slot2_ocalls, slot2_resumes);
+    enclave.destroy();
+    return 1;
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
+static int
 run_enter_slot_lt_user_illegal(const char* eapp_file, const char* rt_file,
     const char* ld_file, Keystone::Params params) {
   return run_enter_slot_lt_user_probe("lt_user_illegal",
@@ -773,7 +846,9 @@ main(int argc, char** argv) {
         "[--enter-slot-lt-bind] [--enter-slot-lt-trap-safe] "
         "[--enter-slot-lt-ecall] [--enter-slot-lt-user] "
         "[--enter-slot-same-enclave-multislot] "
-        "[--enter-slot-lt-user-ocall] [--enter-slot-lt-user-illegal] "
+        "[--enter-slot-lt-user-ocall] "
+        "[--enter-slot-lt-user-ocall-same-enclave] "
+        "[--enter-slot-lt-user-illegal] "
         "[--enter-slot-lt-user-page-fault] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
@@ -802,6 +877,7 @@ main(int argc, char** argv) {
   int enter_slot_lt_user = 0;
   int enter_slot_same_enclave_multislot = 0;
   int enter_slot_lt_user_ocall = 0;
+  int enter_slot_lt_user_ocall_same_enclave = 0;
   int enter_slot_lt_user_illegal = 0;
   int enter_slot_lt_user_page_fault = 0;
 
@@ -834,6 +910,8 @@ main(int argc, char** argv) {
       {"enter-slot-same-enclave-multislot", no_argument,
        &enter_slot_same_enclave_multislot, 1},
       {"enter-slot-lt-user-ocall", no_argument, &enter_slot_lt_user_ocall, 1},
+      {"enter-slot-lt-user-ocall-same-enclave", no_argument,
+       &enter_slot_lt_user_ocall_same_enclave, 1},
       {"enter-slot-lt-user-illegal", no_argument, &enter_slot_lt_user_illegal, 1},
       {"enter-slot-lt-user-page-fault", no_argument, &enter_slot_lt_user_page_fault, 1},
       {"utm-size", required_argument, 0, 'u'},
@@ -916,6 +994,11 @@ main(int argc, char** argv) {
 
   if (enter_slot_lt_user_ocall) {
     return run_enter_slot_lt_user_ocall(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_lt_user_ocall_same_enclave) {
+    return run_enter_slot_lt_user_ocall_same_enclave(
+        eapp_file, rt_file, ld_file, params);
   }
 
   if (enter_slot_lt_user_illegal) {
