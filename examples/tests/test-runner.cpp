@@ -399,9 +399,16 @@ run_enter_slot_lt_context(const char* eapp_file, const char* rt_file,
       SLOTTEE_LT_CONTEXT_MAGIC, eapp_file, rt_file, ld_file, params);
 }
 
+static int
+run_enter_slot_lt_yield(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  return run_enter_slot_pool_case("lt_yield", SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD,
+      SLOTTEE_LT_YIELD_MAGIC, eapp_file, rt_file, ld_file, params);
+}
+
 int
 main(int argc, char** argv) {
-  if (argc < 4 || argc > 16) {
+  if (argc < 4 || argc > 17) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
@@ -410,7 +417,7 @@ main(int argc, char** argv) {
         "[--enter-slot-multislot] [--enter-slot-capability] "
         "[--enter-slot-revoke-replay] [--enter-slot-bench] "
         "[--enter-slot-pthread-pool] [--enter-slot-lt-scheduler] "
-        "[--enter-slot-lt-context] [--utm-ptr 0xPTR] "
+        "[--enter-slot-lt-context] [--enter-slot-lt-yield] [--utm-ptr 0xPTR] "
         "[--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -431,6 +438,7 @@ main(int argc, char** argv) {
   int enter_slot_pthread_pool = 0;
   int enter_slot_lt_scheduler = 0;
   int enter_slot_lt_context = 0;
+  int enter_slot_lt_yield = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -453,6 +461,7 @@ main(int argc, char** argv) {
       {"enter-slot-pthread-pool", no_argument, &enter_slot_pthread_pool, 1},
       {"enter-slot-lt-scheduler", no_argument, &enter_slot_lt_scheduler, 1},
       {"enter-slot-lt-context", no_argument, &enter_slot_lt_context, 1},
+      {"enter-slot-lt-yield", no_argument, &enter_slot_lt_yield, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -507,6 +516,10 @@ main(int argc, char** argv) {
     return run_enter_slot_lt_context(eapp_file, rt_file, ld_file, params);
   }
 
+  if (enter_slot_lt_yield) {
+    return run_enter_slot_lt_yield(eapp_file, rt_file, ld_file, params);
+  }
+
   Keystone::Enclave enclave;
 
   if (self_timing) {
@@ -554,7 +567,7 @@ main(int argc, char** argv) {
     }
 
     enter_slot_ret = enclave.enterSlot(
-        1, SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT + 1, &enter_slot_status, &enter_slot_value);
+        1, SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD + 1, &enter_slot_status, &enter_slot_value);
     if (expect_enter_slot_status("ENTER_SLOT flags", enter_slot_ret, enter_slot_status,
             enter_slot_value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
       return 1;

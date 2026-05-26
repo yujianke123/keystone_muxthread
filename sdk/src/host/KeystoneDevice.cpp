@@ -335,7 +335,8 @@ MockKeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot
       (req.flags != SLOTTEE_ENTER_SLOT_FLAG_NONE &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT &&
-       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT)) {
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT &&
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD)) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   } else if (req.cap.epoch != SLOTTEE_INITIAL_EPOCH) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
@@ -355,6 +356,11 @@ MockKeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot
   } else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_SUCCESS;
     local_resp.value = SLOTTEE_LT_CONTEXT_MAGIC;
+    local_resp.lease_id = 1;
+    local_resp.expiry_cycle = req.cap.max_lease_cycles;
+  } else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_SUCCESS;
+    local_resp.value = SLOTTEE_LT_YIELD_MAGIC;
     local_resp.lease_id = 1;
     local_resp.expiry_cycle = req.cap.max_lease_cycles;
   } else {
