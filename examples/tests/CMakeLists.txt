@@ -23,7 +23,9 @@ set(all_test_bins
 
 set(slottee_fault_test_bins
   test-lt-user-illegal
-  test-lt-user-page-fault)
+  test-lt-user-page-fault
+  test-lt-user-illegal-cleanup
+  test-lt-user-page-fault-cleanup)
 
 # and (2) define the recipe of the test below:
 
@@ -81,6 +83,12 @@ target_link_libraries(test-lt-user-illegal ${KEYSTONE_LIB_EAPP})
 
 add_executable(test-lt-user-page-fault lt-user-page-fault/lt-user-page-fault.c)
 target_link_libraries(test-lt-user-page-fault ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-illegal-cleanup lt-user-illegal-cleanup/lt-user-illegal-cleanup.c)
+target_link_libraries(test-lt-user-illegal-cleanup ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-page-fault-cleanup lt-user-page-fault-cleanup/lt-user-page-fault-cleanup.c)
+target_link_libraries(test-lt-user-page-fault-cleanup ${KEYSTONE_LIB_EAPP})
 
 ###############################################
 # a script for running all test enclaves
@@ -175,8 +183,16 @@ file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-lt-user-illegal\" ]
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-illegal eyrie-rt loader.bin --load-only --enter-slot-lt-user-illegal\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-lt-user-illegal-cleanup-same-enclave\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-illegal-cleanup eyrie-rt loader.bin --load-only --enter-slot-lt-user-illegal-cleanup-same-enclave\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-lt-user-page-fault\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-page-fault eyrie-rt loader.bin --load-only --enter-slot-lt-user-page-fault\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-lt-user-page-fault-cleanup-same-enclave\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-page-fault-cleanup eyrie-rt loader.bin --load-only --enter-slot-lt-user-page-fault-cleanup-same-enclave\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 foreach (test IN ITEMS ${all_test_bins})
