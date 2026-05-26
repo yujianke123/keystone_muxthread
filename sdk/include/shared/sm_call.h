@@ -25,6 +25,7 @@
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT 2
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT 3
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD 4
+#define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_BIND 5
 #define SLOTTEE_CAP_RIGHT_ENTER        1
 #define SLOTTEE_DEFAULT_CAP_SEQ        1
 #define SLOTTEE_DEFAULT_MAX_LEASE_CYCLES ((uintptr_t)-1 / 4)
@@ -42,6 +43,7 @@
 #define SLOTTEE_SLOT_TOKEN_MODE_LT_SCHED   1
 #define SLOTTEE_SLOT_TOKEN_MODE_LT_CONTEXT 2
 #define SLOTTEE_SLOT_TOKEN_MODE_LT_YIELD   3
+#define SLOTTEE_SLOT_TOKEN_MODE_LT_BIND    4
 #define SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id, mode) \
   ((((uintptr_t)(lease_id)) << SLOTTEE_SLOT_TOKEN_LEASE_SHIFT) | \
    (((uintptr_t)(mode)) << SLOTTEE_SLOT_TOKEN_MODE_SHIFT) | ((uintptr_t)(slot_id)))
@@ -56,6 +58,7 @@
 #define SLOTTEE_LT_SCHED_MAGIC         0x51515152
 #define SLOTTEE_LT_CONTEXT_MAGIC       0x51515153
 #define SLOTTEE_LT_YIELD_MAGIC         0x51515154
+#define SLOTTEE_LT_BIND_MAGIC          0x51515155
 
 /* 3000-3999 are called by enclave */
 #define SBI_SM_RANDOM            3001

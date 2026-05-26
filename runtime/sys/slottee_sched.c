@@ -11,6 +11,8 @@
 #define SLOTTEE_LT_YIELD_REASON_TEST 1
 #define SLOTTEE_LT_STACK_SCRATCH_BASE ((uintptr_t)0x51510000)
 #define SLOTTEE_LT_TLS_SCRATCH_BASE   ((uintptr_t)0x51520000)
+#define SLOTTEE_LT_BIND_STACK_SCRATCH_BASE ((uintptr_t)0x51530000)
+#define SLOTTEE_LT_BIND_TLS_SCRATCH_BASE   ((uintptr_t)0x51540000)
 
 enum slottee_lt_state {
   SLOTTEE_LT_EMPTY = 0,
@@ -29,6 +31,13 @@ struct slottee_lt_context {
   uintptr_t saved_pc;
   uintptr_t saved_sp;
   uintptr_t saved_tp;
+  uintptr_t runtime_sp_before;
+  uintptr_t runtime_tp_before;
+  uintptr_t runtime_sp_after;
+  uintptr_t runtime_tp_after;
+  uintptr_t bound_sp;
+  uintptr_t bound_tp;
+  uintptr_t stack_scratch_addr;
   uintptr_t stack_scratch;
   uintptr_t tls_scratch;
 };
@@ -55,9 +64,15 @@ struct slottee_ready_queue {
 };
 
 static struct slottee_lt_desc slottee_lts[SLOTTEE_MAX_SLOTS];
-static uintptr_t slottee_lt_stack_backing[SLOTTEE_MAX_SLOTS][SLOTTEE_LT_STACK_WORDS];
-static uintptr_t slottee_lt_tls_backing[SLOTTEE_MAX_SLOTS][SLOTTEE_LT_TLS_WORDS];
+static uintptr_t slottee_lt_stack_backing[SLOTTEE_MAX_SLOTS][SLOTTEE_LT_STACK_WORDS]
+    __attribute__((aligned(16)));
+static uintptr_t slottee_lt_tls_backing[SLOTTEE_MAX_SLOTS][SLOTTEE_LT_TLS_WORDS]
+    __attribute__((aligned(16)));
 static struct slottee_ready_queue slottee_ready_queue;
+
+void slottee_lt_bind_switch(uintptr_t lt_sp, uintptr_t lt_tp,
+    void (*entry)(void*), void* arg,
+    uintptr_t* runtime_sp_before, uintptr_t* runtime_tp_before);
 
 static int
 slottee_range_overlaps(uintptr_t base_a, uintptr_t size_a, uintptr_t base_b, uintptr_t size_b)
@@ -66,6 +81,12 @@ slottee_range_overlaps(uintptr_t base_a, uintptr_t size_a, uintptr_t base_b, uin
   uintptr_t end_b = base_b + size_b;
 
   return base_a < end_b && base_b < end_a;
+}
+
+static int
+slottee_addr_in_range(uintptr_t addr, uintptr_t base, uintptr_t size)
+{
+  return addr >= base && addr < (base + size);
 }
 
 static void
@@ -137,6 +158,13 @@ slottee_lt_context_init(struct slottee_lt_desc* lt)
   lt->context.saved_pc = 0;
   lt->context.saved_sp = lt->context.stack_base + lt->context.stack_size;
   lt->context.saved_tp = lt->context.tls_base;
+  lt->context.runtime_sp_before = 0;
+  lt->context.runtime_tp_before = 0;
+  lt->context.runtime_sp_after = 0;
+  lt->context.runtime_tp_after = 0;
+  lt->context.bound_sp = 0;
+  lt->context.bound_tp = 0;
+  lt->context.stack_scratch_addr = 0;
   lt->context.stack_scratch = 0;
   lt->context.tls_scratch = 0;
 }
@@ -213,6 +241,48 @@ slottee_lt_yield_trace_ok(const struct slottee_lt_desc* lt)
       lt->state_trace[2] == SLOTTEE_LT_YIELDED &&
       lt->state_trace[3] == SLOTTEE_LT_RUNNING &&
       lt->state_trace[4] == SLOTTEE_LT_EXITED;
+}
+
+static void
+slottee_lt_binding_entry(void* opaque)
+{
+  struct slottee_lt_desc* lt = (struct slottee_lt_desc*)opaque;
+  volatile uintptr_t stack_scratch = SLOTTEE_LT_BIND_STACK_SCRATCH_BASE | lt->slot_id;
+  uintptr_t observed_sp = 0;
+  uintptr_t observed_tp = 0;
+  uintptr_t* tls;
+
+  __asm__ volatile("mv %0, sp" : "=r"(observed_sp));
+  __asm__ volatile("mv %0, tp" : "=r"(observed_tp));
+
+  tls = (uintptr_t*)observed_tp;
+  tls[2] = SLOTTEE_LT_BIND_TLS_SCRATCH_BASE | lt->slot_id;
+  tls[3] = lt->lease_id;
+
+  lt->context.bound_sp = observed_sp;
+  lt->context.bound_tp = observed_tp;
+  lt->context.stack_scratch_addr = (uintptr_t)&stack_scratch;
+  lt->context.stack_scratch = stack_scratch;
+  lt->context.tls_scratch = tls[2];
+}
+
+static int
+slottee_lt_bind_probe_ok(const struct slottee_lt_desc* lt)
+{
+  const uintptr_t* stack_scratch = (const uintptr_t*)lt->context.stack_scratch_addr;
+  const uintptr_t* tls = (const uintptr_t*)lt->context.tls_base;
+
+  return lt->context.runtime_sp_before != 0 &&
+      lt->context.runtime_tp_before == lt->context.runtime_tp_after &&
+      lt->context.runtime_sp_before == lt->context.runtime_sp_after &&
+      slottee_addr_in_range(lt->context.bound_sp,
+          lt->context.stack_base, lt->context.stack_size) &&
+      lt->context.bound_tp == lt->context.tls_base &&
+      slottee_addr_in_range(lt->context.stack_scratch_addr,
+          lt->context.stack_base, lt->context.stack_size) &&
+      stack_scratch[0] == lt->context.stack_scratch &&
+      tls[2] == lt->context.tls_scratch &&
+      tls[3] == lt->lease_id;
 }
 
 uintptr_t
@@ -307,4 +377,39 @@ slottee_lt_yield_run(uintptr_t slot_id, uintptr_t lease_id)
     return SLOTTEE_SLOT_MAGIC;
 
   return SLOTTEE_LT_YIELD_MAGIC;
+}
+
+uintptr_t
+slottee_lt_bind_run(uintptr_t slot_id, uintptr_t lease_id)
+{
+  struct slottee_lt_desc* lt;
+
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return SLOTTEE_SLOT_MAGIC;
+
+  lt = &slottee_lts[slot_id];
+  slottee_lt_prepare(lt, slot_id, lease_id);
+  slottee_lt_context_init(lt);
+
+  if (!slottee_lt_context_isolated(lt))
+    return SLOTTEE_SLOT_MAGIC;
+
+  slottee_lt_set_state(lt, SLOTTEE_LT_RUNNING);
+  slottee_lt_bind_switch(lt->context.saved_sp, lt->context.saved_tp,
+      slottee_lt_binding_entry, lt,
+      &lt->context.runtime_sp_before, &lt->context.runtime_tp_before);
+  __asm__ volatile("mv %0, sp" : "=r"(lt->context.runtime_sp_after));
+  __asm__ volatile("mv %0, tp" : "=r"(lt->context.runtime_tp_after));
+  lt->run_count++;
+  slottee_lt_set_state(lt, SLOTTEE_LT_EXITED);
+
+  if (!slottee_lt_bind_probe_ok(lt) ||
+      !slottee_lt_context_isolated(lt) ||
+      lt->trace_len != 3 ||
+      lt->state_trace[0] != SLOTTEE_LT_READY ||
+      lt->state_trace[1] != SLOTTEE_LT_RUNNING ||
+      lt->state_trace[2] != SLOTTEE_LT_EXITED)
+    return SLOTTEE_SLOT_MAGIC;
+
+  return SLOTTEE_LT_BIND_MAGIC;
 }
