@@ -27,6 +27,7 @@
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD 4
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_BIND 5
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_TRAP_SAFE 6
+#define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL 7
 #define SLOTTEE_CAP_RIGHT_ENTER        1
 #define SLOTTEE_DEFAULT_CAP_SEQ        1
 #define SLOTTEE_DEFAULT_MAX_LEASE_CYCLES ((uintptr_t)-1 / 4)
@@ -46,6 +47,7 @@
 #define SLOTTEE_SLOT_TOKEN_MODE_LT_YIELD   3
 #define SLOTTEE_SLOT_TOKEN_MODE_LT_BIND    4
 #define SLOTTEE_SLOT_TOKEN_MODE_LT_TRAP_SAFE 5
+#define SLOTTEE_SLOT_TOKEN_MODE_LT_ECALL   6
 #define SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id, mode) \
   ((((uintptr_t)(lease_id)) << SLOTTEE_SLOT_TOKEN_LEASE_SHIFT) | \
    (((uintptr_t)(mode)) << SLOTTEE_SLOT_TOKEN_MODE_SHIFT) | ((uintptr_t)(slot_id)))
@@ -62,6 +64,19 @@
 #define SLOTTEE_LT_YIELD_MAGIC         0x51515154
 #define SLOTTEE_LT_BIND_MAGIC          0x51515155
 #define SLOTTEE_LT_TRAP_SAFE_MAGIC     0x51515156
+#define SLOTTEE_LT_ECALL_MAGIC         0x51515157
+#define SLOTTEE_LT_ECALL_REQ_MAGIC     0x51580000
+#define SLOTTEE_LT_ECALL_REPLY_MAGIC   0x51590000
+#define SLOTTEE_LT_ECALL_TOKEN_SHIFT   8
+#define SLOTTEE_LT_ECALL_TOKEN_MASK    0xff
+#define SLOTTEE_LT_ECALL_MAKE_REQUEST(slot_id, lease_id) \
+  (SLOTTEE_LT_ECALL_REQ_MAGIC | \
+   (((uintptr_t)(slot_id)) << SLOTTEE_LT_ECALL_TOKEN_SHIFT) | \
+   ((uintptr_t)(lease_id) & SLOTTEE_LT_ECALL_TOKEN_MASK))
+#define SLOTTEE_LT_ECALL_MAKE_REPLY(slot_id, lease_id) \
+  (SLOTTEE_LT_ECALL_REPLY_MAGIC | \
+   (((uintptr_t)(slot_id)) << SLOTTEE_LT_ECALL_TOKEN_SHIFT) | \
+   ((uintptr_t)(lease_id) & SLOTTEE_LT_ECALL_TOKEN_MASK))
 
 /* 3000-3999 are called by enclave */
 #define SBI_SM_RANDOM            3001
@@ -70,6 +85,7 @@
 #define SBI_SM_STOP_ENCLAVE      3004
 #define SBI_SM_EXIT_SLOT         3005
 #define SBI_SM_EXIT_ENCLAVE      3006
+#define SBI_SM_LT_ECALL_PROBE    3007
 #define FID_RANGE_ENCLAVE        3999
 
 /* 4000-4999 are experimental */

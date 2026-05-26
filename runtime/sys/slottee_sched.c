@@ -16,6 +16,8 @@
 #define SLOTTEE_LT_TRAP_SAFE_STACK_GUARD_BASE ((uintptr_t)0x51550000)
 #define SLOTTEE_LT_TRAP_SAFE_TLS_MARKER_BASE  ((uintptr_t)0x51560000)
 #define SLOTTEE_LT_TRAP_SAFE_BOUNDARY_BASE    ((uintptr_t)0x51570000)
+#define SLOTTEE_LT_ECALL_STACK_GUARD_BASE     ((uintptr_t)0x515a0000)
+#define SLOTTEE_LT_ECALL_TLS_MARKER_BASE      ((uintptr_t)0x515b0000)
 
 enum slottee_lt_state {
   SLOTTEE_LT_EMPTY = 0,
@@ -52,6 +54,17 @@ struct slottee_lt_context {
   uintptr_t trap_tls_marker;
   uintptr_t trap_boundary_marker;
   uintptr_t trap_probe_count;
+  uintptr_t ecall_before_sp;
+  uintptr_t ecall_before_tp;
+  uintptr_t ecall_after_sp;
+  uintptr_t ecall_after_tp;
+  uintptr_t ecall_guard_addr;
+  uintptr_t ecall_guard_value;
+  uintptr_t ecall_tls_marker;
+  uintptr_t ecall_request;
+  uintptr_t ecall_reply;
+  uintptr_t ecall_status;
+  uintptr_t ecall_probe_count;
 };
 
 struct slottee_lt_desc {
@@ -188,6 +201,17 @@ slottee_lt_context_init(struct slottee_lt_desc* lt)
   lt->context.trap_tls_marker = 0;
   lt->context.trap_boundary_marker = 0;
   lt->context.trap_probe_count = 0;
+  lt->context.ecall_before_sp = 0;
+  lt->context.ecall_before_tp = 0;
+  lt->context.ecall_after_sp = 0;
+  lt->context.ecall_after_tp = 0;
+  lt->context.ecall_guard_addr = 0;
+  lt->context.ecall_guard_value = 0;
+  lt->context.ecall_tls_marker = 0;
+  lt->context.ecall_request = 0;
+  lt->context.ecall_reply = 0;
+  lt->context.ecall_status = 0;
+  lt->context.ecall_probe_count = 0;
 }
 
 static int
@@ -390,6 +414,81 @@ slottee_lt_trap_safe_probe_ok(const struct slottee_lt_desc* lt)
       lt->context.trap_probe_count == 1;
 }
 
+static void
+slottee_lt_ecall_entry(void* opaque)
+{
+  struct slottee_lt_desc* lt = (struct slottee_lt_desc*)opaque;
+  volatile uintptr_t ecall_guard = SLOTTEE_LT_ECALL_STACK_GUARD_BASE | lt->slot_id;
+  uintptr_t before_sp = 0;
+  uintptr_t before_tp = 0;
+  uintptr_t after_sp = 0;
+  uintptr_t after_tp = 0;
+  uintptr_t reply = 0;
+  uintptr_t request;
+  uintptr_t* tls;
+
+  __asm__ volatile("mv %0, sp" : "=r"(before_sp));
+  __asm__ volatile("mv %0, tp" : "=r"(before_tp));
+
+  request = SLOTTEE_LT_ECALL_MAKE_REQUEST(lt->slot_id, lt->lease_id);
+  tls = (uintptr_t*)before_tp;
+  tls[7] = SLOTTEE_LT_ECALL_TLS_MARKER_BASE | lt->slot_id;
+  tls[8] = request;
+
+  lt->context.ecall_before_sp = before_sp;
+  lt->context.ecall_before_tp = before_tp;
+  lt->context.ecall_guard_addr = (uintptr_t)&ecall_guard;
+  lt->context.ecall_guard_value = ecall_guard;
+  lt->context.ecall_tls_marker = tls[7];
+  lt->context.ecall_request = request;
+
+  lt->context.ecall_status =
+      sbi_lt_ecall_probe(lt->slot_id, lt->lease_id, request, &reply);
+
+  __asm__ volatile("mv %0, sp" : "=r"(after_sp));
+  __asm__ volatile("mv %0, tp" : "=r"(after_tp));
+
+  lt->context.ecall_after_sp = after_sp;
+  lt->context.ecall_after_tp = after_tp;
+  lt->context.ecall_reply = reply;
+  lt->context.ecall_probe_count++;
+
+  tls = (uintptr_t*)after_tp;
+  tls[9] = reply;
+}
+
+static int
+slottee_lt_ecall_probe_ok(const struct slottee_lt_desc* lt)
+{
+  const uintptr_t* tls = (const uintptr_t*)lt->context.tls_base;
+  const volatile uintptr_t* guard =
+      (const volatile uintptr_t*)lt->context.ecall_guard_addr;
+
+  return lt->context.runtime_sp_before != 0 &&
+      lt->context.runtime_tp_before == lt->context.runtime_tp_after &&
+      lt->context.runtime_sp_before == lt->context.runtime_sp_after &&
+      lt->context.ecall_status == 0 &&
+      lt->context.ecall_request ==
+          SLOTTEE_LT_ECALL_MAKE_REQUEST(lt->slot_id, lt->lease_id) &&
+      lt->context.ecall_reply ==
+          SLOTTEE_LT_ECALL_MAKE_REPLY(lt->slot_id, lt->lease_id) &&
+      slottee_addr_in_range(lt->context.ecall_before_sp,
+          lt->context.stack_base, lt->context.stack_size) &&
+      lt->context.ecall_before_sp == lt->context.ecall_after_sp &&
+      lt->context.ecall_before_tp == lt->context.tls_base &&
+      lt->context.ecall_before_tp == lt->context.ecall_after_tp &&
+      slottee_addr_in_range(lt->context.ecall_after_sp,
+          lt->context.stack_base, lt->context.stack_size) &&
+      lt->context.ecall_after_tp == lt->context.tls_base &&
+      slottee_addr_in_range(lt->context.ecall_guard_addr,
+          lt->context.stack_base, lt->context.stack_size) &&
+      guard[0] == lt->context.ecall_guard_value &&
+      tls[7] == lt->context.ecall_tls_marker &&
+      tls[8] == lt->context.ecall_request &&
+      tls[9] == lt->context.ecall_reply &&
+      lt->context.ecall_probe_count == 1;
+}
+
 uintptr_t
 slottee_lt_scheduler_run(uintptr_t slot_id, uintptr_t lease_id)
 {
@@ -552,4 +651,39 @@ slottee_lt_trap_safe_run(uintptr_t slot_id, uintptr_t lease_id)
     return SLOTTEE_SLOT_MAGIC;
 
   return SLOTTEE_LT_TRAP_SAFE_MAGIC;
+}
+
+uintptr_t
+slottee_lt_ecall_run(uintptr_t slot_id, uintptr_t lease_id)
+{
+  struct slottee_lt_desc* lt;
+
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return SLOTTEE_SLOT_MAGIC;
+
+  lt = &slottee_lts[slot_id];
+  slottee_lt_prepare(lt, slot_id, lease_id);
+  slottee_lt_context_init(lt);
+
+  if (!slottee_lt_context_isolated(lt))
+    return SLOTTEE_SLOT_MAGIC;
+
+  slottee_lt_set_state(lt, SLOTTEE_LT_RUNNING);
+  slottee_lt_bind_switch(lt->context.saved_sp, lt->context.saved_tp,
+      slottee_lt_ecall_entry, lt,
+      &lt->context.runtime_sp_before, &lt->context.runtime_tp_before);
+  __asm__ volatile("mv %0, sp" : "=r"(lt->context.runtime_sp_after));
+  __asm__ volatile("mv %0, tp" : "=r"(lt->context.runtime_tp_after));
+  lt->run_count++;
+  slottee_lt_set_state(lt, SLOTTEE_LT_EXITED);
+
+  if (!slottee_lt_ecall_probe_ok(lt) ||
+      !slottee_lt_context_isolated(lt) ||
+      lt->trace_len != 3 ||
+      lt->state_trace[0] != SLOTTEE_LT_READY ||
+      lt->state_trace[1] != SLOTTEE_LT_RUNNING ||
+      lt->state_trace[2] != SLOTTEE_LT_EXITED)
+    return SLOTTEE_SLOT_MAGIC;
+
+  return SLOTTEE_LT_ECALL_MAGIC;
 }

@@ -78,6 +78,25 @@ sbi_random() {
 }
 
 uintptr_t
+sbi_lt_ecall_probe(uintptr_t slot_id, uintptr_t lease_id, uintptr_t request, uintptr_t* reply) {
+  register uintptr_t a0 __asm__("a0") = slot_id;
+  register uintptr_t a1 __asm__("a1") = lease_id;
+  register uintptr_t a2 __asm__("a2") = request;
+  register uintptr_t a6 __asm__("a6") = SBI_SM_LT_ECALL_PROBE;
+  register uintptr_t a7 __asm__("a7") = SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE;
+
+  __asm__ volatile("ecall"
+                   : "+r"(a0), "+r"(a1)
+                   : "r"(a2), "r"(a6), "r"(a7)
+                   : "memory");
+
+  if (reply)
+    *reply = a1;
+
+  return a0;
+}
+
+uintptr_t
 sbi_query_multimem(size_t *size) {
   return SBI_CALL_3(SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE,
       SBI_SM_CALL_PLUGIN, SM_MULTIMEM_PLUGIN_ID, SM_MULTIMEM_CALL_GET_SIZE, size);

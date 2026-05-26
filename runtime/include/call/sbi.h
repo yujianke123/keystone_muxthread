@@ -23,6 +23,8 @@ sbi_exit_slot(uintptr_t slot_id, uintptr_t lease_id, uintptr_t exit_reason, uint
 uintptr_t
 sbi_random();
 uintptr_t
+sbi_lt_ecall_probe(uintptr_t slot_id, uintptr_t lease_id, uintptr_t request, uintptr_t* reply);
+uintptr_t
 sbi_query_multimem(size_t *size);
 uintptr_t
 sbi_query_multimem_addr(uintptr_t *addr);

@@ -46,6 +46,10 @@ unsigned long
 sbi_sm_random(void);
 
 unsigned long
+sbi_sm_lt_ecall_probe(
+    unsigned long *out_val, uintptr_t slot_id, uintptr_t lease_id, uintptr_t request);
+
+unsigned long
 sbi_sm_call_plugin(uintptr_t plugin_id, uintptr_t call_id, uintptr_t arg0, uintptr_t arg1);
 
 #endif

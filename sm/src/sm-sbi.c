@@ -76,7 +76,8 @@ unsigned long sbi_sm_enter_slot(
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_BIND &&
-       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_TRAP_SAFE)) {
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_TRAP_SAFE &&
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL)) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
@@ -87,7 +88,8 @@ unsigned long sbi_sm_enter_slot(
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_BIND ||
-      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_TRAP_SAFE) {
+      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_TRAP_SAFE ||
+      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL) {
     uintptr_t slot_mode = SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
 
     if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT)
@@ -100,6 +102,8 @@ unsigned long sbi_sm_enter_slot(
       slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_BIND;
     else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_TRAP_SAFE)
       slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_TRAP_SAFE;
+    else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL)
+      slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_ECALL;
 
     ret = activate_enclave_slot((enclave_id) eid, &req.cap, &resp);
     resp.value = 0;
@@ -179,6 +183,17 @@ unsigned long sbi_sm_get_sealing_key(uintptr_t sealing_key, uintptr_t key_ident,
 unsigned long sbi_sm_random(void)
 {
   return (unsigned long) platform_random();
+}
+
+unsigned long sbi_sm_lt_ecall_probe(
+    unsigned long *out_val, uintptr_t slot_id, uintptr_t lease_id, uintptr_t request)
+{
+  if (!out_val || slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS || lease_id == 0 ||
+      request != SLOTTEE_LT_ECALL_MAKE_REQUEST(slot_id, lease_id))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  *out_val = SLOTTEE_LT_ECALL_MAKE_REPLY(slot_id, lease_id);
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
 }
 
 unsigned long sbi_sm_call_plugin(uintptr_t plugin_id, uintptr_t call_id, uintptr_t arg0, uintptr_t arg1)
