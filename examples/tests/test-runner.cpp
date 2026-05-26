@@ -437,20 +437,26 @@ run_enter_slot_lt_user(const char* eapp_file, const char* rt_file,
       12345, eapp_file, rt_file, ld_file, params);
 }
 
-struct enter_slot_ocall_worker_arg {
-  const char* eapp_file;
-  const char* rt_file;
-  const char* ld_file;
-  Keystone::Params params;
-  uintptr_t slot_id;
-  Keystone::Error ret;
-  uintptr_t status;
-  uintptr_t value;
-  uintptr_t ocall_count;
-  uintptr_t resume_count;
-};
+static Keystone::Error
+enter_slot_request_once(Keystone::Enclave& enclave, uintptr_t slot_id, uintptr_t flags,
+    uintptr_t* status, uintptr_t* value, uintptr_t* lease_id) {
+  enter_slot_req_t req = {};
+  enter_slot_resp_t resp = {};
 
-static pthread_mutex_t enter_slot_ocall_lock = PTHREAD_MUTEX_INITIALIZER;
+  req.version = SLOTTEE_ENTER_SLOT_VERSION;
+  req.cap = make_enter_slot_test_cap(slot_id);
+  req.flags = flags;
+
+  Keystone::Error ret = enclave.enterSlotWithRequest(req, &resp);
+  if (status)
+    *status = resp.status;
+  if (value)
+    *value = resp.value;
+  if (lease_id)
+    *lease_id = resp.lease_id;
+
+  return ret;
+}
 
 static Keystone::Error
 enter_slot_resume_once(Keystone::Enclave& enclave, uintptr_t* status, uintptr_t* value)
@@ -472,10 +478,180 @@ enter_slot_resume_once(Keystone::Enclave& enclave, uintptr_t* status, uintptr_t*
   return resume_ret;
 }
 
+static Keystone::Error
+enter_slot_request_round(Keystone::Enclave& enclave, uintptr_t slot_id,
+    uintptr_t flags, uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
+    uintptr_t* resume_count)
+{
+  Keystone::Error ret;
+
+  if (resume_count)
+    *resume_count = 0;
+
+  ret = enter_slot_request_once(enclave, slot_id, flags, status, value, lease_id);
+  if (ret != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT slot%lu request failed ret=%d status=%lu value=%lu lease=%lu\n",
+        slot_id, (int)ret, status ? *status : 0, value ? *value : 0,
+        lease_id ? *lease_id : 0);
+  }
+
+  for (uintptr_t retry = 0; ret == Keystone::Error::Success &&
+       *status == SBI_ERR_SM_ENCLAVE_INTERRUPTED &&
+       retry < enter_slot_resume_limit; retry++) {
+    ret = enter_slot_resume_once(enclave, status, value);
+    if (resume_count)
+      (*resume_count)++;
+    if (ret == Keystone::Error::Success &&
+        *status == SBI_ERR_SM_ENCLAVE_SUCCESS)
+      break;
+    if (ret != Keystone::Error::EnclaveInterrupted)
+      break;
+    ret = Keystone::Error::Success;
+  }
+
+  return ret;
+}
+
+static int
+run_enter_slot_same_enclave_multislot(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  Keystone::Enclave enclave;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t slot1_lease = 0;
+  uintptr_t slot2_lease = 0;
+  uintptr_t slot1_resumes = 0;
+  uintptr_t slot2_resumes = 0;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT same-enclave multislot failed to init enclave\n");
+    return 1;
+  }
+
+  printf("same_enclave_real,slot,status,value,lease,resumes\n");
+  fflush(stdout);
+
+  if (enter_slot_request_round(enclave, 1, SLOTTEE_ENTER_SLOT_FLAG_REAL,
+          &status, &value, &slot1_lease,
+          &slot1_resumes) != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT same-enclave slot1", Keystone::Error::Success,
+          status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("same_enclave_real", 1, value,
+          SLOTTEE_SLOT_MAGIC)) {
+    enclave.destroy();
+    return 1;
+  }
+  printf("same_enclave_real,1,%lu,%lu,%lu,%lu\n",
+      status, value, slot1_lease, slot1_resumes);
+  fflush(stdout);
+
+  status = 0;
+  value = 0;
+  if (enter_slot_request_round(enclave, 2, SLOTTEE_ENTER_SLOT_FLAG_REAL,
+          &status, &value, &slot2_lease,
+          &slot2_resumes) != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT same-enclave slot2", Keystone::Error::Success,
+          status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("same_enclave_real", 2, value,
+          SLOTTEE_SLOT_MAGIC)) {
+    enclave.destroy();
+    return 1;
+  }
+  printf("same_enclave_real,2,%lu,%lu,%lu,%lu\n",
+      status, value, slot2_lease, slot2_resumes);
+  fflush(stdout);
+
+  if (slot1_lease == 0 || slot2_lease == 0 || slot1_lease == slot2_lease) {
+    printf("[FAIL] ENTER_SLOT same-enclave returned invalid lease ids (%lu, %lu)\n",
+        slot1_lease, slot2_lease);
+    enclave.destroy();
+    return 1;
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
+struct enter_slot_ocall_worker_arg {
+  const char* eapp_file;
+  const char* rt_file;
+  const char* ld_file;
+  Keystone::Params params;
+  uintptr_t slot_id;
+  Keystone::Error ret;
+  uintptr_t status;
+  uintptr_t value;
+  uintptr_t ocall_count;
+  uintptr_t resume_count;
+};
+
+static pthread_mutex_t enter_slot_ocall_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static Keystone::Error
+enter_slot_user_ocall_round(Keystone::Enclave& enclave, uintptr_t slot_id,
+    uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
+    uintptr_t* ocall_count, uintptr_t* resume_count)
+{
+  Keystone::Error ret;
+
+  if (ocall_count)
+    *ocall_count = 0;
+  if (resume_count)
+    *resume_count = 0;
+
+  ret = enter_slot_request_once(enclave, slot_id,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, status, value, lease_id);
+  if (ret != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT LT user ocall slot%lu request failed ret=%d status=%lu value=%lu lease=%lu\n",
+        slot_id, (int)ret, status ? *status : 0, value ? *value : 0,
+        lease_id ? *lease_id : 0);
+  }
+  for (uintptr_t retry = 0; ret == Keystone::Error::Success &&
+       retry < enter_slot_resume_limit; retry++) {
+    if (*status == SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      if (ocall_count)
+        (*ocall_count)++;
+      ret = enter_slot_resume_once(enclave, status, value);
+      if (resume_count)
+        (*resume_count)++;
+      if (ret == Keystone::Error::Success &&
+          *status == SBI_ERR_SM_ENCLAVE_SUCCESS)
+        break;
+      if (ret != Keystone::Error::EdgeCallHost &&
+          ret != Keystone::Error::EnclaveInterrupted)
+        break;
+      ret = Keystone::Error::Success;
+      continue;
+    }
+
+    if (*status == SBI_ERR_SM_ENCLAVE_INTERRUPTED) {
+      ret = enter_slot_resume_once(enclave, status, value);
+      if (resume_count)
+        (*resume_count)++;
+      if (ret == Keystone::Error::Success &&
+          *status == SBI_ERR_SM_ENCLAVE_SUCCESS)
+        break;
+      if (ret != Keystone::Error::EnclaveInterrupted)
+        break;
+      ret = Keystone::Error::Success;
+      continue;
+    }
+
+    break;
+  }
+
+  return ret;
+}
+
 static void*
 enter_slot_ocall_worker(void* opaque) {
   enter_slot_ocall_worker_arg* arg = (enter_slot_ocall_worker_arg*)opaque;
   Keystone::Enclave enclave;
+  uintptr_t lease_id = 0;
 
   arg->ret = Keystone::Error::DeviceError;
   arg->status = 0;
@@ -493,39 +669,8 @@ enter_slot_ocall_worker(void* opaque) {
 
   edge_init(&enclave);
 
-  arg->ret = enclave.enterSlot(arg->slot_id,
-      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &arg->status, &arg->value);
-  for (uintptr_t retry = 0; arg->ret == Keystone::Error::Success &&
-       retry < enter_slot_resume_limit; retry++) {
-    if (arg->status == SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST) {
-      incoming_call_dispatch(enclave.getSharedBuffer());
-      arg->ocall_count++;
-      arg->ret = enter_slot_resume_once(enclave, &arg->status, &arg->value);
-      arg->resume_count++;
-      if (arg->ret == Keystone::Error::Success &&
-          arg->status == SBI_ERR_SM_ENCLAVE_SUCCESS)
-        break;
-      if (arg->ret != Keystone::Error::EdgeCallHost &&
-          arg->ret != Keystone::Error::EnclaveInterrupted)
-        break;
-      arg->ret = Keystone::Error::Success;
-      continue;
-    }
-
-    if (arg->status == SBI_ERR_SM_ENCLAVE_INTERRUPTED) {
-      arg->ret = enter_slot_resume_once(enclave, &arg->status, &arg->value);
-      arg->resume_count++;
-      if (arg->ret == Keystone::Error::Success &&
-          arg->status == SBI_ERR_SM_ENCLAVE_SUCCESS)
-        break;
-      if (arg->ret != Keystone::Error::EnclaveInterrupted)
-        break;
-      arg->ret = Keystone::Error::Success;
-      continue;
-    }
-
-    break;
-  }
+  arg->ret = enter_slot_user_ocall_round(enclave, arg->slot_id, &arg->status,
+      &arg->value, &lease_id, &arg->ocall_count, &arg->resume_count);
 
   enclave.destroy();
   pthread_mutex_unlock(&enter_slot_ocall_lock);
@@ -627,6 +772,7 @@ main(int argc, char** argv) {
         "[--enter-slot-lt-context] [--enter-slot-lt-yield] "
         "[--enter-slot-lt-bind] [--enter-slot-lt-trap-safe] "
         "[--enter-slot-lt-ecall] [--enter-slot-lt-user] "
+        "[--enter-slot-same-enclave-multislot] "
         "[--enter-slot-lt-user-ocall] [--enter-slot-lt-user-illegal] "
         "[--enter-slot-lt-user-page-fault] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
@@ -654,6 +800,7 @@ main(int argc, char** argv) {
   int enter_slot_lt_trap_safe = 0;
   int enter_slot_lt_ecall = 0;
   int enter_slot_lt_user = 0;
+  int enter_slot_same_enclave_multislot = 0;
   int enter_slot_lt_user_ocall = 0;
   int enter_slot_lt_user_illegal = 0;
   int enter_slot_lt_user_page_fault = 0;
@@ -684,6 +831,8 @@ main(int argc, char** argv) {
       {"enter-slot-lt-trap-safe", no_argument, &enter_slot_lt_trap_safe, 1},
       {"enter-slot-lt-ecall", no_argument, &enter_slot_lt_ecall, 1},
       {"enter-slot-lt-user", no_argument, &enter_slot_lt_user, 1},
+      {"enter-slot-same-enclave-multislot", no_argument,
+       &enter_slot_same_enclave_multislot, 1},
       {"enter-slot-lt-user-ocall", no_argument, &enter_slot_lt_user_ocall, 1},
       {"enter-slot-lt-user-illegal", no_argument, &enter_slot_lt_user_illegal, 1},
       {"enter-slot-lt-user-page-fault", no_argument, &enter_slot_lt_user_page_fault, 1},
@@ -759,6 +908,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_lt_user) {
     return run_enter_slot_lt_user(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_same_enclave_multislot) {
+    return run_enter_slot_same_enclave_multislot(eapp_file, rt_file, ld_file, params);
   }
 
   if (enter_slot_lt_user_ocall) {

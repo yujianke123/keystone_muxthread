@@ -24,13 +24,20 @@ int cpu_get_enclave_id(void)
   return cpus[csr_read(mhartid)].eid;
 }
 
-void cpu_enter_enclave_context(enclave_id eid)
+uintptr_t cpu_get_enclave_thread_index(void)
+{
+  return cpus[csr_read(mhartid)].thread_index;
+}
+
+void cpu_enter_enclave_context(enclave_id eid, uintptr_t thread_index)
 {
   cpus[csr_read(mhartid)].is_enclave = 1;
   cpus[csr_read(mhartid)].eid = eid;
+  cpus[csr_read(mhartid)].thread_index = thread_index;
 }
 
 void cpu_exit_enclave_context(void)
 {
   cpus[csr_read(mhartid)].is_enclave = 0;
+  cpus[csr_read(mhartid)].thread_index = 0;
 }

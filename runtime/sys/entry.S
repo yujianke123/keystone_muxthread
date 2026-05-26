@@ -129,6 +129,15 @@ _start:
   li a0, 0 // passed as rtld_fini to entry point/ __libc_start_main
   sret
 
+.global slottee_runtime_reenter
+slottee_runtime_reenter:
+  la sp, kernel_stack_end
+  mv a0, t6
+  la t0, slottee_slot_trampoline
+  jalr t0
+1:
+  j 1b
+
 .align 6
 encl_trap_handler:
   .global encl_trap_handler

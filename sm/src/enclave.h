@@ -18,8 +18,7 @@
 #include TARGET_PLATFORM_HEADER
 
 #define ATTEST_DATA_MAXLEN  1024
-/* TODO: does not support multithreaded enclave yet */
-#define MAX_ENCL_THREADS 1
+#define MAX_ENCL_THREADS SLOTTEE_MAX_SLOTS
 
 typedef enum {
   INVALID = -1,
@@ -54,6 +53,7 @@ struct slot_lease_t
   uintptr_t entry_pc;
   uintptr_t exit_reason;
   uintptr_t active_hart;
+  uintptr_t thread_index;
   slot_lease_state state;
 };
 
@@ -96,7 +96,11 @@ struct enclave
 
   /* enclave execution context */
   unsigned int n_thread;
+  uintptr_t stopped_thread_index;
   struct thread_state threads[MAX_ENCL_THREADS];
+  int slot_reentry_ready;
+  struct csrs slot_reentry_csrs;
+  uintptr_t slot_reentry_mstatus;
 
   uintptr_t next_slot_lease_id;
   uintptr_t current_slot_epoch;

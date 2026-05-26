@@ -41,6 +41,7 @@ class ElfFile {
   size_t getProgramHeaderMemorySize(size_t ph);
   uintptr_t getProgramHeaderVaddr(size_t ph);
   uintptr_t getEntryPoint();
+  uintptr_t getSymbolAddress(const char* symbolName);
   void* getProgramSegment(size_t ph);
 
  private:

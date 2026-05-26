@@ -189,9 +189,11 @@ Enclave::init(
 
   pMemory->startFreeMem();
 
+  uintptr_t slotEntry = runtimeFile->getSymbolAddress("slottee_runtime_reenter");
   if (pDevice->finalize(
           pMemory->getRuntimePhysAddr(), pMemory->getEappPhysAddr(),
-          pMemory->getFreePhysAddr(), params.getFreeMemSize()) != Error::Success) {
+          pMemory->getFreePhysAddr(), params.getFreeMemSize(), slotEntry) !=
+      Error::Success) {
     destroy();
     return Error::DeviceError;
   }
