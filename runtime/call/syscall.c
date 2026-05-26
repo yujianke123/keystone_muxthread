@@ -10,6 +10,7 @@
 #include "edge_call.h"
 #include "uaccess.h"
 #include "mm/mm.h"
+#include "sys/slottee.h"
 #include "util/rt_util.h"
 
 #include "call/syscall_nums.h"
@@ -166,6 +167,8 @@ void handle_syscall(struct encl_ctx* ctx)
 
   switch (n) {
   case(RUNTIME_SYSCALL_EXIT):
+    if (slottee_active_user_exit(arg0))
+      break;
     sbi_exit_enclave(arg0);
     break;
   case(RUNTIME_SYSCALL_OCALL):
