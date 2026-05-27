@@ -42,6 +42,9 @@ sbi_sm_exit_slot(
     uintptr_t exit_reason, uintptr_t value);
 
 unsigned long
+sbi_sm_init_reentry_template(struct sbi_trap_regs *regs);
+
+unsigned long
 sbi_sm_attest_enclave(uintptr_t report, uintptr_t data, uintptr_t size);
 
 unsigned long

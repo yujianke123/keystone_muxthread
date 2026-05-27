@@ -26,7 +26,8 @@ set(slottee_fault_test_bins
   test-lt-user-page-fault
   test-lt-user-illegal-cleanup
   test-lt-user-page-fault-cleanup
-  test-lt-user-busy-revoke)
+  test-lt-user-busy-revoke
+  test-lt-user-first-busy-revoke)
 
 # and (2) define the recipe of the test below:
 
@@ -93,6 +94,9 @@ target_link_libraries(test-lt-user-page-fault-cleanup ${KEYSTONE_LIB_EAPP})
 
 add_executable(test-lt-user-busy-revoke lt-user-busy-revoke/lt-user-busy-revoke.c)
 target_link_libraries(test-lt-user-busy-revoke ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-first-busy-revoke lt-user-first-busy-revoke/lt-user-first-busy-revoke.c)
+target_link_libraries(test-lt-user-first-busy-revoke ${KEYSTONE_LIB_EAPP})
 
 ###############################################
 # a script for running all test enclaves
@@ -225,6 +229,18 @@ file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-active-revoke-timer-stress\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-active-revoke-timer-stress\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-first-active-revoke-template\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-first-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-first-active-revoke-template\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-first-active-revoke-diagnostic\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-first-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-first-active-revoke-diagnostic\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-active-revoke-destroy-race\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-first-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-active-revoke-destroy-race\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-rt-revoke-fault\" ]; then\n")

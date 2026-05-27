@@ -80,7 +80,8 @@ unsigned long sbi_sm_enter_slot(
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL &&
-       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT)) {
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT &&
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL_NO_TEMPLATE)) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
@@ -95,7 +96,8 @@ unsigned long sbi_sm_enter_slot(
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL ||
-      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT) {
+      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT ||
+      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL_NO_TEMPLATE) {
     uintptr_t slot_mode = SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
 
     if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT)
@@ -116,6 +118,8 @@ unsigned long sbi_sm_enter_slot(
       slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL;
     else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT)
       slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT;
+    else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL_NO_TEMPLATE)
+      slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL_NO_TEMPLATE;
 
     ret = activate_enclave_slot((enclave_id) eid, &req.cap, &resp);
     resp.value = 0;
@@ -190,6 +194,11 @@ unsigned long sbi_sm_exit_enclave(struct sbi_trap_regs *regs, unsigned long retv
   regs->mepc += 4;
   sbi_trap_exit(regs);
   return 0;
+}
+
+unsigned long sbi_sm_init_reentry_template(struct sbi_trap_regs *regs)
+{
+  return init_enclave_slot_reentry_template(regs, cpu_get_enclave_id());
 }
 
 unsigned long sbi_sm_stop_enclave(struct sbi_trap_regs *regs, unsigned long request)

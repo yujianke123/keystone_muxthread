@@ -25,6 +25,14 @@ size_t utm_size;
 /* defined in entry.S */
 extern void* encl_trap_handler;
 
+static int
+slottee_should_init_reentry_template(uintptr_t slot_token)
+{
+  return slot_token != 0 &&
+      SLOTTEE_SLOT_TOKEN_MODE(slot_token) !=
+          SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL_NO_TEMPLATE;
+}
+
 int verify_and_load_elf_file(uintptr_t ptr, size_t file_size, bool is_eapp) {
   int ret = 0;
   // validate elf 
@@ -138,6 +146,9 @@ eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
 
   /* Enable the FPU */
   csr_write(sstatus, csr_read(sstatus) | 0x6000);
+
+  if (slottee_should_init_reentry_template(dummy))
+    sbi_init_reentry_template();
 
   if (dummy != 0) {
     slottee_slot_trampoline(dummy);

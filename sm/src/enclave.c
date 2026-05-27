@@ -172,6 +172,25 @@ static void save_enclave_slot_reentry_template(enclave_id eid, uintptr_t thread_
   enclaves[eid].slot_reentry_ready = 1;
 }
 
+static void save_current_enclave_slot_reentry_template(
+    enclave_id eid, struct sbi_trap_regs *regs)
+{
+  enclaves[eid].slot_reentry_csrs.sstatus = csr_read(sstatus);
+  enclaves[eid].slot_reentry_csrs.sedeleg = 0;
+  enclaves[eid].slot_reentry_csrs.sideleg = 0;
+  enclaves[eid].slot_reentry_csrs.sie = csr_read(sie);
+  enclaves[eid].slot_reentry_csrs.stvec = csr_read(stvec);
+  enclaves[eid].slot_reentry_csrs.scounteren = csr_read(scounteren);
+  enclaves[eid].slot_reentry_csrs.sscratch = csr_read(sscratch);
+  enclaves[eid].slot_reentry_csrs.sepc = csr_read(sepc);
+  enclaves[eid].slot_reentry_csrs.scause = csr_read(scause);
+  enclaves[eid].slot_reentry_csrs.sbadaddr = csr_read(sbadaddr);
+  enclaves[eid].slot_reentry_csrs.sip = csr_read(sip);
+  enclaves[eid].slot_reentry_csrs.satp = csr_read(satp);
+  enclaves[eid].slot_reentry_mstatus = regs->mstatus;
+  enclaves[eid].slot_reentry_ready = 1;
+}
+
 static int prepare_enclave_slot_reentry(
     enclave_id eid, uintptr_t thread_index, uintptr_t slot_token)
 {
@@ -1048,6 +1067,31 @@ unsigned long exit_enclave_slot(
 
   (void)value;
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+unsigned long init_enclave_slot_reentry_template(
+    struct sbi_trap_regs *regs, enclave_id eid)
+{
+  unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
+  uintptr_t thread_index = cpu_get_enclave_thread_index();
+
+  if (!regs)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+  if (!ENCLAVE_EXISTS(eid)) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+  } else if (enclaves[eid].state != RUNNING) {
+    ret = SBI_ERR_SM_ENCLAVE_NOT_RUNNING;
+  } else if (thread_index == 0 || thread_index >= MAX_ENCL_THREADS ||
+      enclaves[eid].params.slot_entry == enclaves[eid].params.dram_base) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  } else {
+    save_current_enclave_slot_reentry_template(eid, regs);
+  }
+  spin_unlock(&encl_lock);
+
+  return ret;
 }
 
 unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave_id eid)

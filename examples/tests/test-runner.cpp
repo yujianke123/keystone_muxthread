@@ -1707,9 +1707,13 @@ struct enter_slot_active_revoke_timer_arg {
   int enter_done;
   int mark_done;
   int mark_failed;
+  int destroy_after_mark;
+  int destroy_done;
   Keystone::Error enter_ret;
   Keystone::Error duplicate_ret;
   Keystone::Error mark_ret;
+  Keystone::Error destroy_ret;
+  uintptr_t enter_flags;
   uintptr_t enter_status;
   uintptr_t enter_value;
   uintptr_t enter_lease;
@@ -1732,8 +1736,8 @@ enter_slot_active_revoke_timer_enter_worker(void* opaque)
   pthread_mutex_unlock(&arg->lock);
 
   arg->enter_ret = enter_slot_request_once_with_cap(*arg->enclave, arg->cap,
-      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &arg->enter_status,
-      &arg->enter_value, &arg->enter_lease);
+      arg->enter_flags, &arg->enter_status, &arg->enter_value,
+      &arg->enter_lease);
 
   pthread_mutex_lock(&arg->lock);
   arg->enter_done = 1;
@@ -1780,6 +1784,10 @@ enter_slot_active_revoke_timer_mark_worker(void* opaque)
 
       arg->mark_ret = arg->enclave->markRevoke(arg->slot_id,
           &arg->mark_status, &arg->mark_epoch);
+      if (arg->destroy_after_mark) {
+        arg->destroy_ret = arg->enclave->destroy();
+        arg->destroy_done = 1;
+      }
 
       pthread_mutex_lock(&arg->lock);
       arg->mark_done = 1;
@@ -1796,6 +1804,35 @@ enter_slot_active_revoke_timer_mark_worker(void* opaque)
   pthread_cond_broadcast(&arg->cond);
   pthread_mutex_unlock(&arg->lock);
   return NULL;
+}
+
+static int
+enter_slot_active_revoke_timer_run_workers(
+    const char* label, enter_slot_active_revoke_timer_arg* arg)
+{
+  pthread_t enter_thread;
+  pthread_t mark_thread;
+
+  if (pthread_create(&enter_thread, NULL,
+          enter_slot_active_revoke_timer_enter_worker, arg) != 0) {
+    printf("[FAIL] %s failed to create enter worker\n", label);
+    return 1;
+  }
+
+  if (pthread_create(&mark_thread, NULL,
+          enter_slot_active_revoke_timer_mark_worker, arg) != 0) {
+    printf("[FAIL] %s failed to create mark worker\n", label);
+    pthread_join(enter_thread, NULL);
+    return 1;
+  }
+
+  if (pthread_join(mark_thread, NULL) != 0 ||
+      pthread_join(enter_thread, NULL) != 0) {
+    printf("[FAIL] %s failed to join workers\n", label);
+    return 1;
+  }
+
+  return 0;
 }
 
 static int
@@ -1857,9 +1894,11 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
     arg.slot_id = 2;
     arg.cap = make_enter_slot_test_cap(arg.slot_id);
     arg.cap.epoch = epoch;
+    arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL;
     arg.enter_ret = Keystone::Error::DeviceError;
     arg.duplicate_ret = Keystone::Error::DeviceError;
     arg.mark_ret = Keystone::Error::DeviceError;
+    arg.destroy_ret = Keystone::Error::DeviceError;
     pthread_mutex_init(&arg.lock, NULL);
     pthread_cond_init(&arg.cond, NULL);
 
@@ -1980,6 +2019,354 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
   }
 
   enclave.destroy();
+  return 0;
+}
+
+static int
+run_enter_slot_first_active_revoke_template(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  enter_slot_active_revoke_timer_arg arg;
+  slot_cap_t fresh_cap;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t old_replay_lease = 0;
+  uintptr_t fresh_lease = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+  Keystone::Error resume_ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT first active revoke template failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  memset(&arg, 0, sizeof(arg));
+  arg.enclave = &enclave;
+  arg.slot_id = 2;
+  arg.cap = make_enter_slot_test_cap(arg.slot_id);
+  arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL;
+  arg.enter_ret = Keystone::Error::DeviceError;
+  arg.duplicate_ret = Keystone::Error::DeviceError;
+  arg.mark_ret = Keystone::Error::DeviceError;
+  arg.destroy_ret = Keystone::Error::DeviceError;
+  pthread_mutex_init(&arg.lock, NULL);
+  pthread_cond_init(&arg.cond, NULL);
+
+  printf("first_active_revoke_template,phase,ret,status,value,lease,epoch,ocalls,resumes\n");
+  fflush(stdout);
+
+  if (enter_slot_active_revoke_timer_run_workers(
+          "ENTER_SLOT first active revoke template", &arg)) {
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  printf("first_active_revoke_template,duplicate_probe,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)arg.duplicate_ret, arg.duplicate_status, arg.duplicate_value,
+      arg.duplicate_lease, SLOTTEE_INITIAL_EPOCH);
+  printf("first_active_revoke_template,mark_pending,%d,%lu,0,0,%lu,0,0\n",
+      (int)arg.mark_ret, arg.mark_status, arg.mark_epoch);
+  printf("first_active_revoke_template,active_interrupt,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)arg.enter_ret, arg.enter_status, arg.enter_value,
+      arg.enter_lease, SLOTTEE_INITIAL_EPOCH);
+  fflush(stdout);
+
+  if (arg.mark_failed || !arg.mark_done ||
+      arg.duplicate_ret != Keystone::Error::Success ||
+      arg.duplicate_status != SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT ||
+      arg.mark_ret != Keystone::Error::Success ||
+      arg.mark_status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+      arg.mark_epoch != SLOTTEE_INITIAL_EPOCH + 1 ||
+      arg.enter_ret != Keystone::Error::Success ||
+      arg.enter_status != SBI_ERR_SM_ENCLAVE_INTERRUPTED ||
+      arg.enter_lease == 0) {
+    printf("[FAIL] ENTER_SLOT first active revoke template failed active round\n");
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  value = 0;
+  resume_ret = enclave.resume(&value);
+  printf("first_active_revoke_template,old_resume,%d,0,%lu,0,%lu,0,0\n",
+      (int)resume_ret, value, arg.mark_epoch);
+  fflush(stdout);
+  if (resume_ret == Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT first active revoke template allowed old resume\n");
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  ret = enter_slot_request_once_with_cap(enclave, arg.cap,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value,
+      &old_replay_lease);
+  printf("first_active_revoke_template,old_cap,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, old_replay_lease, arg.mark_epoch);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT first active revoke template old cap",
+          ret, status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  fresh_cap = make_enter_slot_test_cap(arg.slot_id);
+  fresh_cap.epoch = arg.mark_epoch;
+  ret = enter_slot_user_ocall_round_with_cap(enclave, fresh_cap,
+      &status, &value, &fresh_lease, &ocalls, &resumes);
+  printf("first_active_revoke_template,new_epoch,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, fresh_lease, fresh_cap.epoch, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT first active revoke template new epoch",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("first_active_revoke_template", 2, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      fresh_lease <= arg.enter_lease || ocalls != 1 || resumes != 1) {
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  enclave.destroy();
+  pthread_mutex_destroy(&arg.lock);
+  pthread_cond_destroy(&arg.cond);
+  return 0;
+}
+
+static int
+run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  enter_slot_active_revoke_timer_arg arg;
+  slot_cap_t fresh_cap;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t old_replay_lease = 0;
+  uintptr_t fresh_lease = 0;
+  Keystone::Error ret;
+  Keystone::Error resume_ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT first active revoke diagnostic failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  memset(&arg, 0, sizeof(arg));
+  arg.enclave = &enclave;
+  arg.slot_id = 2;
+  arg.cap = make_enter_slot_test_cap(arg.slot_id);
+  arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL_NO_TEMPLATE;
+  arg.enter_ret = Keystone::Error::DeviceError;
+  arg.duplicate_ret = Keystone::Error::DeviceError;
+  arg.mark_ret = Keystone::Error::DeviceError;
+  arg.destroy_ret = Keystone::Error::DeviceError;
+  pthread_mutex_init(&arg.lock, NULL);
+  pthread_cond_init(&arg.cond, NULL);
+
+  printf("first_active_revoke_diagnostic,phase,ret,status,value,lease,epoch,ocalls,resumes\n");
+  fflush(stdout);
+
+  if (enter_slot_active_revoke_timer_run_workers(
+          "ENTER_SLOT first active revoke diagnostic", &arg)) {
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  printf("first_active_revoke_diagnostic,duplicate_probe,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)arg.duplicate_ret, arg.duplicate_status, arg.duplicate_value,
+      arg.duplicate_lease, SLOTTEE_INITIAL_EPOCH);
+  printf("first_active_revoke_diagnostic,mark_pending,%d,%lu,0,0,%lu,0,0\n",
+      (int)arg.mark_ret, arg.mark_status, arg.mark_epoch);
+  printf("first_active_revoke_diagnostic,active_interrupt,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)arg.enter_ret, arg.enter_status, arg.enter_value,
+      arg.enter_lease, SLOTTEE_INITIAL_EPOCH);
+  fflush(stdout);
+
+  if (arg.mark_failed || !arg.mark_done ||
+      arg.duplicate_ret != Keystone::Error::Success ||
+      arg.duplicate_status != SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT ||
+      arg.mark_ret != Keystone::Error::Success ||
+      arg.mark_status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+      arg.mark_epoch != SLOTTEE_INITIAL_EPOCH + 1 ||
+      arg.enter_ret != Keystone::Error::Success ||
+      arg.enter_status != SBI_ERR_SM_ENCLAVE_INTERRUPTED ||
+      arg.enter_lease == 0) {
+    printf("[FAIL] ENTER_SLOT first active revoke diagnostic failed active round\n");
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  value = 0;
+  resume_ret = enclave.resume(&value);
+  printf("first_active_revoke_diagnostic,old_resume,%d,0,%lu,0,%lu,0,0\n",
+      (int)resume_ret, value, arg.mark_epoch);
+  fflush(stdout);
+  if (resume_ret == Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT first active revoke diagnostic allowed old resume\n");
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  ret = enter_slot_request_once_with_cap(enclave, arg.cap,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL_NO_TEMPLATE, &status, &value,
+      &old_replay_lease);
+  printf("first_active_revoke_diagnostic,old_cap,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, old_replay_lease, arg.mark_epoch);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT first active revoke diagnostic old cap",
+          ret, status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  fresh_cap = make_enter_slot_test_cap(arg.slot_id);
+  fresh_cap.epoch = arg.mark_epoch;
+  ret = enter_slot_request_once_with_cap(enclave, fresh_cap,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value,
+      &fresh_lease);
+  printf("first_active_revoke_diagnostic,new_epoch_no_template,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, fresh_lease, fresh_cap.epoch);
+  fflush(stdout);
+  if (expect_enter_slot_status(
+          "ENTER_SLOT first active revoke diagnostic new epoch without template",
+          ret, status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  enclave.destroy();
+  pthread_mutex_destroy(&arg.lock);
+  pthread_cond_destroy(&arg.cond);
+  return 0;
+}
+
+static int
+run_enter_slot_active_revoke_destroy_race(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  enter_slot_active_revoke_timer_arg arg;
+  uintptr_t value = 0;
+  Keystone::Error resume_ret;
+  Keystone::Error final_destroy_ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT active revoke destroy race failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  memset(&arg, 0, sizeof(arg));
+  arg.enclave = &enclave;
+  arg.slot_id = 2;
+  arg.cap = make_enter_slot_test_cap(arg.slot_id);
+  arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL;
+  arg.destroy_after_mark = 1;
+  arg.enter_ret = Keystone::Error::DeviceError;
+  arg.duplicate_ret = Keystone::Error::DeviceError;
+  arg.mark_ret = Keystone::Error::DeviceError;
+  arg.destroy_ret = Keystone::Error::DeviceError;
+  pthread_mutex_init(&arg.lock, NULL);
+  pthread_cond_init(&arg.cond, NULL);
+
+  printf("active_revoke_destroy_race,phase,ret,status,value,lease,epoch,ocalls,resumes\n");
+  fflush(stdout);
+
+  if (enter_slot_active_revoke_timer_run_workers(
+          "ENTER_SLOT active revoke destroy race", &arg)) {
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  printf("active_revoke_destroy_race,duplicate_probe,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)arg.duplicate_ret, arg.duplicate_status, arg.duplicate_value,
+      arg.duplicate_lease, SLOTTEE_INITIAL_EPOCH);
+  printf("active_revoke_destroy_race,mark_pending,%d,%lu,0,0,%lu,0,0\n",
+      (int)arg.mark_ret, arg.mark_status, arg.mark_epoch);
+  printf("active_revoke_destroy_race,destroy_while_running,%d,0,0,0,%lu,0,0\n",
+      (int)arg.destroy_ret, arg.mark_epoch);
+  printf("active_revoke_destroy_race,active_interrupt,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)arg.enter_ret, arg.enter_status, arg.enter_value,
+      arg.enter_lease, SLOTTEE_INITIAL_EPOCH);
+  fflush(stdout);
+
+  if (arg.mark_failed || !arg.mark_done || !arg.destroy_done ||
+      arg.duplicate_ret != Keystone::Error::Success ||
+      arg.duplicate_status != SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT ||
+      arg.mark_ret != Keystone::Error::Success ||
+      arg.mark_status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+      arg.mark_epoch != SLOTTEE_INITIAL_EPOCH + 1 ||
+      arg.destroy_ret == Keystone::Error::Success ||
+      arg.enter_ret != Keystone::Error::Success ||
+      arg.enter_status != SBI_ERR_SM_ENCLAVE_INTERRUPTED ||
+      arg.enter_lease == 0) {
+    printf("[FAIL] ENTER_SLOT active revoke destroy race returned unexpected active result\n");
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  resume_ret = enclave.resume(&value);
+  printf("active_revoke_destroy_race,old_resume,%d,0,%lu,0,%lu,0,0\n",
+      (int)resume_ret, value, arg.mark_epoch);
+  fflush(stdout);
+  if (resume_ret == Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT active revoke destroy race allowed old resume\n");
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  final_destroy_ret = enclave.destroy();
+  printf("active_revoke_destroy_race,final_destroy,%d,0,0,0,%lu,0,0\n",
+      (int)final_destroy_ret, arg.mark_epoch);
+  fflush(stdout);
+  if (final_destroy_ret != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT active revoke destroy race failed final destroy\n");
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  pthread_mutex_destroy(&arg.lock);
+  pthread_cond_destroy(&arg.cond);
   return 0;
 }
 
@@ -2246,6 +2633,9 @@ main(int argc, char** argv) {
         "[--enter-slot-mark-revoke] "
         "[--enter-slot-active-revoke-boundary] "
         "[--enter-slot-active-revoke-timer-stress] "
+        "[--enter-slot-first-active-revoke-template] "
+        "[--enter-slot-first-active-revoke-diagnostic] "
+        "[--enter-slot-active-revoke-destroy-race] "
         "[--enter-slot-rt-revoke-fault] "
         "[--enter-slot-revoke-stress] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
@@ -2287,6 +2677,9 @@ main(int argc, char** argv) {
   int enter_slot_mark_revoke = 0;
   int enter_slot_active_revoke_boundary = 0;
   int enter_slot_active_revoke_timer_stress = 0;
+  int enter_slot_first_active_revoke_template = 0;
+  int enter_slot_first_active_revoke_diagnostic = 0;
+  int enter_slot_active_revoke_destroy_race = 0;
   int enter_slot_rt_revoke_fault = 0;
   int enter_slot_revoke_stress = 0;
 
@@ -2340,6 +2733,12 @@ main(int argc, char** argv) {
        &enter_slot_active_revoke_boundary, 1},
       {"enter-slot-active-revoke-timer-stress", no_argument,
        &enter_slot_active_revoke_timer_stress, 1},
+      {"enter-slot-first-active-revoke-template", no_argument,
+       &enter_slot_first_active_revoke_template, 1},
+      {"enter-slot-first-active-revoke-diagnostic", no_argument,
+       &enter_slot_first_active_revoke_diagnostic, 1},
+      {"enter-slot-active-revoke-destroy-race", no_argument,
+       &enter_slot_active_revoke_destroy_race, 1},
       {"enter-slot-rt-revoke-fault", no_argument, &enter_slot_rt_revoke_fault, 1},
       {"enter-slot-revoke-stress", no_argument, &enter_slot_revoke_stress, 1},
       {"utm-size", required_argument, 0, 'u'},
@@ -2476,6 +2875,21 @@ main(int argc, char** argv) {
 
   if (enter_slot_active_revoke_timer_stress) {
     return run_enter_slot_active_revoke_timer_stress(
+        eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_first_active_revoke_template) {
+    return run_enter_slot_first_active_revoke_template(
+        eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_first_active_revoke_diagnostic) {
+    return run_enter_slot_first_active_revoke_diagnostic(
+        eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_active_revoke_destroy_race) {
+    return run_enter_slot_active_revoke_destroy_race(
         eapp_file, rt_file, ld_file, params);
   }
 

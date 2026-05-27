@@ -159,6 +159,8 @@ unsigned long exit_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long exit_enclave_slot(
     struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
     uintptr_t exit_reason, uintptr_t value);
+unsigned long init_enclave_slot_reentry_template(
+    struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave_id eid);
 unsigned long attest_enclave(uintptr_t report, uintptr_t data, uintptr_t size, enclave_id eid);
 // attestation

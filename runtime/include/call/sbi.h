@@ -21,6 +21,8 @@ sbi_exit_enclave(uint64_t retval);
 uintptr_t
 sbi_exit_slot(uintptr_t slot_id, uintptr_t lease_id, uintptr_t exit_reason, uintptr_t value);
 uintptr_t
+sbi_init_reentry_template();
+uintptr_t
 sbi_random();
 uintptr_t
 sbi_lt_ecall_probe(uintptr_t slot_id, uintptr_t lease_id, uintptr_t request, uintptr_t* reply);
