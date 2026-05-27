@@ -226,6 +226,28 @@ KeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_res
   return Error::Success;
 }
 
+Error
+KeystoneDevice::markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch) {
+  struct keystone_ioctl_mark_revoke encl;
+  memset(&encl, 0, sizeof(encl));
+  encl.eid = eid;
+  encl.req.version = SLOTTEE_ENTER_SLOT_VERSION;
+  encl.req.slot_id = slotId;
+
+  if (ioctl(fd, KEYSTONE_IOC_MARK_REVOKE, &encl)) {
+    return Error::IoctlErrorMarkRevoke;
+  }
+
+  if (status) {
+    *status = encl.resp.status;
+  }
+  if (epoch) {
+    *epoch = encl.resp.epoch;
+  }
+
+  return Error::Success;
+}
+
 void*
 KeystoneDevice::map(uintptr_t addr, size_t size) {
   assert(fd >= 0);
@@ -402,6 +424,19 @@ MockKeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot
 
   if (resp) {
     *resp = local_resp;
+  }
+  return Error::Success;
+}
+
+Error
+MockKeystoneDevice::markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch) {
+  if (status) {
+    *status = (slotId == 0 || slotId >= SLOTTEE_MAX_SLOTS) ?
+        SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT : SBI_ERR_SM_ENCLAVE_SUCCESS;
+  }
+  if (epoch) {
+    *epoch = (slotId == 0 || slotId >= SLOTTEE_MAX_SLOTS) ?
+        0 : SLOTTEE_INITIAL_EPOCH + 1;
   }
   return Error::Success;
 }

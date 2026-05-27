@@ -1132,6 +1132,420 @@ run_enter_slot_lt_user_revoke_after_reentry(const char* eapp_file,
   return 0;
 }
 
+struct enter_slot_destroy_race_arg {
+  Keystone::Enclave* enclave;
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  int edge_ready;
+  Keystone::Error enter_ret;
+  Keystone::Error destroy_ret;
+  uintptr_t status;
+  uintptr_t value;
+  uintptr_t lease;
+};
+
+static void*
+enter_slot_destroy_race_enter_worker(void* opaque)
+{
+  enter_slot_destroy_race_arg* arg = (enter_slot_destroy_race_arg*)opaque;
+
+  arg->enter_ret = enter_slot_request_once(*arg->enclave, 2,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &arg->status, &arg->value,
+      &arg->lease);
+
+  pthread_mutex_lock(&arg->lock);
+  arg->edge_ready = 1;
+  pthread_cond_signal(&arg->cond);
+  pthread_mutex_unlock(&arg->lock);
+
+  return NULL;
+}
+
+static void*
+enter_slot_destroy_race_destroy_worker(void* opaque)
+{
+  enter_slot_destroy_race_arg* arg = (enter_slot_destroy_race_arg*)opaque;
+
+  pthread_mutex_lock(&arg->lock);
+  while (!arg->edge_ready)
+    pthread_cond_wait(&arg->cond, &arg->lock);
+  pthread_mutex_unlock(&arg->lock);
+
+  arg->destroy_ret = arg->enclave->destroy();
+  return NULL;
+}
+
+static int
+run_enter_slot_lt_user_destroy_race(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  Keystone::Enclave recreated;
+  enter_slot_destroy_race_arg arg;
+  pthread_t enter_thread;
+  pthread_t destroy_thread;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t lease = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT destroy race failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+
+  memset(&arg, 0, sizeof(arg));
+  arg.enclave = &enclave;
+  arg.enter_ret = Keystone::Error::DeviceError;
+  arg.destroy_ret = Keystone::Error::DeviceError;
+  pthread_mutex_init(&arg.lock, NULL);
+  pthread_cond_init(&arg.cond, NULL);
+
+  printf("lt_user_destroy_race,phase,ret,status,value,lease,ocalls,resumes\n");
+  fflush(stdout);
+
+  if (pthread_create(&enter_thread, NULL,
+          enter_slot_destroy_race_enter_worker, &arg) != 0 ||
+      pthread_create(&destroy_thread, NULL,
+          enter_slot_destroy_race_destroy_worker, &arg) != 0) {
+    printf("[FAIL] ENTER_SLOT destroy race failed to create workers\n");
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  if (pthread_join(enter_thread, NULL) != 0 ||
+      pthread_join(destroy_thread, NULL) != 0) {
+    printf("[FAIL] ENTER_SLOT destroy race failed to join workers\n");
+    enclave.destroy();
+    pthread_mutex_destroy(&arg.lock);
+    pthread_cond_destroy(&arg.cond);
+    return 1;
+  }
+
+  printf("lt_user_destroy_race,edge,%d,%lu,%lu,%lu,0,0\n",
+      (int)arg.enter_ret, arg.status, arg.value, arg.lease);
+  printf("lt_user_destroy_race,destroy,%d,0,0,0,0,0\n", (int)arg.destroy_ret);
+  fflush(stdout);
+
+  pthread_mutex_destroy(&arg.lock);
+  pthread_cond_destroy(&arg.cond);
+
+  if (arg.enter_ret != Keystone::Error::Success ||
+      arg.status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || arg.lease == 0 ||
+      arg.destroy_ret != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT destroy race returned unexpected edge/destroy result\n");
+    return 1;
+  }
+
+  if (recreated.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT destroy race failed to recreate enclave\n");
+    return 1;
+  }
+
+  edge_init(&recreated);
+  ret = enter_slot_user_ocall_round(
+      recreated, 1, &status, &value, &lease, &ocalls, &resumes);
+  printf("lt_user_destroy_race,recreated,%d,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, lease, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT destroy race recreated",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("lt_user_destroy_race", 1, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      lease == 0 || ocalls != 1 || resumes != 1) {
+    recreated.destroy();
+    return 1;
+  }
+
+  recreated.destroy();
+  return 0;
+}
+
+static int
+run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  Keystone::Enclave recreated;
+  slot_cap_t cap;
+  slot_cap_t fresh_cap;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t lease = 0;
+  uintptr_t reentry_lease = 0;
+  uintptr_t reserved_lease = 0;
+  uintptr_t duplicate_lease = 0;
+  uintptr_t replay_lease = 0;
+  uintptr_t fresh_lease = 0;
+  uintptr_t recreated_lease = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  uintptr_t epoch = SLOTTEE_INITIAL_EPOCH;
+  uintptr_t rollover_ttl = SLOTTEE_TEST_MAX_LEASE_CYCLES * 1024 * 1024;
+  Keystone::Error ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT double-enter epoch failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+
+  printf("double_enter_epoch_rollover,phase,ret,status,value,lease,ocalls,resumes\n");
+  fflush(stdout);
+
+  ret = enter_slot_user_ocall_round(
+      enclave, 1, &status, &value, &reentry_lease, &ocalls, &resumes);
+  printf("double_enter_epoch_rollover,reentry,%d,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, reentry_lease, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT double-enter initial",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("double_enter_epoch_rollover", 1, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  cap = make_enter_slot_test_cap(2);
+  cap.max_lease_cycles = rollover_ttl;
+  ret = enter_slot_request_once_with_cap(enclave, cap,
+      SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &reserved_lease);
+  printf("double_enter_epoch_rollover,reserve,%d,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, reserved_lease);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT double-enter reserve", ret,
+          status, value, SBI_ERR_SM_NOT_IMPLEMENTED) ||
+      reserved_lease == 0) {
+    enclave.destroy();
+    return 1;
+  }
+
+  ret = enter_slot_request_once_with_cap(enclave, cap,
+      SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &duplicate_lease);
+  printf("double_enter_epoch_rollover,duplicate,%d,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, duplicate_lease);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT double-enter duplicate", ret,
+          status, value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  ret = enclave.markRevoke(2, &status, &epoch);
+  printf("double_enter_epoch_rollover,rollover,%d,%lu,%lu,0,0,0\n",
+      (int)ret, status, epoch);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success || status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+      epoch != SLOTTEE_INITIAL_EPOCH + 1) {
+    printf("[FAIL] ENTER_SLOT double-enter epoch rollover failed to revoke busy slot\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  ret = enter_slot_request_once_with_cap(enclave, cap,
+      SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &replay_lease);
+  printf("double_enter_epoch_rollover,replay,%d,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, replay_lease);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT double-enter replay", ret,
+          status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  fresh_cap = make_enter_slot_test_cap(2);
+  fresh_cap.epoch = epoch;
+  ocalls = 0;
+  resumes = 0;
+  ret = enter_slot_user_ocall_round_with_cap(
+      enclave, fresh_cap, &status, &value, &fresh_lease, &ocalls, &resumes);
+  printf("double_enter_epoch_rollover,new_epoch,%d,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, fresh_lease, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT double-enter new epoch",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("double_enter_epoch_rollover", 2, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      fresh_lease == 0 || fresh_lease == reserved_lease ||
+      ocalls != 1 || resumes != 1) {
+    enclave.destroy();
+    return 1;
+  }
+
+  if (enclave.destroy() != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT double-enter failed to destroy first enclave\n");
+    return 1;
+  }
+
+  if (recreated.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT double-enter failed to recreate enclave\n");
+    return 1;
+  }
+
+  edge_init(&recreated);
+  ret = enter_slot_request_once_with_cap(recreated, fresh_cap,
+      SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &lease);
+  printf("double_enter_epoch_rollover,recreated_old_epoch,%d,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, lease);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT double-enter recreated old epoch", ret,
+          status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+    recreated.destroy();
+    return 1;
+  }
+
+  ocalls = 0;
+  resumes = 0;
+  ret = enter_slot_user_ocall_round(
+      recreated, 1, &status, &value, &recreated_lease, &ocalls, &resumes);
+  printf("double_enter_epoch_rollover,recreated_fresh,%d,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, recreated_lease, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT double-enter recreated fresh",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("double_enter_epoch_rollover", 3, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      recreated_lease == 0 || ocalls != 1 || resumes != 1) {
+    recreated.destroy();
+    return 1;
+  }
+
+  recreated.destroy();
+  return 0;
+}
+
+static int
+run_enter_slot_mark_revoke(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  slot_cap_t old_cap;
+  slot_cap_t fresh_cap;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t epoch = 0;
+  uintptr_t lease = 0;
+  uintptr_t old_replay_lease = 0;
+  uintptr_t fresh_lease = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+  Keystone::Error resume_ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT mark revoke failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+
+  printf("mark_revoke,phase,ret,status,value,lease,epoch,ocalls,resumes\n");
+  fflush(stdout);
+
+  ret = enter_slot_user_ocall_round(
+      enclave, 1, &status, &value, &lease, &ocalls, &resumes);
+  printf("mark_revoke,reentry,%d,%lu,%lu,%lu,0,%lu,%lu\n",
+      (int)ret, status, value, lease, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT mark revoke initial",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("mark_revoke", 1, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  ret = enter_slot_request_once(enclave, 2,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value, &lease);
+  printf("mark_revoke,edge,%d,%lu,%lu,%lu,0,0,0\n",
+      (int)ret, status, value, lease);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || lease == 0) {
+    printf("[FAIL] ENTER_SLOT mark revoke did not stop at edgecall boundary\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  ret = enclave.markRevoke(2, &status, &epoch);
+  printf("mark_revoke,revoke,%d,%lu,0,0,%lu,0,0\n",
+      (int)ret, status, epoch);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success || status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+      epoch != SLOTTEE_INITIAL_EPOCH + 1) {
+    printf("[FAIL] ENTER_SLOT mark revoke returned unexpected epoch/status\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  resume_ret = enclave.resume(&value);
+  printf("mark_revoke,old_resume,%d,0,%lu,0,%lu,0,0\n",
+      (int)resume_ret, value, epoch);
+  fflush(stdout);
+  if (resume_ret == Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT mark revoke allowed revoked slot resume\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  old_cap = make_enter_slot_test_cap(2);
+  ret = enter_slot_request_once_with_cap(enclave, old_cap,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value,
+      &old_replay_lease);
+  printf("mark_revoke,old_cap,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, old_replay_lease, epoch);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT mark revoke old cap", ret,
+          status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  fresh_cap = make_enter_slot_test_cap(2);
+  fresh_cap.epoch = epoch;
+  ocalls = 0;
+  resumes = 0;
+  ret = enter_slot_user_ocall_round_with_cap(
+      enclave, fresh_cap, &status, &value, &fresh_lease, &ocalls, &resumes);
+  printf("mark_revoke,new_epoch,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, fresh_lease, epoch, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT mark revoke new epoch",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("mark_revoke", 2, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      fresh_lease == 0 || fresh_lease == lease ||
+      ocalls != 1 || resumes != 1) {
+    enclave.destroy();
+    return 1;
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
 int
 main(int argc, char** argv) {
   if (argc < 4 || argc > 24) {
@@ -1155,6 +1569,9 @@ main(int argc, char** argv) {
         "[--enter-slot-lt-user-page-fault-cleanup-same-enclave] "
         "[--enter-slot-lt-user-destroy-after-reentry] "
         "[--enter-slot-lt-user-revoke-after-reentry] "
+        "[--enter-slot-lt-user-destroy-race] "
+        "[--enter-slot-double-enter-epoch-rollover] "
+        "[--enter-slot-mark-revoke] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -1189,6 +1606,9 @@ main(int argc, char** argv) {
   int enter_slot_lt_user_page_fault_cleanup_same_enclave = 0;
   int enter_slot_lt_user_destroy_after_reentry = 0;
   int enter_slot_lt_user_revoke_after_reentry = 0;
+  int enter_slot_lt_user_destroy_race = 0;
+  int enter_slot_double_enter_epoch_rollover = 0;
+  int enter_slot_mark_revoke = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -1231,6 +1651,11 @@ main(int argc, char** argv) {
        &enter_slot_lt_user_destroy_after_reentry, 1},
       {"enter-slot-lt-user-revoke-after-reentry", no_argument,
        &enter_slot_lt_user_revoke_after_reentry, 1},
+      {"enter-slot-lt-user-destroy-race", no_argument,
+       &enter_slot_lt_user_destroy_race, 1},
+      {"enter-slot-double-enter-epoch-rollover", no_argument,
+       &enter_slot_double_enter_epoch_rollover, 1},
+      {"enter-slot-mark-revoke", no_argument, &enter_slot_mark_revoke, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -1344,6 +1769,19 @@ main(int argc, char** argv) {
   if (enter_slot_lt_user_revoke_after_reentry) {
     return run_enter_slot_lt_user_revoke_after_reentry(
         eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_lt_user_destroy_race) {
+    return run_enter_slot_lt_user_destroy_race(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_double_enter_epoch_rollover) {
+    return run_enter_slot_double_enter_epoch_rollover(
+        eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_mark_revoke) {
+    return run_enter_slot_mark_revoke(eapp_file, rt_file, ld_file, params);
   }
 
   Keystone::Enclave enclave;

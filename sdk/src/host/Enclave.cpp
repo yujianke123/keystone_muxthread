@@ -15,7 +15,7 @@ extern "C" {
 
 namespace Keystone {
 
-Enclave::Enclave() {
+Enclave::Enclave() : pDevice(NULL) {
 }
 
 Enclave::~Enclave() {
@@ -231,6 +231,9 @@ Enclave::mapUntrusted(size_t size) {
 
 Error
 Enclave::destroy() {
+  if (pDevice == NULL) {
+    return Error::Success;
+  }
   return pDevice->destroy();
 }
 
@@ -292,6 +295,11 @@ Enclave::enterSlotWithCap(
 Error
 Enclave::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp) {
   return pDevice->enterSlotWithRequest(req, resp);
+}
+
+Error
+Enclave::markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch) {
+  return pDevice->markRevoke(slotId, status, epoch);
 }
 
 void*

@@ -16,6 +16,7 @@
 #define SBI_SM_RUN_ENCLAVE       2003
 #define SBI_SM_RESUME_ENCLAVE    2005
 #define SBI_SM_ENTER_SLOT        2006
+#define SBI_SM_MARK_REVOKE       2007
 #define FID_RANGE_HOST           2999
 
 #define SLOTTEE_ENTER_SLOT_VERSION     1
@@ -176,6 +177,16 @@ struct exit_slot_req_t {
 struct exit_slot_resp_t {
   uintptr_t status;
   uintptr_t value;
+};
+
+struct mark_revoke_req_t {
+  uintptr_t version;
+  uintptr_t slot_id;
+};
+
+struct mark_revoke_resp_t {
+  uintptr_t status;
+  uintptr_t epoch;
 };
 
 #endif  // __SM_CALL_H__

@@ -30,3 +30,10 @@ struct sbiret sbi_sm_enter_slot(
       SBI_SM_ENTER_SLOT,
       eid, (unsigned long) req, (unsigned long) resp, 0, 0, 0);
 }
+
+struct sbiret sbi_sm_mark_revoke(
+    unsigned long eid, struct mark_revoke_req_t *req, struct mark_revoke_resp_t *resp) {
+  return sbi_ecall(SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE,
+      SBI_SM_MARK_REVOKE,
+      eid, (unsigned long) req, (unsigned long) resp, 0, 0, 0);
+}

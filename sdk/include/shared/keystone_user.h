@@ -28,6 +28,8 @@
   _IOR(KEYSTONE_IOC_MAGIC, 0x07, struct keystone_ioctl_create_enclave)
 #define KEYSTONE_IOC_ENTER_SLOT \
   _IOR(KEYSTONE_IOC_MAGIC, 0x08, struct keystone_ioctl_enter_slot)
+#define KEYSTONE_IOC_MARK_REVOKE \
+  _IOR(KEYSTONE_IOC_MAGIC, 0x09, struct keystone_ioctl_mark_revoke)
 
 #define RT_NOEXEC 0
 #define USER_NOEXEC 1
@@ -65,6 +67,12 @@ struct keystone_ioctl_enter_slot {
   uintptr_t eid;
   struct enter_slot_req_t req;
   struct enter_slot_resp_t resp;
+};
+
+struct keystone_ioctl_mark_revoke {
+  uintptr_t eid;
+  struct mark_revoke_req_t req;
+  struct mark_revoke_resp_t resp;
 };
 
 #endif

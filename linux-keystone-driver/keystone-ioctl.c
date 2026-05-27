@@ -255,6 +255,37 @@ int keystone_enter_slot(unsigned long data)
   return 0;
 }
 
+int keystone_mark_revoke(unsigned long data)
+{
+  struct sbiret ret;
+  struct keystone_ioctl_mark_revoke *arg = (struct keystone_ioctl_mark_revoke*) data;
+  unsigned long ueid = arg->eid;
+  struct enclave* enclave;
+  enclave = get_enclave_by_id(ueid);
+
+  if (!enclave)
+  {
+    keystone_err("invalid enclave id\n");
+    return -EINVAL;
+  }
+
+  if (enclave->eid < 0) {
+    keystone_err("real enclave does not exist\n");
+    return -EINVAL;
+  }
+
+  memset(&arg->resp, 0, sizeof(arg->resp));
+
+  ret = sbi_sm_mark_revoke(enclave->eid, &arg->req, &arg->resp);
+
+  if (!arg->resp.status)
+    arg->resp.status = ret.error;
+  if (!arg->resp.epoch)
+    arg->resp.epoch = ret.value;
+
+  return 0;
+}
+
 long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 {
   long ret;
@@ -289,6 +320,9 @@ long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
       break;
     case KEYSTONE_IOC_ENTER_SLOT:
       ret = keystone_enter_slot((unsigned long) data);
+      break;
+    case KEYSTONE_IOC_MARK_REVOKE:
+      ret = keystone_mark_revoke((unsigned long) data);
       break;
     /* Note that following commands could have been implemented as a part of ADD_PAGE ioctl.
      * However, there was a weird bug in compiler that generates a wrong control flow

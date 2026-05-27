@@ -876,6 +876,41 @@ out:
   return ret;
 }
 
+unsigned long mark_revoke_enclave_slot(
+    enclave_id eid, const struct mark_revoke_req_t *req, struct mark_revoke_resp_t *resp)
+{
+  unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
+  struct slot_lease_t *lease;
+
+  if (!req || req->version != SLOTTEE_ENTER_SLOT_VERSION ||
+      req->slot_id == 0 || req->slot_id >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+
+  if (!ENCLAVE_EXISTS(eid) || enclaves[eid].state < FRESH) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+    goto out;
+  }
+
+  lease = &enclaves[eid].slot_leases[req->slot_id];
+  if (slot_lease_is_busy(lease))
+    revoke_enclave_slot_lease(lease);
+
+  enclaves[eid].current_slot_epoch++;
+  if (resp)
+    resp->epoch = enclaves[eid].current_slot_epoch;
+
+out:
+  if (resp) {
+    resp->status = ret;
+    if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
+      resp->epoch = 0;
+  }
+  spin_unlock(&encl_lock);
+  return ret;
+}
+
 void enter_activated_enclave_slot(
     struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
     uintptr_t slot_mode)

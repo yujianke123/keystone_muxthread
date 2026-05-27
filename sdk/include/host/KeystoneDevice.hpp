@@ -58,6 +58,7 @@ class KeystoneDevice {
   virtual Error enterSlotWithCap(
       const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value);
   virtual Error enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp);
+  virtual Error markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch);
   virtual void* map(uintptr_t addr, size_t size);
 };
 
@@ -89,6 +90,7 @@ class MockKeystoneDevice : public KeystoneDevice {
   Error enterSlotWithCap(
       const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value);
   Error enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp);
+  Error markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch);
   void* map(uintptr_t addr, size_t size);
 };
 

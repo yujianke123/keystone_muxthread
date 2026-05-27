@@ -140,6 +140,30 @@ out:
   return ret;
 }
 
+unsigned long sbi_sm_mark_revoke(
+    unsigned long *out_val, unsigned long eid, uintptr_t mark_revoke_req,
+    uintptr_t mark_revoke_resp)
+{
+  struct mark_revoke_req_t req;
+  struct mark_revoke_resp_t resp = {0};
+  unsigned long ret;
+
+  if (out_val)
+    *out_val = 0;
+
+  if (copy_to_sm(&req, mark_revoke_req, sizeof(req)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  ret = mark_revoke_enclave_slot((enclave_id) eid, &req, &resp);
+  if (out_val)
+    *out_val = resp.epoch;
+
+  if (mark_revoke_resp && copy_from_sm(mark_revoke_resp, &resp, sizeof(resp)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  return ret;
+}
+
 unsigned long sbi_sm_exit_slot(
     struct sbi_trap_regs *regs, uintptr_t slot_id, uintptr_t lease_id,
     uintptr_t exit_reason, uintptr_t value)
