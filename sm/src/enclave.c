@@ -1079,7 +1079,7 @@ unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave
     spin_lock(&encl_lock);
     lease = find_active_slot_lease_by_thread_index(eid, thread_index);
     if (slot_lease_has_pending_revoke(lease)) {
-      save_enclave_slot_reentry_template(eid, thread_index);
+      /* Timer stops may trap out of U-mode; keep the last safe runtime template. */
       complete_pending_revoke_enclave_slot(eid, lease);
     }
     spin_unlock(&encl_lock);

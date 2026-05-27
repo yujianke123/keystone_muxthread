@@ -9,7 +9,7 @@
 #include "util/printf.h"
 #include <asm/csr.h>
 
-#define DEFAULT_CLOCK_DELAY 10000
+#define DEFAULT_CLOCK_DELAY 100000
 
 void init_timer(void)
 {
