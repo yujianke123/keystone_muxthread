@@ -1559,6 +1559,139 @@ run_enter_slot_mark_revoke(const char* eapp_file,
 }
 
 static int
+run_enter_slot_active_revoke_boundary(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  slot_cap_t old_cap;
+  slot_cap_t fresh_cap;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t epoch = 0;
+  uintptr_t baseline_lease = 0;
+  uintptr_t pending_lease = 0;
+  uintptr_t duplicate_lease = 0;
+  uintptr_t old_replay_lease = 0;
+  uintptr_t fresh_lease = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+  Keystone::Error resume_ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT active revoke boundary failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+
+  printf("active_revoke_boundary,phase,ret,status,value,lease,epoch,ocalls,resumes\n");
+  fflush(stdout);
+
+  ret = enter_slot_user_ocall_round(
+      enclave, 1, &status, &value, &baseline_lease, &ocalls, &resumes);
+  printf("active_revoke_boundary,baseline,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, baseline_lease, SLOTTEE_INITIAL_EPOCH,
+      ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT active revoke baseline",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("active_revoke_boundary", 1, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      baseline_lease == 0 || ocalls != 1 || resumes != 1) {
+    enclave.destroy();
+    return 1;
+  }
+
+  ret = enter_slot_request_once(enclave, 2,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value,
+      &pending_lease);
+  printf("active_revoke_boundary,pending_edge,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, pending_lease, SLOTTEE_INITIAL_EPOCH);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || pending_lease == 0) {
+    printf("[FAIL] ENTER_SLOT active revoke boundary did not stop at edgecall\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  ret = enclave.markRevoke(2, &status, &epoch);
+  printf("active_revoke_boundary,mark_pending,%d,%lu,0,0,%lu,0,0\n",
+      (int)ret, status, epoch);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+      epoch != SLOTTEE_INITIAL_EPOCH + 1) {
+    printf("[FAIL] ENTER_SLOT active revoke boundary markRevoke returned unexpected projected epoch/status\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  old_cap = make_enter_slot_test_cap(2);
+  ret = enter_slot_request_once_with_cap(enclave, old_cap,
+      SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &duplicate_lease);
+  printf("active_revoke_boundary,pending_duplicate,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, duplicate_lease, SLOTTEE_INITIAL_EPOCH);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT active revoke pending duplicate", ret,
+          status, value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  value = 0;
+  resume_ret = enclave.resume(&value);
+  printf("active_revoke_boundary,old_resume,%d,0,%lu,0,%lu,0,0\n",
+      (int)resume_ret, value, epoch);
+  fflush(stdout);
+  if (resume_ret == Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT active revoke boundary allowed pending revoked resume\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  ret = enter_slot_request_once_with_cap(enclave, old_cap,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value,
+      &old_replay_lease);
+  printf("active_revoke_boundary,old_cap,%d,%lu,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, old_replay_lease, epoch);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT active revoke old cap", ret,
+          status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  fresh_cap = make_enter_slot_test_cap(2);
+  fresh_cap.epoch = epoch;
+  ocalls = 0;
+  resumes = 0;
+  ret = enter_slot_user_ocall_round_with_cap(
+      enclave, fresh_cap, &status, &value, &fresh_lease, &ocalls, &resumes);
+  printf("active_revoke_boundary,new_epoch,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, fresh_lease, epoch, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT active revoke new epoch",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("active_revoke_boundary", 2, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      fresh_lease == 0 || fresh_lease == pending_lease ||
+      ocalls != 1 || resumes != 1) {
+    enclave.destroy();
+    return 1;
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
+static int
 run_enter_slot_rt_revoke_fault(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
 {
@@ -1819,6 +1952,7 @@ main(int argc, char** argv) {
         "[--enter-slot-lt-user-destroy-race] "
         "[--enter-slot-double-enter-epoch-rollover] "
         "[--enter-slot-mark-revoke] "
+        "[--enter-slot-active-revoke-boundary] "
         "[--enter-slot-rt-revoke-fault] "
         "[--enter-slot-revoke-stress] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
@@ -1858,6 +1992,7 @@ main(int argc, char** argv) {
   int enter_slot_lt_user_destroy_race = 0;
   int enter_slot_double_enter_epoch_rollover = 0;
   int enter_slot_mark_revoke = 0;
+  int enter_slot_active_revoke_boundary = 0;
   int enter_slot_rt_revoke_fault = 0;
   int enter_slot_revoke_stress = 0;
 
@@ -1907,6 +2042,8 @@ main(int argc, char** argv) {
       {"enter-slot-double-enter-epoch-rollover", no_argument,
        &enter_slot_double_enter_epoch_rollover, 1},
       {"enter-slot-mark-revoke", no_argument, &enter_slot_mark_revoke, 1},
+      {"enter-slot-active-revoke-boundary", no_argument,
+       &enter_slot_active_revoke_boundary, 1},
       {"enter-slot-rt-revoke-fault", no_argument, &enter_slot_rt_revoke_fault, 1},
       {"enter-slot-revoke-stress", no_argument, &enter_slot_revoke_stress, 1},
       {"utm-size", required_argument, 0, 'u'},
@@ -2035,6 +2172,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_mark_revoke) {
     return run_enter_slot_mark_revoke(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_active_revoke_boundary) {
+    return run_enter_slot_active_revoke_boundary(eapp_file, rt_file, ld_file, params);
   }
 
   if (enter_slot_rt_revoke_fault) {

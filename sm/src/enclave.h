@@ -54,6 +54,7 @@ struct slot_lease_t
   uintptr_t exit_reason;
   uintptr_t active_hart;
   uintptr_t thread_index;
+  uintptr_t revoke_pending;
   slot_lease_state state;
 };
 

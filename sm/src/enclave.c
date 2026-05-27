@@ -82,6 +82,7 @@ static void clear_enclave_slot_leases(enclave_id eid)
     enclaves[eid].slot_leases[slot].exit_reason = 0;
     enclaves[eid].slot_leases[slot].active_hart = 0;
     enclaves[eid].slot_leases[slot].thread_index = 0;
+    enclaves[eid].slot_leases[slot].revoke_pending = 0;
     enclaves[eid].slot_leases[slot].state = SLOT_LEASE_FREE;
   }
 }
@@ -92,6 +93,7 @@ static void revoke_enclave_slot_lease(struct slot_lease_t *lease)
   lease->max_lease_cycles = 0;
   lease->active_hart = 0;
   lease->thread_index = 0;
+  lease->revoke_pending = 0;
   lease->state = SLOT_LEASE_REVOKED;
 }
 
@@ -111,6 +113,7 @@ static void free_enclave_slot_lease(struct slot_lease_t *lease)
   lease->exit_reason = 0;
   lease->active_hart = 0;
   lease->thread_index = 0;
+  lease->revoke_pending = 0;
   lease->state = SLOT_LEASE_FREE;
 }
 
@@ -119,6 +122,30 @@ static int slot_lease_is_busy(const struct slot_lease_t *lease)
   return lease->state == SLOT_LEASE_RESERVED ||
          lease->state == SLOT_LEASE_ACTIVE ||
          lease->state == SLOT_LEASE_EXITING;
+}
+
+static int slot_lease_has_pending_revoke(const struct slot_lease_t *lease)
+{
+  return lease &&
+      lease->state == SLOT_LEASE_ACTIVE &&
+      lease->revoke_pending;
+}
+
+static void mark_slot_lease_revoke_pending(struct slot_lease_t *lease)
+{
+  if (lease && lease->state == SLOT_LEASE_ACTIVE)
+    lease->revoke_pending = 1;
+}
+
+static void complete_pending_revoke_enclave_slot(
+    enclave_id eid, struct slot_lease_t *lease)
+{
+  if (!slot_lease_has_pending_revoke(lease))
+    return;
+
+  lease->exit_reason = SLOTTEE_SLOT_EXIT_REVOKE;
+  revoke_enclave_slot_lease(lease);
+  enclaves[eid].current_slot_epoch++;
 }
 
 static int enclave_has_busy_slot_leases(enclave_id eid)
@@ -894,6 +921,13 @@ unsigned long mark_revoke_enclave_slot(
   }
 
   lease = &enclaves[eid].slot_leases[req->slot_id];
+  if (lease->state == SLOT_LEASE_ACTIVE) {
+    mark_slot_lease_revoke_pending(lease);
+    if (resp)
+      resp->epoch = enclaves[eid].current_slot_epoch + 1;
+    goto out;
+  }
+
   if (slot_lease_is_busy(lease))
     revoke_enclave_slot_lease(lease);
 
@@ -1019,11 +1053,16 @@ unsigned long exit_enclave_slot(
 unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave_id eid)
 {
   int stoppable;
+  int complete_timer_revoke = 0;
   uintptr_t thread_index = cpu_get_enclave_thread_index();
+  struct slot_lease_t *lease = NULL;
 
   spin_lock(&encl_lock);
   stoppable = enclaves[eid].state == RUNNING && thread_index < MAX_ENCL_THREADS;
   if (stoppable) {
+    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+    complete_timer_revoke =
+        request == STOP_TIMER_INTERRUPT && slot_lease_has_pending_revoke(lease);
     enclaves[eid].stopped_thread_index = thread_index;
     enclaves[eid].n_thread--;
     if(enclaves[eid].n_thread == 0)
@@ -1035,6 +1074,16 @@ unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave
     return SBI_ERR_SM_ENCLAVE_NOT_RUNNING;
 
   context_switch_to_host(regs, eid, thread_index, request == STOP_EDGE_CALL_HOST);
+
+  if (complete_timer_revoke) {
+    spin_lock(&encl_lock);
+    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+    if (slot_lease_has_pending_revoke(lease)) {
+      save_enclave_slot_reentry_template(eid, thread_index);
+      complete_pending_revoke_enclave_slot(eid, lease);
+    }
+    spin_unlock(&encl_lock);
+  }
 
   switch(request) {
     case(STOP_TIMER_INTERRUPT):
@@ -1056,6 +1105,14 @@ unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid)
   thread_index = enclaves[eid].stopped_thread_index;
   if (thread_index != 0)
     lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+
+  if (slot_lease_has_pending_revoke(lease)) {
+    save_enclave_slot_reentry_template(eid, thread_index);
+    complete_pending_revoke_enclave_slot(eid, lease);
+    spin_unlock(&encl_lock);
+    return SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE;
+  }
+
   resumable = (ENCLAVE_EXISTS(eid)
                && (enclaves[eid].state == RUNNING || enclaves[eid].state == STOPPED)
                && enclaves[eid].n_thread < MAX_ENCL_THREADS
