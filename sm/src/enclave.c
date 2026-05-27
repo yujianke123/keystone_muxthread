@@ -1008,6 +1008,8 @@ unsigned long exit_enclave_slot(
   spin_lock(&encl_lock);
   save_enclave_slot_reentry_template(eid, thread_index);
   free_enclave_slot_lease(lease);
+  if (exit_reason == SLOTTEE_SLOT_EXIT_REVOKE)
+    enclaves[eid].current_slot_epoch++;
   spin_unlock(&encl_lock);
 
   (void)value;

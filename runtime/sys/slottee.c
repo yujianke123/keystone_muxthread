@@ -41,6 +41,7 @@ struct slottee_active_user_context {
   uintptr_t ocall_resume_count;
   uintptr_t exit_trap_count;
   uintptr_t fault_trap_count;
+  uintptr_t revoke_on_fault;
 };
 
 static struct slottee_active_user_context slottee_active_user;
@@ -183,8 +184,11 @@ slottee_activate_user_context(uintptr_t slot_id, uintptr_t lease_id, uintptr_t m
   slottee_active_user.ocall_resume_count = 0;
   slottee_active_user.exit_trap_count = 0;
   slottee_active_user.fault_trap_count = 0;
+  slottee_active_user.revoke_on_fault =
+      mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT;
 
-  if (mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL)
+  if (mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL ||
+      mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT)
     slottee_prepare_user_memory(slot_id);
 }
 
@@ -192,7 +196,8 @@ int
 slottee_active_user_prepare_user_entry(void)
 {
   if (!slottee_active_user.active ||
-      slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL ||
+      (slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL &&
+       slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT) ||
       !slottee_active_user.user_alloc_ok ||
       !slottee_user_entry_point)
     return 0;
@@ -222,7 +227,8 @@ void
 slottee_active_user_record_ocall(struct encl_ctx* ctx)
 {
   if (!slottee_active_user.active ||
-      slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL)
+      (slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL &&
+       slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT))
     return;
 
   slottee_record_trap_frame(ctx, RUNTIME_SYSCALL_OCALL);
@@ -233,7 +239,8 @@ void
 slottee_active_user_record_ocall_resume(uintptr_t value)
 {
   if (!slottee_active_user.active ||
-      slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL ||
+      (slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL &&
+       slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT) ||
       value != 0)
     return;
 
@@ -243,7 +250,8 @@ slottee_active_user_record_ocall_resume(uintptr_t value)
 static int
 slottee_active_user_ocall_exit_ok(uintptr_t value)
 {
-  if (slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL)
+  if (slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL &&
+      slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT)
     return 1;
 
   return value == SLOTTEE_LT_USER_OCALL_MAGIC &&
@@ -264,14 +272,16 @@ slottee_active_user_exit(uintptr_t value)
 
   if (!slottee_active_user.active ||
       (slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER &&
-       slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL))
+       slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL &&
+       slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT))
     return 0;
 
   slottee_active_user.exit_trap_count++;
   if (!slottee_active_user_ocall_exit_ok(value))
     value = SLOTTEE_LT_USER_ILLEGAL_MAGIC;
 
-  if (slottee_active_user.mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL) {
+  if (slottee_active_user.mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL ||
+      slottee_active_user.mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT) {
     printf("[slottee] lt_user_exit slot=%lu value=%lu syscalls=%lu ocalls=%lu resumes=%lu exits=%lu faults=%lu sp=0x%lx tp=0x%lx\r\n",
         slottee_active_user.slot_id, value,
         slottee_active_user.syscall_trap_count,
@@ -311,7 +321,10 @@ slottee_active_user_fault_exit(struct encl_ctx* ctx, uintptr_t value)
       slottee_active_user.last_trap_user_tp);
 
   status = sbi_exit_slot(slottee_active_user.slot_id,
-      slottee_active_user.lease_id, SLOTTEE_SLOT_EXIT_NORMAL, value);
+      slottee_active_user.lease_id,
+      slottee_active_user.revoke_on_fault ?
+          SLOTTEE_SLOT_EXIT_REVOKE : SLOTTEE_SLOT_EXIT_NORMAL,
+      value);
 
   while (1) {
     sbi_exit_enclave(status ? status : value);
@@ -342,6 +355,9 @@ slottee_slot_trampoline(uintptr_t slot_token)
     slottee_activate_user_context(slot_id, lease_id, slot_mode);
     return;
   } else if (slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL) {
+    slottee_activate_user_context(slot_id, lease_id, slot_mode);
+    return;
+  } else if (slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT) {
     slottee_activate_user_context(slot_id, lease_id, slot_mode);
     return;
   }
