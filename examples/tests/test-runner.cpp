@@ -438,13 +438,13 @@ run_enter_slot_lt_user(const char* eapp_file, const char* rt_file,
 }
 
 static Keystone::Error
-enter_slot_request_once(Keystone::Enclave& enclave, uintptr_t slot_id, uintptr_t flags,
-    uintptr_t* status, uintptr_t* value, uintptr_t* lease_id) {
+enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& cap,
+    uintptr_t flags, uintptr_t* status, uintptr_t* value, uintptr_t* lease_id) {
   enter_slot_req_t req = {};
   enter_slot_resp_t resp = {};
 
   req.version = SLOTTEE_ENTER_SLOT_VERSION;
-  req.cap = make_enter_slot_test_cap(slot_id);
+  req.cap = cap;
   req.flags = flags;
 
   Keystone::Error ret = enclave.enterSlotWithRequest(req, &resp);
@@ -456,6 +456,15 @@ enter_slot_request_once(Keystone::Enclave& enclave, uintptr_t slot_id, uintptr_t
     *lease_id = resp.lease_id;
 
   return ret;
+}
+
+static Keystone::Error
+enter_slot_request_once(Keystone::Enclave& enclave, uintptr_t slot_id, uintptr_t flags,
+    uintptr_t* status, uintptr_t* value, uintptr_t* lease_id) {
+  slot_cap_t cap = make_enter_slot_test_cap(slot_id);
+
+  return enter_slot_request_once_with_cap(
+      enclave, cap, flags, status, value, lease_id);
 }
 
 static Keystone::Error
@@ -591,7 +600,7 @@ struct enter_slot_ocall_worker_arg {
 static pthread_mutex_t enter_slot_ocall_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static Keystone::Error
-enter_slot_user_ocall_round(Keystone::Enclave& enclave, uintptr_t slot_id,
+enter_slot_user_ocall_round_with_cap(Keystone::Enclave& enclave, const slot_cap_t& cap,
     uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
     uintptr_t* ocall_count, uintptr_t* resume_count)
 {
@@ -602,11 +611,11 @@ enter_slot_user_ocall_round(Keystone::Enclave& enclave, uintptr_t slot_id,
   if (resume_count)
     *resume_count = 0;
 
-  ret = enter_slot_request_once(enclave, slot_id,
+  ret = enter_slot_request_once_with_cap(enclave, cap,
       SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, status, value, lease_id);
   if (ret != Keystone::Error::Success) {
     printf("[FAIL] ENTER_SLOT LT user ocall slot%lu request failed ret=%d status=%lu value=%lu lease=%lu\n",
-        slot_id, (int)ret, status ? *status : 0, value ? *value : 0,
+        cap.slot_id, (int)ret, status ? *status : 0, value ? *value : 0,
         lease_id ? *lease_id : 0);
   }
   for (uintptr_t retry = 0; ret == Keystone::Error::Success &&
@@ -645,6 +654,17 @@ enter_slot_user_ocall_round(Keystone::Enclave& enclave, uintptr_t slot_id,
   }
 
   return ret;
+}
+
+static Keystone::Error
+enter_slot_user_ocall_round(Keystone::Enclave& enclave, uintptr_t slot_id,
+    uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
+    uintptr_t* ocall_count, uintptr_t* resume_count)
+{
+  slot_cap_t cap = make_enter_slot_test_cap(slot_id);
+
+  return enter_slot_user_ocall_round_with_cap(
+      enclave, cap, status, value, lease_id, ocall_count, resume_count);
 }
 
 static void*
@@ -919,6 +939,199 @@ run_enter_slot_lt_user_page_fault_cleanup_same_enclave(const char* eapp_file,
       eapp_file, rt_file, ld_file, params);
 }
 
+static int
+run_enter_slot_lt_user_destroy_after_reentry(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params) {
+  Keystone::Enclave enclave;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t completed_lease = 0;
+  uintptr_t pending_lease = 0;
+  uintptr_t recreated_lease = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT destroy-after-reentry failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+
+  printf("lt_user_destroy_after_reentry,phase,ret,status,value,lease,ocalls,resumes\n");
+  fflush(stdout);
+
+  ret = enter_slot_user_ocall_round(
+      enclave, 1, &status, &value, &completed_lease, &ocalls, &resumes);
+  printf("lt_user_destroy_after_reentry,completed,%d,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, completed_lease, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT destroy-after-reentry completed",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("lt_user_destroy_after_reentry", 1, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      completed_lease == 0 || ocalls != 1 || resumes != 1) {
+    enclave.destroy();
+    return 1;
+  }
+
+  status = 0;
+  value = 0;
+  ret = enter_slot_request_once(enclave, 2,
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value, &pending_lease);
+  printf("lt_user_destroy_after_reentry,pending_edgecall,%d,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, pending_lease);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || pending_lease == 0) {
+    printf("[FAIL] ENTER_SLOT destroy-after-reentry did not stop at edgecall boundary\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  ret = enclave.destroy();
+  printf("lt_user_destroy_after_reentry,destroy,%d,0,0,0,0,0\n", (int)ret);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT destroy-after-reentry failed to destroy active slot enclave\n");
+    return 1;
+  }
+
+  Keystone::Enclave recreated;
+  if (recreated.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT destroy-after-reentry failed to recreate enclave\n");
+    return 1;
+  }
+
+  edge_init(&recreated);
+  status = 0;
+  value = 0;
+  ocalls = 0;
+  resumes = 0;
+  ret = enter_slot_user_ocall_round(
+      recreated, 1, &status, &value, &recreated_lease, &ocalls, &resumes);
+  printf("lt_user_destroy_after_reentry,recreated,%d,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, recreated_lease, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT destroy-after-reentry recreated",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("lt_user_destroy_after_reentry", 2, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      recreated_lease == 0 || ocalls != 1 || resumes != 1) {
+    recreated.destroy();
+    return 1;
+  }
+
+  recreated.destroy();
+  return 0;
+}
+
+static int
+run_enter_slot_lt_user_revoke_after_reentry(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params) {
+  Keystone::Enclave enclave;
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t reentry_lease = 0;
+  uintptr_t reserved_lease = 0;
+  uintptr_t replay_lease = 0;
+  uintptr_t fresh_lease = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  slot_cap_t cap;
+  Keystone::Error ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT revoke-after-reentry failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+
+  printf("lt_user_revoke_after_reentry,phase,ret,status,value,lease,ocalls,resumes\n");
+  fflush(stdout);
+
+  ret = enter_slot_user_ocall_round(
+      enclave, 1, &status, &value, &reentry_lease, &ocalls, &resumes);
+  printf("lt_user_revoke_after_reentry,reentry,%d,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, reentry_lease, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT revoke-after-reentry initial",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("lt_user_revoke_after_reentry", 1, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      reentry_lease == 0 || ocalls != 1 || resumes != 1) {
+    enclave.destroy();
+    return 1;
+  }
+
+  cap = make_enter_slot_test_cap(2);
+  cap.max_lease_cycles = SLOTTEE_TEST_MAX_LEASE_CYCLES;
+  status = 0;
+  value = 0;
+  ret = enter_slot_request_once_with_cap(enclave, cap,
+      SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &reserved_lease);
+  printf("lt_user_revoke_after_reentry,reserve,%d,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, reserved_lease);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT revoke-after-reentry reserve", ret,
+          status, value, SBI_ERR_SM_NOT_IMPLEMENTED) ||
+      reserved_lease == 0) {
+    enclave.destroy();
+    return 1;
+  }
+
+  wait_for_enter_slot_ttl(SLOTTEE_TEST_MAX_LEASE_CYCLES * 32);
+
+  status = 0;
+  value = 0;
+  ret = enter_slot_request_once_with_cap(enclave, cap,
+      SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &replay_lease);
+  printf("lt_user_revoke_after_reentry,replay,%d,%lu,%lu,%lu,0,0\n",
+      (int)ret, status, value, replay_lease);
+  fflush(stdout);
+  if (expect_enter_slot_status("ENTER_SLOT revoke-after-reentry replay", ret,
+          status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  cap = make_enter_slot_test_cap(2);
+  cap.epoch = SLOTTEE_INITIAL_EPOCH + 1;
+  status = 0;
+  value = 0;
+  ocalls = 0;
+  resumes = 0;
+  ret = enter_slot_user_ocall_round_with_cap(
+      enclave, cap, &status, &value, &fresh_lease, &ocalls, &resumes);
+  printf("lt_user_revoke_after_reentry,new_epoch_ocall,%d,%lu,%lu,%lu,%lu,%lu\n",
+      (int)ret, status, value, fresh_lease, ocalls, resumes);
+  fflush(stdout);
+  if (ret != Keystone::Error::Success ||
+      expect_enter_slot_status("ENTER_SLOT revoke-after-reentry new epoch",
+          Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      expect_enter_slot_bench_value("lt_user_revoke_after_reentry", 2, value,
+          SLOTTEE_LT_USER_OCALL_MAGIC) ||
+      fresh_lease == 0 || fresh_lease == reserved_lease ||
+      ocalls != 1 || resumes != 1) {
+    enclave.destroy();
+    return 1;
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
 int
 main(int argc, char** argv) {
   if (argc < 4 || argc > 24) {
@@ -940,6 +1153,8 @@ main(int argc, char** argv) {
         "[--enter-slot-lt-user-illegal-cleanup-same-enclave] "
         "[--enter-slot-lt-user-page-fault] "
         "[--enter-slot-lt-user-page-fault-cleanup-same-enclave] "
+        "[--enter-slot-lt-user-destroy-after-reentry] "
+        "[--enter-slot-lt-user-revoke-after-reentry] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -972,6 +1187,8 @@ main(int argc, char** argv) {
   int enter_slot_lt_user_illegal_cleanup_same_enclave = 0;
   int enter_slot_lt_user_page_fault = 0;
   int enter_slot_lt_user_page_fault_cleanup_same_enclave = 0;
+  int enter_slot_lt_user_destroy_after_reentry = 0;
+  int enter_slot_lt_user_revoke_after_reentry = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -1010,6 +1227,10 @@ main(int argc, char** argv) {
       {"enter-slot-lt-user-page-fault", no_argument, &enter_slot_lt_user_page_fault, 1},
       {"enter-slot-lt-user-page-fault-cleanup-same-enclave", no_argument,
        &enter_slot_lt_user_page_fault_cleanup_same_enclave, 1},
+      {"enter-slot-lt-user-destroy-after-reentry", no_argument,
+       &enter_slot_lt_user_destroy_after_reentry, 1},
+      {"enter-slot-lt-user-revoke-after-reentry", no_argument,
+       &enter_slot_lt_user_revoke_after_reentry, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -1112,6 +1333,16 @@ main(int argc, char** argv) {
 
   if (enter_slot_lt_user_page_fault_cleanup_same_enclave) {
     return run_enter_slot_lt_user_page_fault_cleanup_same_enclave(
+        eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_lt_user_destroy_after_reentry) {
+    return run_enter_slot_lt_user_destroy_after_reentry(
+        eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_lt_user_revoke_after_reentry) {
+    return run_enter_slot_lt_user_revoke_after_reentry(
         eapp_file, rt_file, ld_file, params);
   }
 
