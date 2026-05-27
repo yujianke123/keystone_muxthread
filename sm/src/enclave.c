@@ -20,6 +20,7 @@ struct enclave enclaves[ENCL_MAX];
 #define ENCLAVE_EXISTS(eid) (eid < ENCL_MAX && enclaves[eid].state >= 0)
 
 static spinlock_t encl_lock = SPIN_LOCK_INITIALIZER;
+static uintptr_t next_cap_key_generation = 1;
 
 extern void save_host_regs(void);
 extern void restore_host_regs(void);
@@ -39,17 +40,31 @@ static void clear_enclave_cap_key(enclave_id eid)
 {
   sbi_memset(enclaves[eid].cap_key, 0, sizeof(enclaves[eid].cap_key));
   enclaves[eid].cap_key_ready = 0;
+  enclaves[eid].cap_key_generation = 0;
+}
+
+static uintptr_t allocate_cap_key_generation(void)
+{
+  uintptr_t generation = next_cap_key_generation++;
+
+  if (next_cap_key_generation == 0)
+    next_cap_key_generation = 1;
+
+  return generation;
 }
 
 static void derive_enclave_cap_key(enclave_id eid)
 {
-  static const char label[] = "slottee-cap-v1";
+  static const char label[] = "slottee-cap-v2";
+  uintptr_t generation = allocate_cap_key_generation();
   hash_ctx ctx;
 
+  enclaves[eid].cap_key_generation = generation;
   hash_init(&ctx);
   hash_extend(&ctx, sm_private_key, PRIVATE_KEY_SIZE);
   hash_extend(&ctx, enclaves[eid].hash, MDSIZE);
   hash_extend(&ctx, &eid, sizeof(eid));
+  hash_extend(&ctx, &generation, sizeof(generation));
   hash_extend(&ctx, label, sizeof(label) - 1);
   hash_finalize(enclaves[eid].cap_key, &ctx);
   enclaves[eid].cap_key_ready = 1;
@@ -1126,12 +1141,14 @@ out:
       resp->n_thread = enclaves[eid].n_thread;
       resp->busy_slots = count_busy_slot_leases(eid);
       resp->cap_key_ready = enclaves[eid].cap_key_ready;
+      resp->cap_key_generation = enclaves[eid].cap_key_generation;
     } else {
       resp->reentry_ready = 0;
       resp->epoch = 0;
       resp->n_thread = 0;
       resp->busy_slots = 0;
       resp->cap_key_ready = 0;
+      resp->cap_key_generation = 0;
       resp->cap = (struct slot_cap_t) {0};
     }
   }

@@ -96,7 +96,8 @@ make_enter_slot_test_cap(uintptr_t slot_id) {
 }
 
 static Keystone::Error
-mint_enter_slot_test_cap(Keystone::Enclave& enclave, slot_cap_t* cap) {
+mint_enter_slot_test_cap_with_resp(
+    Keystone::Enclave& enclave, slot_cap_t* cap, slottee_debug_resp_t* debug_resp) {
   slottee_debug_req_t req = {};
   slottee_debug_resp_t resp = {};
   Keystone::Error ret;
@@ -118,7 +119,14 @@ mint_enter_slot_test_cap(Keystone::Enclave& enclave, slot_cap_t* cap) {
   }
 
   *cap = resp.cap;
+  if (debug_resp)
+    *debug_resp = resp;
   return Keystone::Error::Success;
+}
+
+static Keystone::Error
+mint_enter_slot_test_cap(Keystone::Enclave& enclave, slot_cap_t* cap) {
+  return mint_enter_slot_test_cap_with_resp(enclave, cap, NULL);
 }
 
 static void
@@ -1538,7 +1546,7 @@ run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
       (int)ret, status, value, lease);
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT double-enter recreated old epoch", ret,
-          status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+          status, value, SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
     recreated.destroy();
     return 1;
   }
@@ -3019,7 +3027,7 @@ run_enter_slot_revoke_stress(const char* eapp_file,
       (int)ret, status, value, last_lease, stale_after_recreate_cap.epoch);
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT revoke stress recreated old epoch", ret,
-          status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
+          status, value, SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
     recreated.destroy();
     return 1;
   }
@@ -3220,6 +3228,126 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
   return 0;
 }
 
+static int
+expect_cap_generation_replay_row(const char* phase, Keystone::Error ret,
+    uintptr_t status, uintptr_t value, uintptr_t lease, uintptr_t old_eid,
+    uintptr_t new_eid, uintptr_t old_epoch, uintptr_t new_epoch,
+    uintptr_t old_generation, uintptr_t new_generation, uintptr_t ocalls,
+    uintptr_t resumes, uintptr_t expected_status)
+{
+  printf("cap_generation_replay,%s,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      phase, (int)ret, status, value, lease, old_eid, new_eid, old_epoch,
+      new_epoch, old_generation, new_generation, ocalls, resumes);
+  fflush(stdout);
+
+  if (ret != Keystone::Error::Success || status != expected_status) {
+    printf("[FAIL] cap_generation_replay %s returned unexpected ret/status\n",
+        phase);
+    return 1;
+  }
+
+  return 0;
+}
+
+static int
+run_enter_slot_cap_generation_replay(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  Keystone::Enclave recreated;
+  slot_cap_t old_cap = make_enter_slot_test_cap(1);
+  slot_cap_t new_cap = make_enter_slot_test_cap(1);
+  slottee_debug_resp_t old_mint = {};
+  slottee_debug_resp_t new_mint = {};
+  uintptr_t status = 0;
+  uintptr_t value = 0;
+  uintptr_t lease = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT cap generation replay failed to init enclave\n");
+    return 1;
+  }
+
+  if (mint_enter_slot_test_cap_with_resp(enclave, &old_cap, &old_mint) !=
+      Keystone::Error::Success) {
+    enclave.destroy();
+    return 1;
+  }
+
+  if (expect_cap_generation_replay_row("mint_old", Keystone::Error::Success,
+          old_mint.status, 0, 0, old_cap.eid, 0, old_cap.epoch, 0,
+          old_mint.cap_key_generation, 0, 0, 0,
+          SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      old_cap.epoch != SLOTTEE_INITIAL_EPOCH ||
+      old_mint.cap_key_generation == 0) {
+    enclave.destroy();
+    return 1;
+  }
+
+  if (enclave.destroy() != Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT cap generation replay failed to destroy first enclave\n");
+    return 1;
+  }
+
+  if (recreated.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] ENTER_SLOT cap generation replay failed to recreate enclave\n");
+    return 1;
+  }
+
+  edge_init(&recreated);
+
+  if (mint_enter_slot_test_cap_with_resp(recreated, &new_cap, &new_mint) !=
+      Keystone::Error::Success) {
+    recreated.destroy();
+    return 1;
+  }
+
+  if (expect_cap_generation_replay_row("mint_new", Keystone::Error::Success,
+          new_mint.status, 0, 0, old_cap.eid, new_cap.eid, old_cap.epoch,
+          new_cap.epoch, old_mint.cap_key_generation,
+          new_mint.cap_key_generation, 0, 0, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      old_cap.eid != new_cap.eid ||
+      new_cap.epoch != SLOTTEE_INITIAL_EPOCH ||
+      old_mint.cap_key_generation == new_mint.cap_key_generation) {
+    printf("[FAIL] cap_generation_replay did not exercise same eid/new generation\n");
+    recreated.destroy();
+    return 1;
+  }
+
+  ret = enter_slot_request_once_with_cap(recreated, old_cap,
+      SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &lease);
+  if (expect_cap_generation_replay_row("old_cap_after_recreate", ret, status,
+          value, lease, old_cap.eid, new_cap.eid, old_cap.epoch, new_cap.epoch,
+          old_mint.cap_key_generation, new_mint.cap_key_generation, 0, 0,
+          SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
+    recreated.destroy();
+    return 1;
+  }
+
+  ret = enter_slot_user_ocall_round_with_cap(recreated, new_cap, &status,
+      &value, &lease, &ocalls, &resumes);
+  if (expect_cap_generation_replay_row("new_cap_after_recreate", ret, status,
+          value, lease, old_cap.eid, new_cap.eid, old_cap.epoch, new_cap.epoch,
+          old_mint.cap_key_generation, new_mint.cap_key_generation, ocalls,
+          resumes, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      value != SLOTTEE_LT_USER_OCALL_MAGIC ||
+      lease == 0 || ocalls != 1 || resumes != 1) {
+    recreated.destroy();
+    return 1;
+  }
+
+  recreated.destroy();
+  return 0;
+}
+
 int
 main(int argc, char** argv) {
   if (argc < 4 || argc > 24) {
@@ -3255,6 +3383,7 @@ main(int argc, char** argv) {
         "[--enter-slot-rt-revoke-fault] "
         "[--enter-slot-revoke-stress] "
         "[--enter-slot-cap-mac-forge] "
+        "[--enter-slot-cap-generation-replay] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -3301,6 +3430,7 @@ main(int argc, char** argv) {
   int enter_slot_rt_revoke_fault = 0;
   int enter_slot_revoke_stress = 0;
   int enter_slot_cap_mac_forge = 0;
+  int enter_slot_cap_generation_replay = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -3363,6 +3493,8 @@ main(int argc, char** argv) {
       {"enter-slot-rt-revoke-fault", no_argument, &enter_slot_rt_revoke_fault, 1},
       {"enter-slot-revoke-stress", no_argument, &enter_slot_revoke_stress, 1},
       {"enter-slot-cap-mac-forge", no_argument, &enter_slot_cap_mac_forge, 1},
+      {"enter-slot-cap-generation-replay", no_argument,
+       &enter_slot_cap_generation_replay, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -3530,6 +3662,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_cap_mac_forge) {
     return run_enter_slot_cap_mac_forge(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_cap_generation_replay) {
+    return run_enter_slot_cap_generation_replay(eapp_file, rt_file, ld_file, params);
   }
 
   Keystone::Enclave enclave;

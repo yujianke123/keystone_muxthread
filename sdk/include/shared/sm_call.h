@@ -213,6 +213,7 @@ struct slottee_debug_resp_t {
   uintptr_t n_thread;
   uintptr_t busy_slots;
   uintptr_t cap_key_ready;
+  uintptr_t cap_key_generation;
   struct slot_cap_t cap;
 };
 

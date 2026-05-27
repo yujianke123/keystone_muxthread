@@ -488,6 +488,7 @@ MockKeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_r
         req.op == SLOTTEE_DEBUG_OP_REENTRY_CLEAR ? 0 : 1;
     local_resp.epoch = SLOTTEE_INITIAL_EPOCH;
     local_resp.cap_key_ready = 1;
+    local_resp.cap_key_generation = 1;
     if (req.op == SLOTTEE_DEBUG_OP_MINT_CAP) {
       local_resp.cap = req.cap;
       local_resp.cap.version = SLOTTEE_ENTER_SLOT_VERSION;
