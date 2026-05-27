@@ -27,6 +27,8 @@ enum class Error {
   PageAllocationFailure,
   EdgeCallHost,
   EnclaveInterrupted,
+  EnclaveNotResumable,
+  IoctlErrorSlotteeDebug,
 };
 
 }  // namespace Keystone

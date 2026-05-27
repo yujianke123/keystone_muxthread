@@ -54,6 +54,9 @@ static int sbi_ecall_keystone_enclave_handler(unsigned long extid, unsigned long
     case SBI_SM_MARK_REVOKE:
       retval = sbi_sm_mark_revoke(out_val, regs->a0, regs->a1, regs->a2);
       break;
+    case SBI_SM_SLOTTEE_DEBUG:
+      retval = sbi_sm_slottee_debug(out_val, regs->a0, regs->a1, regs->a2);
+      break;
     case SBI_SM_RANDOM:
       *out_val = sbi_sm_random();
       retval = 0;

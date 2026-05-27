@@ -18,5 +18,7 @@ struct sbiret sbi_sm_enter_slot(
     unsigned long eid, struct enter_slot_req_t *req, struct enter_slot_resp_t *resp);
 struct sbiret sbi_sm_mark_revoke(
     unsigned long eid, struct mark_revoke_req_t *req, struct mark_revoke_resp_t *resp);
+struct sbiret sbi_sm_slottee_debug(
+    unsigned long eid, struct slottee_debug_req_t *req, struct slottee_debug_resp_t *resp);
 
 #endif

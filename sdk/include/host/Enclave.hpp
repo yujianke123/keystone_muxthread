@@ -80,6 +80,7 @@ class Enclave {
       const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value = nullptr);
   Error enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp);
   Error markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch = nullptr);
+  Error slotteeDebug(const slottee_debug_req_t& req, slottee_debug_resp_t* resp);
 };
 
 uint64_t

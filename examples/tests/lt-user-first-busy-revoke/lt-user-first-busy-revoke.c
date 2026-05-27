@@ -3,7 +3,7 @@
 #include "shared/sm_call.h"
 
 #define OCALL_PRINT_VALUE 2
-#define SLOTTEE_FIRST_BUSY_REVOKE_SPINS (1UL << 32)
+#define SLOTTEE_FIRST_BUSY_REVOKE_SPINS (1UL << 34)
 
 static volatile unsigned long entry_count;
 
@@ -22,7 +22,7 @@ eapp_entry()
   unsigned long entry = ++entry_count;
   unsigned long value = SLOTTEE_LT_USER_OCALL_MAGIC;
 
-  if ((entry & 1) == 1) {
+  if (entry == 1) {
     busy_until_timer_interrupt();
     EAPP_RETURN(SLOTTEE_LT_USER_ILLEGAL_MAGIC);
   }

@@ -168,14 +168,14 @@ void handle_syscall(struct encl_ctx* ctx)
 
   switch (n) {
   case(RUNTIME_SYSCALL_EXIT):
-    if (slottee_active_user_exit(arg0))
+    if (slottee_active_user_exit(ctx, arg0))
       break;
     sbi_exit_enclave(arg0);
     break;
   case(RUNTIME_SYSCALL_OCALL):
     slottee_active_user_record_ocall(ctx);
     ret = dispatch_edgecall_ocall(arg0, (void*)arg1, arg2, (void*)arg3, arg4);
-    slottee_active_user_record_ocall_resume(ret);
+    slottee_active_user_record_ocall_resume(ctx, ret);
     break;
   case(RUNTIME_SYSCALL_SHAREDCOPY):
     ret = handle_copy_from_shared((void*)arg0, arg1, arg2);

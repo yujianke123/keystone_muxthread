@@ -140,6 +140,8 @@ KeystoneDevice::__run(bool resume, uintptr_t* ret) {
       return Error::EdgeCallHost;
     case SBI_ERR_SM_ENCLAVE_INTERRUPTED:
       return Error::EnclaveInterrupted;
+    case SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE:
+      return Error::EnclaveNotResumable;
     case SBI_ERR_SM_ENCLAVE_SUCCESS:
       if (ret) {
         *ret = encl.value;
@@ -243,6 +245,24 @@ KeystoneDevice::markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch
   }
   if (epoch) {
     *epoch = encl.resp.epoch;
+  }
+
+  return Error::Success;
+}
+
+Error
+KeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_resp_t* resp) {
+  struct keystone_ioctl_slottee_debug encl;
+  memset(&encl, 0, sizeof(encl));
+  encl.eid = eid;
+  encl.req = req;
+
+  if (ioctl(fd, KEYSTONE_IOC_SLOTTEE_DEBUG, &encl)) {
+    return Error::IoctlErrorSlotteeDebug;
+  }
+
+  if (resp) {
+    *resp = encl.resp;
   }
 
   return Error::Success;
@@ -443,6 +463,28 @@ MockKeystoneDevice::markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* e
   if (epoch) {
     *epoch = (slotId == 0 || slotId >= SLOTTEE_MAX_SLOTS) ?
         0 : SLOTTEE_INITIAL_EPOCH + 1;
+  }
+  return Error::Success;
+}
+
+Error
+MockKeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_resp_t* resp) {
+  slottee_debug_resp_t local_resp;
+  memset(&local_resp, 0, sizeof(local_resp));
+
+  if (req.version != SLOTTEE_DEBUG_VERSION ||
+      (req.op != SLOTTEE_DEBUG_OP_REENTRY_STATUS &&
+       req.op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR)) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  } else {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_SUCCESS;
+    local_resp.reentry_ready =
+        req.op == SLOTTEE_DEBUG_OP_REENTRY_CLEAR ? 0 : 1;
+    local_resp.epoch = SLOTTEE_INITIAL_EPOCH;
+  }
+
+  if (resp) {
+    *resp = local_resp;
   }
   return Error::Success;
 }

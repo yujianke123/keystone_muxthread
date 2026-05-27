@@ -17,6 +17,7 @@
 #define SBI_SM_RESUME_ENCLAVE    2005
 #define SBI_SM_ENTER_SLOT        2006
 #define SBI_SM_MARK_REVOKE       2007
+#define SBI_SM_SLOTTEE_DEBUG     2008
 #define FID_RANGE_HOST           2999
 
 #define SLOTTEE_ENTER_SLOT_VERSION     1
@@ -32,7 +33,6 @@
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER 8
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL 9
 #define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT 10
-#define SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL_NO_TEMPLATE 11
 #define SLOTTEE_CAP_RIGHT_ENTER        1
 #define SLOTTEE_DEFAULT_CAP_SEQ        1
 #define SLOTTEE_DEFAULT_MAX_LEASE_CYCLES ((uintptr_t)-1 / 4)
@@ -56,7 +56,6 @@
 #define SLOTTEE_SLOT_TOKEN_MODE_LT_USER    7
 #define SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL 8
 #define SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT 9
-#define SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL_NO_TEMPLATE 10
 #define SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id, mode) \
   ((((uintptr_t)(lease_id)) << SLOTTEE_SLOT_TOKEN_LEASE_SHIFT) | \
    (((uintptr_t)(mode)) << SLOTTEE_SLOT_TOKEN_MODE_SHIFT) | ((uintptr_t)(slot_id)))
@@ -193,6 +192,23 @@ struct mark_revoke_req_t {
 struct mark_revoke_resp_t {
   uintptr_t status;
   uintptr_t epoch;
+};
+
+#define SLOTTEE_DEBUG_VERSION              1
+#define SLOTTEE_DEBUG_OP_REENTRY_STATUS    1
+#define SLOTTEE_DEBUG_OP_REENTRY_CLEAR     2
+
+struct slottee_debug_req_t {
+  uintptr_t version;
+  uintptr_t op;
+};
+
+struct slottee_debug_resp_t {
+  uintptr_t status;
+  uintptr_t reentry_ready;
+  uintptr_t epoch;
+  uintptr_t n_thread;
+  uintptr_t busy_slots;
 };
 
 #endif  // __SM_CALL_H__

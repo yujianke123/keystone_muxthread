@@ -37,3 +37,10 @@ struct sbiret sbi_sm_mark_revoke(
       SBI_SM_MARK_REVOKE,
       eid, (unsigned long) req, (unsigned long) resp, 0, 0, 0);
 }
+
+struct sbiret sbi_sm_slottee_debug(
+    unsigned long eid, struct slottee_debug_req_t *req, struct slottee_debug_resp_t *resp) {
+  return sbi_ecall(SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE,
+      SBI_SM_SLOTTEE_DEBUG,
+      eid, (unsigned long) req, (unsigned long) resp, 0, 0, 0);
+}

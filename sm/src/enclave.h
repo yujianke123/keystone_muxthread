@@ -151,6 +151,8 @@ unsigned long activate_enclave_slot(
     enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp);
 unsigned long mark_revoke_enclave_slot(
     enclave_id eid, const struct mark_revoke_req_t *req, struct mark_revoke_resp_t *resp);
+unsigned long debug_enclave_slot_state(
+    enclave_id eid, const struct slottee_debug_req_t *req, struct slottee_debug_resp_t *resp);
 void enter_activated_enclave_slot(
     struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
     uintptr_t slot_mode);

@@ -30,6 +30,8 @@
   _IOR(KEYSTONE_IOC_MAGIC, 0x08, struct keystone_ioctl_enter_slot)
 #define KEYSTONE_IOC_MARK_REVOKE \
   _IOR(KEYSTONE_IOC_MAGIC, 0x09, struct keystone_ioctl_mark_revoke)
+#define KEYSTONE_IOC_SLOTTEE_DEBUG \
+  _IOR(KEYSTONE_IOC_MAGIC, 0x0a, struct keystone_ioctl_slottee_debug)
 
 #define RT_NOEXEC 0
 #define USER_NOEXEC 1
@@ -73,6 +75,12 @@ struct keystone_ioctl_mark_revoke {
   uintptr_t eid;
   struct mark_revoke_req_t req;
   struct mark_revoke_resp_t resp;
+};
+
+struct keystone_ioctl_slottee_debug {
+  uintptr_t eid;
+  struct slottee_debug_req_t req;
+  struct slottee_debug_resp_t resp;
 };
 
 #endif

@@ -302,6 +302,11 @@ Enclave::markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch) {
   return pDevice->markRevoke(slotId, status, epoch);
 }
 
+Error
+Enclave::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_resp_t* resp) {
+  return pDevice->slotteeDebug(req, resp);
+}
+
 void*
 Enclave::getSharedBuffer() {
   return shared_buffer;

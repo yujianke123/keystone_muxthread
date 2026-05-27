@@ -25,14 +25,6 @@ size_t utm_size;
 /* defined in entry.S */
 extern void* encl_trap_handler;
 
-static int
-slottee_should_init_reentry_template(uintptr_t slot_token)
-{
-  return slot_token != 0 &&
-      SLOTTEE_SLOT_TOKEN_MODE(slot_token) !=
-          SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL_NO_TEMPLATE;
-}
-
 int verify_and_load_elf_file(uintptr_t ptr, size_t file_size, bool is_eapp) {
   int ret = 0;
   // validate elf 
@@ -87,7 +79,7 @@ init_user_stack_and_env(ELF(Ehdr) *hdr)
   csr_write(sscratch, user_sp);
 }
 
-void
+uintptr_t
 eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
            uintptr_t dram_base,
            uintptr_t dram_size,
@@ -97,6 +89,9 @@ eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
            uintptr_t utm_vaddr,
            uintptr_t utm_size)
 {
+  uintptr_t slot_token = dummy;
+  uintptr_t slot_runtime_stack = 0;
+
   /* set initial values */
   load_pa_start = dram_base;
   root_page_table = (pte*) __va(csr_read(satp) << RISCV_PAGE_BITS);
@@ -147,15 +142,17 @@ eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
   /* Enable the FPU */
   csr_write(sstatus, csr_read(sstatus) | 0x6000);
 
-  if (slottee_should_init_reentry_template(dummy))
-    sbi_init_reentry_template();
+  if (slot_token != 0) {
+    uintptr_t status = sbi_init_reentry_template();
+    printf("[slottee] init_reentry_template token=0x%lx status=%lu\r\n",
+        slot_token, status);
+  }
 
-  if (dummy != 0) {
-    slottee_slot_trampoline(dummy);
-    slottee_active_user_prepare_user_entry();
+  if (slot_token != 0) {
+    slot_runtime_stack = slottee_slot_trampoline(slot_token);
   }
 
   debug("eyrie boot finished. drop to the user land ...");
   /* booting all finished, droping to the user land */
-  return;
+  return slot_runtime_stack;
 }

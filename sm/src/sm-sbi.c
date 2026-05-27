@@ -80,8 +80,7 @@ unsigned long sbi_sm_enter_slot(
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL &&
-       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT &&
-       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL_NO_TEMPLATE)) {
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT)) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
@@ -96,8 +95,7 @@ unsigned long sbi_sm_enter_slot(
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL ||
-      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT ||
-      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL_NO_TEMPLATE) {
+      req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT) {
     uintptr_t slot_mode = SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
 
     if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT)
@@ -118,8 +116,6 @@ unsigned long sbi_sm_enter_slot(
       slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL;
     else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT)
       slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT;
-    else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL_NO_TEMPLATE)
-      slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL_NO_TEMPLATE;
 
     ret = activate_enclave_slot((enclave_id) eid, &req.cap, &resp);
     resp.value = 0;
@@ -167,6 +163,30 @@ unsigned long sbi_sm_mark_revoke(
     *out_val = resp.epoch;
 
   if (mark_revoke_resp && copy_from_sm(mark_revoke_resp, &resp, sizeof(resp)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  return ret;
+}
+
+unsigned long sbi_sm_slottee_debug(
+    unsigned long *out_val, unsigned long eid, uintptr_t debug_req,
+    uintptr_t debug_resp)
+{
+  struct slottee_debug_req_t req;
+  struct slottee_debug_resp_t resp = {0};
+  unsigned long ret;
+
+  if (out_val)
+    *out_val = 0;
+
+  if (copy_to_sm(&req, debug_req, sizeof(req)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  ret = debug_enclave_slot_state((enclave_id) eid, &req, &resp);
+  if (out_val)
+    *out_val = resp.reentry_ready;
+
+  if (debug_resp && copy_from_sm(debug_resp, &resp, sizeof(resp)))
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   return ret;

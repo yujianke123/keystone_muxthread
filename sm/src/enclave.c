@@ -56,11 +56,15 @@ static int enclave_slot_state_is_activatable(enclave_id eid)
   if (enclaves[eid].state == FRESH)
     return 1;
 
-  return enclaves[eid].state == STOPPED &&
-      enclaves[eid].n_thread == 0 &&
-      enclaves[eid].slot_reentry_ready &&
-      enclaves[eid].params.slot_entry != enclaves[eid].params.dram_base &&
-      !enclave_has_busy_slot_leases(eid);
+  if (!enclaves[eid].slot_reentry_ready ||
+      enclaves[eid].params.slot_entry == enclaves[eid].params.dram_base)
+    return 0;
+
+  if (enclaves[eid].state == STOPPED)
+    return enclaves[eid].n_thread == 0 && !enclave_has_busy_slot_leases(eid);
+
+  return enclaves[eid].state == RUNNING &&
+      enclaves[eid].n_thread < MAX_ENCL_THREADS;
 }
 
 static void clear_enclave_slot_leases(enclave_id eid)
@@ -158,6 +162,26 @@ static int enclave_has_busy_slot_leases(enclave_id eid)
   }
 
   return 0;
+}
+
+static uintptr_t count_busy_slot_leases(enclave_id eid)
+{
+  uintptr_t busy = 0;
+  size_t slot;
+
+  for(slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    if (slot_lease_is_busy(&enclaves[eid].slot_leases[slot]))
+      busy++;
+  }
+
+  return busy;
+}
+
+static void clear_enclave_slot_reentry_template(enclave_id eid)
+{
+  enclaves[eid].slot_reentry_ready = 0;
+  enclaves[eid].slot_reentry_csrs = (struct csrs) {0};
+  enclaves[eid].slot_reentry_mstatus = 0;
 }
 
 static void save_enclave_slot_reentry_template(enclave_id eid, uintptr_t thread_index)
@@ -297,6 +321,7 @@ static inline void context_switch_to_enclave(struct sbi_trap_regs* regs,
     regs->mstatus = (1 << MSTATUS_MPP_SHIFT);
     // $a0: SlotTEE slot token. Zero preserves the original slot 0 run path.
     regs->a0 = entry_arg;
+    regs->t6 = entry_arg;
     // $a1: (PA) DRAM base,
     regs->a1 = (uintptr_t) enclaves[eid].params.dram_base;
     // $a2: DRAM size,
@@ -647,9 +672,7 @@ unsigned long create_enclave(unsigned long *eidptr, struct keystone_sbi_create_t
 #endif
   enclaves[eid].n_thread = 0;
   enclaves[eid].stopped_thread_index = 0;
-  enclaves[eid].slot_reentry_ready = 0;
-  enclaves[eid].slot_reentry_csrs = (struct csrs) {0};
-  enclaves[eid].slot_reentry_mstatus = 0;
+  clear_enclave_slot_reentry_template(eid);
   enclaves[eid].params = params;
   clear_enclave_slot_leases(eid);
 
@@ -752,9 +775,7 @@ unsigned long destroy_enclave(enclave_id eid)
   enclaves[eid].encl_satp = 0;
   enclaves[eid].n_thread = 0;
   enclaves[eid].stopped_thread_index = 0;
-  enclaves[eid].slot_reentry_ready = 0;
-  enclaves[eid].slot_reentry_csrs = (struct csrs) {0};
-  enclaves[eid].slot_reentry_mstatus = 0;
+  clear_enclave_slot_reentry_template(eid);
   enclaves[eid].params = (struct runtime_params_t) {0};
   clear_enclave_slot_leases(eid);
   for(i=0; i < ENCLAVE_REGIONS_MAX; i++){
@@ -959,6 +980,44 @@ out:
     resp->status = ret;
     if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
       resp->epoch = 0;
+  }
+  spin_unlock(&encl_lock);
+  return ret;
+}
+
+unsigned long debug_enclave_slot_state(
+    enclave_id eid, const struct slottee_debug_req_t *req, struct slottee_debug_resp_t *resp)
+{
+  unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
+
+  if (!req || req->version != SLOTTEE_DEBUG_VERSION ||
+      (req->op != SLOTTEE_DEBUG_OP_REENTRY_STATUS &&
+       req->op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+  if (!ENCLAVE_EXISTS(eid) || enclaves[eid].state < FRESH) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+    goto out;
+  }
+
+  if (req->op == SLOTTEE_DEBUG_OP_REENTRY_CLEAR)
+    clear_enclave_slot_reentry_template(eid);
+
+out:
+  if (resp) {
+    resp->status = ret;
+    if (ret == SBI_ERR_SM_ENCLAVE_SUCCESS) {
+      resp->reentry_ready = enclaves[eid].slot_reentry_ready;
+      resp->epoch = enclaves[eid].current_slot_epoch;
+      resp->n_thread = enclaves[eid].n_thread;
+      resp->busy_slots = count_busy_slot_leases(eid);
+    } else {
+      resp->reentry_ready = 0;
+      resp->epoch = 0;
+      resp->n_thread = 0;
+      resp->busy_slots = 0;
+    }
   }
   spin_unlock(&encl_lock);
   return ret;

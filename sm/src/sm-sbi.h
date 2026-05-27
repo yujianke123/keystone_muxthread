@@ -37,6 +37,11 @@ sbi_sm_mark_revoke(
     uintptr_t mark_revoke_resp);
 
 unsigned long
+sbi_sm_slottee_debug(
+    unsigned long *out_val, unsigned long eid, uintptr_t debug_req,
+    uintptr_t debug_resp);
+
+unsigned long
 sbi_sm_exit_slot(
     struct sbi_trap_regs *regs, uintptr_t slot_id, uintptr_t lease_id,
     uintptr_t exit_reason, uintptr_t value);

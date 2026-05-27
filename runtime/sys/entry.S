@@ -118,6 +118,9 @@ _start:
   sfence.vma
   mv a0, t6
   jal eyrie_boot
+  beqz a0, 1f
+  mv sp, a0
+1:
   sfence.vma
 
   /* set spp to user */
@@ -135,9 +138,8 @@ slottee_runtime_reenter:
   mv a0, t6
   la t0, slottee_slot_trampoline
   jalr t0
-  la t0, slottee_active_user_prepare_user_entry
-  jalr t0
   beqz a0, 1f
+  mv sp, a0
 
   /* Mirror the first-boot drop from runtime S-mode into the eapp. */
   li t0, 0x100

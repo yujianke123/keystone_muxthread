@@ -16,6 +16,9 @@
 #define SLOTTEE_USER_REGION_GAP  RISCV_PAGE_SIZE
 #define SLOTTEE_USER_SLOT_STRIDE \
   (SLOTTEE_USER_STACK_SIZE + SLOTTEE_USER_TLS_SIZE + SLOTTEE_USER_REGION_GAP)
+#define SLOTTEE_RUNTIME_STACK_PAGES 8
+#define SLOTTEE_RUNTIME_STACK_WORDS \
+  ((SLOTTEE_RUNTIME_STACK_PAGES * RISCV_PAGE_SIZE) / sizeof(uintptr_t))
 
 struct slottee_active_user_context {
   uintptr_t active;
@@ -44,7 +47,10 @@ struct slottee_active_user_context {
   uintptr_t revoke_on_fault;
 };
 
-static struct slottee_active_user_context slottee_active_user;
+static struct slottee_active_user_context slottee_active_users[SLOTTEE_MAX_SLOTS];
+static uintptr_t
+    slottee_runtime_stacks[SLOTTEE_MAX_SLOTS][SLOTTEE_RUNTIME_STACK_WORDS]
+    __attribute__((aligned(RISCV_PAGE_SIZE)));
 static uintptr_t slottee_user_entry_point;
 
 void
@@ -80,24 +86,45 @@ slottee_user_tls_base(uintptr_t slot_id)
       SLOTTEE_USER_REGION_GAP;
 }
 
+static struct slottee_active_user_context*
+slottee_active_user_for_slot(uintptr_t slot_id)
+{
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return NULL;
+
+  return &slottee_active_users[slot_id];
+}
+
+static uintptr_t
+slottee_runtime_stack_top(uintptr_t slot_id)
+{
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return 0;
+
+  return (uintptr_t)&slottee_runtime_stacks[slot_id][SLOTTEE_RUNTIME_STACK_WORDS];
+}
+
 static int
 slottee_mode_is_user_ocall(uintptr_t mode)
 {
   return mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL ||
-      mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT ||
-      mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL_NO_TEMPLATE;
+      mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT;
 }
 
 static int
-slottee_user_ranges_isolated(uintptr_t slot_id)
+slottee_user_ranges_isolated(
+    const struct slottee_active_user_context* user, uintptr_t slot_id)
 {
-  uintptr_t slot_stack_base = slottee_active_user.user_stack_base;
-  uintptr_t slot_tls_base = slottee_active_user.user_tls_base;
+  uintptr_t slot_stack_base;
+  uintptr_t slot_tls_base;
   uintptr_t other;
 
   if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS ||
-      !slottee_active_user.user_alloc_ok)
+      !user || !user->user_alloc_ok)
     return 0;
+
+  slot_stack_base = user->user_stack_base;
+  slot_tls_base = user->user_tls_base;
 
   if (slottee_user_ranges_overlap(slot_stack_base, SLOTTEE_USER_STACK_SIZE,
           slot_tls_base, SLOTTEE_USER_TLS_SIZE))
@@ -127,175 +154,231 @@ slottee_user_ranges_isolated(uintptr_t slot_id)
 }
 
 static void
-slottee_record_trap_frame(struct encl_ctx* ctx, uintptr_t syscall_id)
+slottee_record_trap_frame(
+    struct slottee_active_user_context* user, struct encl_ctx* ctx,
+    uintptr_t syscall_id)
 {
-  if (!slottee_active_user.active || !ctx)
+  if (!user || !user->active || !ctx)
     return;
 
-  slottee_active_user.last_trap_syscall = syscall_id;
-  slottee_active_user.last_trap_scause = ctx->scause;
-  slottee_active_user.last_trap_sepc = ctx->regs.sepc;
-  slottee_active_user.last_trap_stval = ctx->sbadaddr;
-  slottee_active_user.last_trap_user_sp = ctx->regs.sp;
-  slottee_active_user.last_trap_user_tp = ctx->regs.tp;
+  user->last_trap_syscall = syscall_id;
+  user->last_trap_scause = ctx->scause;
+  user->last_trap_sepc = ctx->regs.sepc;
+  user->last_trap_stval = ctx->sbadaddr;
+  user->last_trap_user_sp = ctx->regs.sp;
+  user->last_trap_user_tp = ctx->regs.tp;
 }
 
 static int
-slottee_prepare_user_memory(uintptr_t slot_id)
+slottee_frame_matches_user(
+    const struct slottee_active_user_context* user, const struct encl_ctx* ctx)
+{
+  if (!user || !ctx || !user->active)
+    return 0;
+
+  if (!slottee_mode_is_user_ocall(user->mode) || !user->user_alloc_ok)
+    return 0;
+
+  return slottee_user_addr_in_range(ctx->regs.sp, user->user_stack_base,
+             SLOTTEE_USER_STACK_SIZE) ||
+      slottee_user_addr_in_range(ctx->regs.tp, user->user_tls_base,
+          user->user_tls_size) ||
+      ctx->regs.tp == user->user_tls_base;
+}
+
+static struct slottee_active_user_context*
+slottee_active_user_for_frame(struct encl_ctx* ctx)
+{
+  struct slottee_active_user_context* only_active = NULL;
+  uintptr_t active_count = 0;
+  uintptr_t slot;
+
+  if (!ctx)
+    return NULL;
+
+  for (slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    struct slottee_active_user_context* user = &slottee_active_users[slot];
+
+    if (!user->active)
+      continue;
+    if (slottee_frame_matches_user(user, ctx))
+      return user;
+    only_active = user;
+    active_count++;
+  }
+
+  return active_count == 1 ? only_active : NULL;
+}
+
+static int
+slottee_prepare_user_memory(struct slottee_active_user_context* user, uintptr_t slot_id)
 {
   uintptr_t stack_base = slottee_user_stack_base(slot_id);
   uintptr_t tls_base = slottee_user_tls_base(slot_id);
   size_t stack_count;
   size_t tls_count;
 
+  if (!user)
+    return 0;
+
   stack_count = alloc_pages(vpn(stack_base), SLOTTEE_USER_STACK_PAGES,
       PTE_R | PTE_W | PTE_D | PTE_A | PTE_U);
   tls_count = alloc_pages(vpn(tls_base), SLOTTEE_USER_TLS_PAGES,
       PTE_R | PTE_W | PTE_D | PTE_A | PTE_U);
 
-  slottee_active_user.user_stack_base = stack_base;
-  slottee_active_user.user_stack_top = stack_base + SLOTTEE_USER_STACK_SIZE;
-  slottee_active_user.user_tls_base = tls_base;
-  slottee_active_user.user_tls_size = SLOTTEE_USER_TLS_SIZE;
-  slottee_active_user.user_stack_pages = stack_count;
-  slottee_active_user.user_tls_pages = tls_count;
-  slottee_active_user.user_alloc_ok =
+  user->user_stack_base = stack_base;
+  user->user_stack_top = stack_base + SLOTTEE_USER_STACK_SIZE;
+  user->user_tls_base = tls_base;
+  user->user_tls_size = SLOTTEE_USER_TLS_SIZE;
+  user->user_stack_pages = stack_count;
+  user->user_tls_pages = tls_count;
+  user->user_alloc_ok =
       stack_count == SLOTTEE_USER_STACK_PAGES &&
       tls_count == SLOTTEE_USER_TLS_PAGES;
 
   printf("[slottee] lt_user_mem slot=%lu stack=0x%lx-0x%lx tls=0x%lx-0x%lx pages=%lu/%lu ok=%lu\r\n",
-      slot_id, slottee_active_user.user_stack_base,
-      slottee_active_user.user_stack_top, slottee_active_user.user_tls_base,
-      slottee_active_user.user_tls_base + slottee_active_user.user_tls_size,
-      slottee_active_user.user_stack_pages, slottee_active_user.user_tls_pages,
-      slottee_active_user.user_alloc_ok);
+      slot_id, user->user_stack_base, user->user_stack_top,
+      user->user_tls_base, user->user_tls_base + user->user_tls_size,
+      user->user_stack_pages, user->user_tls_pages, user->user_alloc_ok);
 
-  return slottee_active_user.user_alloc_ok;
+  return user->user_alloc_ok;
 }
 
-static void
+static struct slottee_active_user_context*
 slottee_activate_user_context(uintptr_t slot_id, uintptr_t lease_id, uintptr_t mode)
 {
-  slottee_active_user.active = 1;
-  slottee_active_user.slot_id = slot_id;
-  slottee_active_user.lease_id = lease_id;
-  slottee_active_user.mode = mode;
-  slottee_active_user.enter_count++;
-  slottee_active_user.last_trap_syscall = 0;
-  slottee_active_user.last_trap_scause = 0;
-  slottee_active_user.last_trap_sepc = 0;
-  slottee_active_user.last_trap_stval = 0;
-  slottee_active_user.last_trap_user_sp = 0;
-  slottee_active_user.last_trap_user_tp = 0;
-  slottee_active_user.syscall_trap_count = 0;
-  slottee_active_user.ocall_trap_count = 0;
-  slottee_active_user.ocall_resume_count = 0;
-  slottee_active_user.exit_trap_count = 0;
-  slottee_active_user.fault_trap_count = 0;
-  slottee_active_user.revoke_on_fault =
+  struct slottee_active_user_context* user =
+      slottee_active_user_for_slot(slot_id);
+
+  if (!user)
+    return NULL;
+
+  user->active = 1;
+  user->slot_id = slot_id;
+  user->lease_id = lease_id;
+  user->mode = mode;
+  user->enter_count++;
+  user->last_trap_syscall = 0;
+  user->last_trap_scause = 0;
+  user->last_trap_sepc = 0;
+  user->last_trap_stval = 0;
+  user->last_trap_user_sp = 0;
+  user->last_trap_user_tp = 0;
+  user->syscall_trap_count = 0;
+  user->ocall_trap_count = 0;
+  user->ocall_resume_count = 0;
+  user->exit_trap_count = 0;
+  user->fault_trap_count = 0;
+  user->revoke_on_fault =
       mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT;
 
   if (slottee_mode_is_user_ocall(mode))
-    slottee_prepare_user_memory(slot_id);
+    slottee_prepare_user_memory(user, slot_id);
+
+  return user;
 }
 
-int
-slottee_active_user_prepare_user_entry(void)
+static uintptr_t
+slottee_active_user_prepare_user_entry(struct slottee_active_user_context* user)
 {
-  if (!slottee_active_user.active ||
-      !slottee_mode_is_user_ocall(slottee_active_user.mode) ||
-      !slottee_active_user.user_alloc_ok ||
-      !slottee_user_entry_point)
+  if (!user || !user->active || !slottee_mode_is_user_ocall(user->mode) ||
+      !user->user_alloc_ok || !slottee_user_entry_point)
     return 0;
 
   printf("[slottee] lt_user_entry slot=%lu sepc=0x%lx sscratch=0x%lx tp=0x%lx\r\n",
-      slottee_active_user.slot_id, slottee_user_entry_point,
-      slottee_active_user.user_stack_top, slottee_active_user.user_tls_base);
+      user->slot_id, slottee_user_entry_point, user->user_stack_top,
+      user->user_tls_base);
 
   __asm__ volatile("csrw sepc, %0" :: "r"(slottee_user_entry_point));
-  __asm__ volatile("csrw sscratch, %0" :: "r"(slottee_active_user.user_stack_top));
-  __asm__ volatile("mv tp, %0" :: "r"(slottee_active_user.user_tls_base) : "memory");
+  __asm__ volatile("csrw sscratch, %0" :: "r"(user->user_stack_top));
+  __asm__ volatile("mv tp, %0" :: "r"(user->user_tls_base) : "memory");
 
-  return 1;
+  return slottee_runtime_stack_top(user->slot_id);
 }
 
 void
 slottee_active_user_record_syscall(struct encl_ctx* ctx, uintptr_t syscall_id)
 {
-  if (!slottee_active_user.active)
+  struct slottee_active_user_context* user = slottee_active_user_for_frame(ctx);
+
+  if (!user)
     return;
 
-  slottee_record_trap_frame(ctx, syscall_id);
-  slottee_active_user.syscall_trap_count++;
+  slottee_record_trap_frame(user, ctx, syscall_id);
+  user->syscall_trap_count++;
 }
 
 void
 slottee_active_user_record_ocall(struct encl_ctx* ctx)
 {
-  if (!slottee_active_user.active ||
-      !slottee_mode_is_user_ocall(slottee_active_user.mode))
+  struct slottee_active_user_context* user = slottee_active_user_for_frame(ctx);
+
+  if (!user || !slottee_mode_is_user_ocall(user->mode))
     return;
 
-  slottee_record_trap_frame(ctx, RUNTIME_SYSCALL_OCALL);
-  slottee_active_user.ocall_trap_count++;
+  slottee_record_trap_frame(user, ctx, RUNTIME_SYSCALL_OCALL);
+  user->ocall_trap_count++;
 }
 
 void
-slottee_active_user_record_ocall_resume(uintptr_t value)
+slottee_active_user_record_ocall_resume(struct encl_ctx* ctx, uintptr_t value)
 {
-  if (!slottee_active_user.active ||
-      !slottee_mode_is_user_ocall(slottee_active_user.mode) ||
-      value != 0)
+  struct slottee_active_user_context* user = slottee_active_user_for_frame(ctx);
+
+  if (!user || !slottee_mode_is_user_ocall(user->mode) || value != 0)
     return;
 
-  slottee_active_user.ocall_resume_count++;
+  user->ocall_resume_count++;
 }
 
 static int
-slottee_active_user_ocall_exit_ok(uintptr_t value)
+slottee_active_user_ocall_exit_ok(
+    const struct slottee_active_user_context* user, uintptr_t value)
 {
-  if (!slottee_mode_is_user_ocall(slottee_active_user.mode))
+  if (!user || !slottee_mode_is_user_ocall(user->mode))
     return 1;
 
   return value == SLOTTEE_LT_USER_OCALL_MAGIC &&
-      slottee_active_user.user_alloc_ok &&
-      slottee_user_ranges_isolated(slottee_active_user.slot_id) &&
-      slottee_active_user.ocall_trap_count == 1 &&
-      slottee_active_user.ocall_resume_count == 1 &&
-      slottee_active_user.exit_trap_count == 1 &&
-      slottee_user_addr_in_range(slottee_active_user.last_trap_user_sp,
-          slottee_active_user.user_stack_base, SLOTTEE_USER_STACK_SIZE) &&
-      slottee_active_user.last_trap_user_tp == slottee_active_user.user_tls_base;
+      user->user_alloc_ok &&
+      slottee_user_ranges_isolated(user, user->slot_id) &&
+      user->ocall_trap_count == 1 &&
+      user->ocall_resume_count == 1 &&
+      user->exit_trap_count == 1 &&
+      slottee_user_addr_in_range(user->last_trap_user_sp,
+          user->user_stack_base, SLOTTEE_USER_STACK_SIZE) &&
+      user->last_trap_user_tp == user->user_tls_base;
 }
 
 int
-slottee_active_user_exit(uintptr_t value)
+slottee_active_user_exit(struct encl_ctx* ctx, uintptr_t value)
 {
+  struct slottee_active_user_context* user = slottee_active_user_for_frame(ctx);
+  uintptr_t slot_id;
+  uintptr_t lease_id;
   uintptr_t status;
 
-  if (!slottee_active_user.active ||
-      (slottee_active_user.mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER &&
-       !slottee_mode_is_user_ocall(slottee_active_user.mode)))
+  if (!user ||
+      (user->mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER &&
+       !slottee_mode_is_user_ocall(user->mode)))
     return 0;
 
-  slottee_active_user.exit_trap_count++;
-  if (!slottee_active_user_ocall_exit_ok(value))
+  slottee_record_trap_frame(user, ctx, RUNTIME_SYSCALL_EXIT);
+  user->exit_trap_count++;
+  if (!slottee_active_user_ocall_exit_ok(user, value))
     value = SLOTTEE_LT_USER_ILLEGAL_MAGIC;
 
-  if (slottee_mode_is_user_ocall(slottee_active_user.mode)) {
+  if (slottee_mode_is_user_ocall(user->mode)) {
     printf("[slottee] lt_user_exit slot=%lu value=%lu syscalls=%lu ocalls=%lu resumes=%lu exits=%lu faults=%lu sp=0x%lx tp=0x%lx\r\n",
-        slottee_active_user.slot_id, value,
-        slottee_active_user.syscall_trap_count,
-        slottee_active_user.ocall_trap_count,
-        slottee_active_user.ocall_resume_count,
-        slottee_active_user.exit_trap_count,
-        slottee_active_user.fault_trap_count,
-        slottee_active_user.last_trap_user_sp,
-        slottee_active_user.last_trap_user_tp);
+        user->slot_id, value, user->syscall_trap_count,
+        user->ocall_trap_count, user->ocall_resume_count,
+        user->exit_trap_count, user->fault_trap_count,
+        user->last_trap_user_sp, user->last_trap_user_tp);
   }
 
-  status = sbi_exit_slot(slottee_active_user.slot_id,
-      slottee_active_user.lease_id, SLOTTEE_SLOT_EXIT_NORMAL, value);
+  slot_id = user->slot_id;
+  lease_id = user->lease_id;
+  user->active = 0;
+  status = sbi_exit_slot(slot_id, lease_id, SLOTTEE_SLOT_EXIT_NORMAL, value);
 
   while (1) {
     sbi_exit_enclave(status ? status : value);
@@ -305,40 +388,43 @@ slottee_active_user_exit(uintptr_t value)
 int
 slottee_active_user_fault_exit(struct encl_ctx* ctx, uintptr_t value)
 {
+  struct slottee_active_user_context* user = slottee_active_user_for_frame(ctx);
+  uintptr_t slot_id;
+  uintptr_t lease_id;
+  uintptr_t exit_reason;
   uintptr_t status;
 
-  if (!slottee_active_user.active)
+  if (!user)
     return 0;
 
-  slottee_record_trap_frame(ctx, 0);
-  slottee_active_user.fault_trap_count++;
+  slottee_record_trap_frame(user, ctx, 0);
+  user->fault_trap_count++;
 
   printf("[slottee] lt_user_fault slot=%lu value=%lu scause=0x%lx sepc=0x%lx stval=0x%lx sp=0x%lx tp=0x%lx\r\n",
-      slottee_active_user.slot_id, value,
-      slottee_active_user.last_trap_scause,
-      slottee_active_user.last_trap_sepc,
-      slottee_active_user.last_trap_stval,
-      slottee_active_user.last_trap_user_sp,
-      slottee_active_user.last_trap_user_tp);
+      user->slot_id, value, user->last_trap_scause,
+      user->last_trap_sepc, user->last_trap_stval,
+      user->last_trap_user_sp, user->last_trap_user_tp);
 
-  status = sbi_exit_slot(slottee_active_user.slot_id,
-      slottee_active_user.lease_id,
-      slottee_active_user.revoke_on_fault ?
-          SLOTTEE_SLOT_EXIT_REVOKE : SLOTTEE_SLOT_EXIT_NORMAL,
-      value);
+  slot_id = user->slot_id;
+  lease_id = user->lease_id;
+  exit_reason = user->revoke_on_fault ?
+      SLOTTEE_SLOT_EXIT_REVOKE : SLOTTEE_SLOT_EXIT_NORMAL;
+  user->active = 0;
+  status = sbi_exit_slot(slot_id, lease_id, exit_reason, value);
 
   while (1) {
     sbi_exit_enclave(status ? status : value);
   }
 }
 
-void
+uintptr_t
 slottee_slot_trampoline(uintptr_t slot_token)
 {
   uintptr_t slot_id = SLOTTEE_SLOT_TOKEN_SLOT_ID(slot_token);
   uintptr_t slot_mode = SLOTTEE_SLOT_TOKEN_MODE(slot_token);
   uintptr_t lease_id = SLOTTEE_SLOT_TOKEN_LEASE_ID(slot_token);
   uintptr_t value = SLOTTEE_SLOT_MAGIC;
+  struct slottee_active_user_context* user;
 
   if (slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_SCHED) {
     value = slottee_lt_scheduler_run(slot_id, lease_id);
@@ -354,16 +440,13 @@ slottee_slot_trampoline(uintptr_t slot_token)
     value = slottee_lt_ecall_run(slot_id, lease_id);
   } else if (slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER) {
     slottee_activate_user_context(slot_id, lease_id, slot_mode);
-    return;
+    return 0;
   } else if (slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL) {
-    slottee_activate_user_context(slot_id, lease_id, slot_mode);
-    return;
+    user = slottee_activate_user_context(slot_id, lease_id, slot_mode);
+    return slottee_active_user_prepare_user_entry(user);
   } else if (slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT) {
-    slottee_activate_user_context(slot_id, lease_id, slot_mode);
-    return;
-  } else if (slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL_NO_TEMPLATE) {
-    slottee_activate_user_context(slot_id, lease_id, slot_mode);
-    return;
+    user = slottee_activate_user_context(slot_id, lease_id, slot_mode);
+    return slottee_active_user_prepare_user_entry(user);
   }
 
   sbi_exit_slot(slot_id, lease_id, SLOTTEE_SLOT_EXIT_NORMAL, value);
