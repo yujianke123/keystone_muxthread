@@ -7,6 +7,7 @@
 
 #include "edge/edge_call.h"
 #include "host/keystone.h"
+#include "shared/sm_call.h"
 
 typedef struct packaged_str{
   unsigned long str_offset;
@@ -25,6 +26,9 @@ void print_value(unsigned long val);
 
 void copy_report_wrapper(void* buffer);
 void copy_report(void* shared_buffer);
+
+void copy_slot_cap_wrapper(void* buffer);
+void copy_slot_cap(void* shared_buffer, size_t size);
 
 void get_host_string_wrapper(void* buffer);
 const char* get_host_string();

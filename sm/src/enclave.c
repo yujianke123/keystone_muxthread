@@ -892,6 +892,55 @@ unsigned long destroy_enclave(enclave_id eid)
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
 }
 
+unsigned long mint_enclave_slot_cap(
+    enclave_id eid, const struct mint_slot_cap_req_t *req, struct mint_slot_cap_resp_t *resp)
+{
+  unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
+  struct slot_cap_t cap = {0};
+
+  if (!req || req->version != SLOTTEE_MINT_CAP_VERSION)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+
+  if (!ENCLAVE_EXISTS(eid) || enclaves[eid].state < FRESH) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+    goto out;
+  }
+
+  if (req->slot_id == 0 || req->slot_id >= SLOTTEE_MAX_SLOTS ||
+      !enclaves[eid].cap_key_ready) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  cap.version = SLOTTEE_ENTER_SLOT_VERSION;
+  cap.eid = eid;
+  cap.slot_id = req->slot_id;
+  cap.epoch = enclaves[eid].current_slot_epoch;
+  cap.cap_seq = req->cap_seq ? req->cap_seq : SLOTTEE_DEFAULT_CAP_SEQ;
+  cap.rights = req->rights ? req->rights : SLOTTEE_CAP_RIGHT_ENTER;
+  cap.max_lease_cycles = req->max_lease_cycles ?
+      req->max_lease_cycles : SLOTTEE_DEFAULT_MAX_LEASE_CYCLES;
+
+  if (cap.rights != SLOTTEE_CAP_RIGHT_ENTER ||
+      cap.max_lease_cycles == 0) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  sign_slot_cap(eid, &cap);
+
+out:
+  if (resp) {
+    resp->status = ret;
+    resp->cap = ret == SBI_ERR_SM_ENCLAVE_SUCCESS ?
+        cap : (struct slot_cap_t) {0};
+  }
+  spin_unlock(&encl_lock);
+  return ret;
+}
+
 unsigned long reserve_enclave_slot(
     enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp)
 {
@@ -1275,7 +1324,8 @@ unsigned long init_enclave_slot_reentry_template(
     ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
   } else if (enclaves[eid].state != RUNNING) {
     ret = SBI_ERR_SM_ENCLAVE_NOT_RUNNING;
-  } else if (thread_index == 0 || thread_index >= MAX_ENCL_THREADS ||
+  /* Thread 0 seeds the RT template during normal boot; slot threads reuse it. */
+  } else if (thread_index >= MAX_ENCL_THREADS ||
       enclaves[eid].params.slot_entry == enclaves[eid].params.dram_base) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   } else {

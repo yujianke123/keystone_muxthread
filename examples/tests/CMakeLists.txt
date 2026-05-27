@@ -29,6 +29,9 @@ set(slottee_fault_test_bins
   test-lt-user-busy-revoke
   test-lt-user-first-busy-revoke)
 
+set(slottee_explicit_test_bins
+  test-lt-user-mint-cap)
+
 # and (2) define the recipe of the test below:
 
 # stack
@@ -77,6 +80,10 @@ target_link_libraries(test-data-sealing ${KEYSTONE_LIB_EAPP} ${KEYSTONE_LIB_EDGE
 # SlotTEE LT user OCALL/resume
 add_executable(test-lt-user-ocall lt-user-ocall/lt-user-ocall.c)
 target_link_libraries(test-lt-user-ocall ${KEYSTONE_LIB_EAPP})
+
+# SlotTEE RT-authorized capability minting probe
+add_executable(test-lt-user-mint-cap lt-user-mint-cap/lt-user-mint-cap.c)
+target_link_libraries(test-lt-user-mint-cap ${KEYSTONE_LIB_EAPP})
 
 # SlotTEE LT-aware U-mode fault probes. These are packaged for explicit
 # wrappers only; the default full tests.ke run must not intentionally fault.
@@ -263,6 +270,10 @@ file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-cap-generation-repl
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-ocall eyrie-rt loader.bin --load-only --enter-slot-cap-generation-replay\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-rt-authorized-mint\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-mint-cap eyrie-rt loader.bin --enter-slot-rt-authorized-mint\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
 foreach (test IN ITEMS ${all_test_bins})
   file(APPEND ${test_script_tmp} "echo 'testing ${test}'\n")
   if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${test}/retval)
@@ -278,7 +289,7 @@ file(COPY ${test_script_tmp} DESTINATION ${CMAKE_CURRENT_BINARY_DIR}
 file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/tmp)
 
 # linker flags for all tests
-set_target_properties(${all_test_bins} ${slottee_fault_test_bins}
+set_target_properties(${all_test_bins} ${slottee_fault_test_bins} ${slottee_explicit_test_bins}
   PROPERTIES LINK_FLAGS "-nostdlib -static -T ${CMAKE_CURRENT_SOURCE_DIR}/app.lds")
 ###############################################
 
@@ -299,7 +310,7 @@ add_eyrie_runtime(test-eyrie
 add_keystone_package(test-package
   ${package_name}
   ${package_script}
-  ${test_script} ${eyrie_files_to_copy} ${all_test_bins} ${slottee_fault_test_bins} ${host_bin}
+  ${test_script} ${eyrie_files_to_copy} ${all_test_bins} ${slottee_fault_test_bins} ${slottee_explicit_test_bins} ${host_bin}
   )
 
 add_dependencies(test-package test-eyrie)

@@ -194,6 +194,29 @@ unsigned long sbi_sm_slottee_debug(
   return ret;
 }
 
+unsigned long sbi_sm_mint_slot_cap(
+    unsigned long *out_val, uintptr_t mint_req, uintptr_t mint_resp)
+{
+  struct mint_slot_cap_req_t req;
+  struct mint_slot_cap_resp_t resp = {0};
+  unsigned long ret;
+
+  if (out_val)
+    *out_val = 0;
+
+  if (copy_to_sm(&req, mint_req, sizeof(req)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  ret = mint_enclave_slot_cap(cpu_get_enclave_id(), &req, &resp);
+  if (out_val)
+    *out_val = resp.status;
+
+  if (mint_resp && copy_from_sm(mint_resp, &resp, sizeof(resp)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  return ret;
+}
+
 unsigned long sbi_sm_exit_slot(
     struct sbi_trap_regs *regs, uintptr_t slot_id, uintptr_t lease_id,
     uintptr_t exit_reason, uintptr_t value)

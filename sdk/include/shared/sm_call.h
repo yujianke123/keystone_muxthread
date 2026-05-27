@@ -99,6 +99,7 @@
 #define SBI_SM_EXIT_ENCLAVE      3006
 #define SBI_SM_LT_ECALL_PROBE    3007
 #define SBI_SM_INIT_REENTRY_TEMPLATE 3008
+#define SBI_SM_MINT_SLOT_CAP     3009
 #define FID_RANGE_ENCLAVE        3999
 
 /* 4000-4999 are experimental */
@@ -194,10 +195,26 @@ struct mark_revoke_resp_t {
   uintptr_t epoch;
 };
 
+#define SLOTTEE_MINT_CAP_VERSION 1
+
+struct mint_slot_cap_req_t {
+  uintptr_t version;
+  uintptr_t slot_id;
+  uintptr_t cap_seq;
+  uintptr_t rights;
+  uintptr_t max_lease_cycles;
+};
+
+struct mint_slot_cap_resp_t {
+  uintptr_t status;
+  struct slot_cap_t cap;
+};
+
 #define SLOTTEE_DEBUG_VERSION              1
 #define SLOTTEE_DEBUG_OP_REENTRY_STATUS    1
 #define SLOTTEE_DEBUG_OP_REENTRY_CLEAR     2
 #define SLOTTEE_DEBUG_OP_CAP_KEY_STATUS    3
+/* Legacy host-side debug/test mint. Production mint is RT-authorized and SM-signed. */
 #define SLOTTEE_DEBUG_OP_MINT_CAP          4
 
 struct slottee_debug_req_t {

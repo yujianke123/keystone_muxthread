@@ -42,6 +42,10 @@ sbi_sm_slottee_debug(
     uintptr_t debug_resp);
 
 unsigned long
+sbi_sm_mint_slot_cap(
+    unsigned long *out_val, uintptr_t mint_req, uintptr_t mint_resp);
+
+unsigned long
 sbi_sm_exit_slot(
     struct sbi_trap_regs *regs, uintptr_t slot_id, uintptr_t lease_id,
     uintptr_t exit_reason, uintptr_t value);

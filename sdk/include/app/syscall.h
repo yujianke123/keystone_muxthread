@@ -10,6 +10,7 @@
 #include "sealing.h"
 
 #include "shared/eyrie_call.h"
+#include "shared/sm_call.h"
 
 #define SYSCALL(which, arg0, arg1, arg2, arg3, arg4)           \
   ({                                                           \
@@ -52,5 +53,9 @@ int
 get_sealing_key(
     struct sealing_key* sealing_key_struct, size_t sealing_key_struct_size,
     void* key_ident, size_t key_ident_size);
+
+int
+slottee_mint_cap(
+    const struct mint_slot_cap_req_t* req, struct mint_slot_cap_resp_t* resp);
 
 #endif /* syscall.h */

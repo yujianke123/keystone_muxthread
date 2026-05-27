@@ -35,6 +35,8 @@ get_host_string() {
 }
 
 static struct report_t report;
+static struct slot_cap_t copied_slot_cap;
+static int copied_slot_cap_ready;
 static const uintptr_t enter_slot_bench_iters = 3;
 static const uintptr_t enter_slot_pool_workers = 2;
 static const uintptr_t enter_slot_resume_limit = 8;
@@ -63,6 +65,14 @@ copy_report(void* buffer) {
     printf("Attestation report SIGNATURE is valid\n");
   } else {
     printf("Attestation report is invalid\n");
+  }
+}
+
+void
+copy_slot_cap(void* buffer, size_t size) {
+  if (size == sizeof(copied_slot_cap)) {
+    memcpy(&copied_slot_cap, buffer, size);
+    copied_slot_cap_ready = 1;
   }
 }
 
@@ -3348,6 +3358,133 @@ run_enter_slot_cap_generation_replay(const char* eapp_file,
   return 0;
 }
 
+static int
+slot_cap_mac_nonzero(const slot_cap_t& cap)
+{
+  uintptr_t mac = 0;
+
+  for (size_t word = 0; word < SLOTTEE_CAP_MAC_WORDS; word++)
+    mac |= cap.cap_mac[word];
+
+  return mac != 0;
+}
+
+static Keystone::Error
+run_enclave_ocall_round(Keystone::Enclave& enclave, uintptr_t* value,
+    uintptr_t* ocalls, uintptr_t* resumes)
+{
+  Keystone::Error ret;
+
+  if (ocalls)
+    *ocalls = 0;
+  if (resumes)
+    *resumes = 0;
+
+  ret = enclave.run(value);
+  for (uintptr_t retry = 0; ret == Keystone::Error::EdgeCallHost &&
+       retry < enter_slot_resume_limit; retry++) {
+    incoming_call_dispatch(enclave.getSharedBuffer());
+    if (ocalls)
+      (*ocalls)++;
+    ret = enclave.resume(value);
+    if (resumes)
+      (*resumes)++;
+  }
+
+  return ret;
+}
+
+static int
+expect_rt_authorized_mint_row(const char* phase, Keystone::Error ret,
+    uintptr_t status, uintptr_t value, const slot_cap_t& cap,
+    uintptr_t lease, uintptr_t ocalls, uintptr_t resumes,
+    uintptr_t expected_status)
+{
+  printf("rt_authorized_mint,%s,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      phase, (int)ret, status, value, cap.eid, cap.slot_id, cap.epoch,
+      cap.cap_seq, cap.rights, lease, ocalls, resumes);
+  fflush(stdout);
+
+  if (ret != Keystone::Error::Success || status != expected_status) {
+    printf("[FAIL] rt_authorized_mint %s returned unexpected ret/status\n",
+        phase);
+    return 1;
+  }
+
+  return 0;
+}
+
+static int
+run_enter_slot_rt_authorized_mint(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  slot_cap_t cap = {};
+  slot_cap_t tampered = {};
+  uintptr_t status = SBI_ERR_SM_ENCLAVE_SUCCESS;
+  uintptr_t value = 0;
+  uintptr_t lease = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  copied_slot_cap_ready = 0;
+  memset(&copied_slot_cap, 0, sizeof(copied_slot_cap));
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] RT-authorized mint failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  ret = run_enclave_ocall_round(enclave, &value, &ocalls, &resumes);
+  if (!copied_slot_cap_ready)
+    status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  cap = copied_slot_cap;
+
+  if (expect_rt_authorized_mint_row("eapp_mint", ret, status, value, cap, 0,
+          ocalls, resumes, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      value != SLOTTEE_LT_USER_OCALL_MAGIC ||
+      cap.version != SLOTTEE_ENTER_SLOT_VERSION ||
+      cap.slot_id != 1 ||
+      cap.epoch != SLOTTEE_INITIAL_EPOCH ||
+      cap.cap_seq != SLOTTEE_DEFAULT_CAP_SEQ ||
+      cap.rights != SLOTTEE_CAP_RIGHT_ENTER ||
+      cap.max_lease_cycles != SLOTTEE_DEFAULT_MAX_LEASE_CYCLES ||
+      !slot_cap_mac_nonzero(cap)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  copied_slot_cap_ready = 0;
+  ret = enter_slot_user_ocall_round_with_cap(enclave, cap, &status, &value,
+      &lease, &ocalls, &resumes);
+  if (expect_rt_authorized_mint_row("enter_with_rt_cap", ret, status, value,
+          cap, lease, ocalls, resumes, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+      value != SLOTTEE_LT_USER_OCALL_MAGIC || lease == 0 ||
+      ocalls != 1 || resumes != 1) {
+    enclave.destroy();
+    return 1;
+  }
+
+  tampered = cap;
+  tampered.slot_id = 2;
+  ret = enter_slot_request_once_with_cap(enclave, tampered,
+      SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &lease);
+  if (expect_rt_authorized_mint_row("tamper_rt_cap", ret, status, value,
+          tampered, lease, 0, 0, SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
+    enclave.destroy();
+    return 1;
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
 int
 main(int argc, char** argv) {
   if (argc < 4 || argc > 24) {
@@ -3384,6 +3521,7 @@ main(int argc, char** argv) {
         "[--enter-slot-revoke-stress] "
         "[--enter-slot-cap-mac-forge] "
         "[--enter-slot-cap-generation-replay] "
+        "[--enter-slot-rt-authorized-mint] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -3431,6 +3569,7 @@ main(int argc, char** argv) {
   int enter_slot_revoke_stress = 0;
   int enter_slot_cap_mac_forge = 0;
   int enter_slot_cap_generation_replay = 0;
+  int enter_slot_rt_authorized_mint = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -3495,6 +3634,8 @@ main(int argc, char** argv) {
       {"enter-slot-cap-mac-forge", no_argument, &enter_slot_cap_mac_forge, 1},
       {"enter-slot-cap-generation-replay", no_argument,
        &enter_slot_cap_generation_replay, 1},
+      {"enter-slot-rt-authorized-mint", no_argument,
+       &enter_slot_rt_authorized_mint, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -3666,6 +3807,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_cap_generation_replay) {
     return run_enter_slot_cap_generation_replay(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_rt_authorized_mint) {
+    return run_enter_slot_rt_authorized_mint(eapp_file, rt_file, ld_file, params);
   }
 
   Keystone::Enclave enclave;

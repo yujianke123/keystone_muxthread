@@ -103,6 +103,13 @@ sbi_lt_ecall_probe(uintptr_t slot_id, uintptr_t lease_id, uintptr_t request, uin
 }
 
 uintptr_t
+sbi_mint_slot_cap(uintptr_t mint_req, uintptr_t mint_resp) {
+  return SBI_CALL_2(
+      SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE,
+      SBI_SM_MINT_SLOT_CAP, mint_req, mint_resp);
+}
+
+uintptr_t
 sbi_query_multimem(size_t *size) {
   return SBI_CALL_3(SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE,
       SBI_SM_CALL_PLUGIN, SM_MULTIMEM_PLUGIN_ID, SM_MULTIMEM_CALL_GET_SIZE, size);

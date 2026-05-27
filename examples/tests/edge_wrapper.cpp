@@ -12,6 +12,7 @@
 #define OCALL_PRINT_VALUE 2
 #define OCALL_COPY_REPORT 3
 #define OCALL_GET_STRING 4
+#define OCALL_COPY_SLOT_CAP 5
 
 void
 edge_init(Keystone::Enclave* enclave) {
@@ -20,6 +21,7 @@ edge_init(Keystone::Enclave* enclave) {
   register_call(OCALL_PRINT_VALUE, print_value_wrapper);
   register_call(OCALL_COPY_REPORT, copy_report_wrapper);
   register_call(OCALL_GET_STRING, get_host_string_wrapper);
+  register_call(OCALL_COPY_SLOT_CAP, copy_slot_cap_wrapper);
 
   edge_call_init_internals(
       (uintptr_t)enclave->getSharedBuffer(), enclave->getSharedBufferSize());
@@ -96,6 +98,22 @@ copy_report_wrapper(void* buffer) {
   edge_call->return_data.call_status = CALL_STATUS_OK;
 
   return;
+}
+
+void
+copy_slot_cap_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slot_cap_t)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_slot_cap((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
 }
 
 void

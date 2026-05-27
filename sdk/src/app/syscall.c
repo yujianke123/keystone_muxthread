@@ -33,3 +33,9 @@ get_sealing_key(
       sealing_key_struct, sealing_key_struct_size,
       key_ident, key_ident_size);
 }
+
+int
+slottee_mint_cap(
+    const struct mint_slot_cap_req_t* req, struct mint_slot_cap_resp_t* resp) {
+  return SYSCALL_2(RUNTIME_SYSCALL_SLOTTEE_MINT_CAP, req, resp);
+}

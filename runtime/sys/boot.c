@@ -142,8 +142,8 @@ eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
   /* Enable the FPU */
   csr_write(sstatus, csr_read(sstatus) | 0x6000);
 
+  uintptr_t status = sbi_init_reentry_template();
   if (slot_token != 0) {
-    uintptr_t status = sbi_init_reentry_template();
     printf("[slottee] init_reentry_template token=0x%lx status=%lu\r\n",
         slot_token, status);
   }

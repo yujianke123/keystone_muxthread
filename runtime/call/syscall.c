@@ -5,7 +5,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/select.h>
+#include "call/sbi.h"
 #include "call/syscall.h"
+#include "sm_err.h"
 #include "util/string.h"
 #include "edge_call.h"
 #include "uaccess.h"
@@ -144,6 +146,62 @@ uintptr_t handle_copy_from_shared(void* dst, uintptr_t offset, size_t size){
   return copy_to_user(dst, (void*)src_ptr, size);
 }
 
+static uintptr_t
+slottee_rt_validate_mint_cap_req(const struct mint_slot_cap_req_t* req)
+{
+  if (!req || req->version != SLOTTEE_MINT_CAP_VERSION)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (req->slot_id == 0 || req->slot_id >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (req->rights != SLOTTEE_CAP_RIGHT_ENTER || req->cap_seq == 0 ||
+      req->max_lease_cycles == 0)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+static uintptr_t
+handle_slottee_mint_cap(uintptr_t user_req, uintptr_t user_resp)
+{
+  struct mint_slot_cap_req_t* req =
+      (struct mint_slot_cap_req_t*)rt_copy_buffer_1;
+  struct mint_slot_cap_resp_t* resp =
+      (struct mint_slot_cap_resp_t*)rt_copy_buffer_2;
+  uintptr_t ret;
+
+  memset(req, 0, sizeof(*req));
+  memset(resp, 0, sizeof(*resp));
+
+  if (!user_req || !user_resp) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  if (copy_from_user(req, (void*)user_req, sizeof(*req))) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  ret = slottee_rt_validate_mint_cap_req(req);
+  if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
+    goto out;
+
+  ret = sbi_mint_slot_cap((uintptr_t)req, (uintptr_t)resp);
+  if (resp->status)
+    ret = resp->status;
+
+out:
+  if (!resp->status)
+    resp->status = ret;
+
+  if (user_resp && copy_to_user((void*)user_resp, resp, sizeof(*resp)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  return resp->status;
+}
+
 void init_edge_internals(){
   edge_call_init_internals(shared_buffer, shared_buffer_size);
 }
@@ -213,6 +271,9 @@ void handle_syscall(struct encl_ctx* ctx)
     /* Delete key from copy buffer */
     memset(rt_copy_buffer_1, 0x00, sizeof(rt_copy_buffer_1));
 
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_MINT_CAP):
+    ret = handle_slottee_mint_cap(arg0, arg1);
     break;
 
 
