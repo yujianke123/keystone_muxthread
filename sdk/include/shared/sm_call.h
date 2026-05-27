@@ -197,10 +197,13 @@ struct mark_revoke_resp_t {
 #define SLOTTEE_DEBUG_VERSION              1
 #define SLOTTEE_DEBUG_OP_REENTRY_STATUS    1
 #define SLOTTEE_DEBUG_OP_REENTRY_CLEAR     2
+#define SLOTTEE_DEBUG_OP_CAP_KEY_STATUS    3
+#define SLOTTEE_DEBUG_OP_MINT_CAP          4
 
 struct slottee_debug_req_t {
   uintptr_t version;
   uintptr_t op;
+  struct slot_cap_t cap;
 };
 
 struct slottee_debug_resp_t {
@@ -209,6 +212,8 @@ struct slottee_debug_resp_t {
   uintptr_t epoch;
   uintptr_t n_thread;
   uintptr_t busy_slots;
+  uintptr_t cap_key_ready;
+  struct slot_cap_t cap;
 };
 
 #endif  // __SM_CALL_H__

@@ -35,6 +35,89 @@ static uintptr_t read_cycle(void)
   return cycle;
 }
 
+static void clear_enclave_cap_key(enclave_id eid)
+{
+  sbi_memset(enclaves[eid].cap_key, 0, sizeof(enclaves[eid].cap_key));
+  enclaves[eid].cap_key_ready = 0;
+}
+
+static void derive_enclave_cap_key(enclave_id eid)
+{
+  static const char label[] = "slottee-cap-v1";
+  hash_ctx ctx;
+
+  hash_init(&ctx);
+  hash_extend(&ctx, sm_private_key, PRIVATE_KEY_SIZE);
+  hash_extend(&ctx, enclaves[eid].hash, MDSIZE);
+  hash_extend(&ctx, &eid, sizeof(eid));
+  hash_extend(&ctx, label, sizeof(label) - 1);
+  hash_finalize(enclaves[eid].cap_key, &ctx);
+  enclaves[eid].cap_key_ready = 1;
+}
+
+static void compute_slot_cap_mac(
+    enclave_id eid, const struct slot_cap_t *cap,
+    uintptr_t mac[SLOTTEE_CAP_MAC_WORDS])
+{
+  static const char label[] = "slottee-cap-mac-v1";
+  byte digest[MDSIZE];
+  uintptr_t fields[7];
+  hash_ctx ctx;
+
+  fields[0] = cap->version;
+  fields[1] = cap->eid;
+  fields[2] = cap->slot_id;
+  fields[3] = cap->epoch;
+  fields[4] = cap->cap_seq;
+  fields[5] = cap->rights;
+  fields[6] = cap->max_lease_cycles;
+
+  hash_init(&ctx);
+  hash_extend(&ctx, enclaves[eid].cap_key, sizeof(enclaves[eid].cap_key));
+  hash_extend(&ctx, label, sizeof(label) - 1);
+  hash_extend(&ctx, fields, sizeof(fields));
+  hash_finalize(digest, &ctx);
+
+  sbi_memcpy(mac, digest, SLOTTEE_CAP_MAC_WORDS * sizeof(uintptr_t));
+  sbi_memset(digest, 0, sizeof(digest));
+}
+
+static int slot_cap_mac_equal(
+    const uintptr_t lhs[SLOTTEE_CAP_MAC_WORDS],
+    const uintptr_t rhs[SLOTTEE_CAP_MAC_WORDS])
+{
+  uintptr_t diff = 0;
+  size_t word;
+
+  for (word = 0; word < SLOTTEE_CAP_MAC_WORDS; word++)
+    diff |= lhs[word] ^ rhs[word];
+
+  return diff == 0;
+}
+
+static int verify_slot_cap_mac(enclave_id eid, const struct slot_cap_t *cap)
+{
+  uintptr_t expected[SLOTTEE_CAP_MAC_WORDS];
+  int ok;
+
+  if (!enclaves[eid].cap_key_ready)
+    return 0;
+
+  compute_slot_cap_mac(eid, cap, expected);
+  ok = slot_cap_mac_equal(cap->cap_mac, expected);
+  sbi_memset(expected, 0, sizeof(expected));
+
+  return ok;
+}
+
+static void sign_slot_cap(enclave_id eid, struct slot_cap_t *cap)
+{
+  cap->version = SLOTTEE_ENTER_SLOT_VERSION;
+  cap->eid = eid;
+  cap->epoch = enclaves[eid].current_slot_epoch;
+  compute_slot_cap_mac(eid, cap, cap->cap_mac);
+}
+
 static uintptr_t slot_lease_expiry(uintptr_t now, uintptr_t ttl)
 {
   if (((uintptr_t)-1) - now < ttl)
@@ -425,6 +508,7 @@ void enclave_init_metadata(void){
       enclaves[eid].regions[i].type = REGION_INVALID;
     }
     clear_enclave_slot_leases(eid);
+    clear_enclave_cap_key(eid);
     /* Fire all platform specific init for each enclave */
     platform_init_enclave(&(enclaves[eid]));
   }
@@ -694,6 +778,7 @@ unsigned long create_enclave(unsigned long *eidptr, struct keystone_sbi_create_t
   if (ret)
     goto unlock;
 
+  derive_enclave_cap_key(eid);
   enclaves[eid].state = FRESH;
   /* EIDs are unsigned int in size, copy via simple copy */
   *eidptr = eid;
@@ -778,6 +863,7 @@ unsigned long destroy_enclave(enclave_id eid)
   clear_enclave_slot_reentry_template(eid);
   enclaves[eid].params = (struct runtime_params_t) {0};
   clear_enclave_slot_leases(eid);
+  clear_enclave_cap_key(eid);
   for(i=0; i < ENCLAVE_REGIONS_MAX; i++){
     enclaves[eid].regions[i].type = REGION_INVALID;
   }
@@ -789,18 +875,6 @@ unsigned long destroy_enclave(enclave_id eid)
   encl_free_eid(eid);
 
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
-}
-
-static int is_slot_cap_mac_zero(const struct slot_cap_t *cap)
-{
-  size_t word;
-
-  for (word = 0; word < SLOTTEE_CAP_MAC_WORDS; word++) {
-    if (cap->cap_mac[word] != 0)
-      return 0;
-  }
-
-  return 1;
 }
 
 unsigned long reserve_enclave_slot(
@@ -826,13 +900,18 @@ unsigned long reserve_enclave_slot(
   now = read_cycle();
   reclaim_expired_enclave_slot_leases(eid, now);
 
+  if (!verify_slot_cap_mac(eid, cap)) {
+    ret = SBI_ERR_SM_ENCLAVE_BAD_CAP;
+    goto out;
+  }
+
   if (cap->eid != eid || cap->epoch != enclaves[eid].current_slot_epoch) {
     ret = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
     goto out;
   }
 
   if (cap->rights != SLOTTEE_CAP_RIGHT_ENTER || cap->cap_seq == 0 ||
-      cap->max_lease_cycles == 0 || !is_slot_cap_mac_zero(cap)) {
+      cap->max_lease_cycles == 0) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
@@ -894,13 +973,18 @@ unsigned long activate_enclave_slot(
   now = read_cycle();
   reclaim_expired_enclave_slot_leases(eid, now);
 
+  if (!verify_slot_cap_mac(eid, cap)) {
+    ret = SBI_ERR_SM_ENCLAVE_BAD_CAP;
+    goto out;
+  }
+
   if (cap->eid != eid || cap->epoch != enclaves[eid].current_slot_epoch) {
     ret = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
     goto out;
   }
 
   if (cap->rights != SLOTTEE_CAP_RIGHT_ENTER || cap->cap_seq == 0 ||
-      cap->max_lease_cycles == 0 || !is_slot_cap_mac_zero(cap)) {
+      cap->max_lease_cycles == 0) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
@@ -992,7 +1076,9 @@ unsigned long debug_enclave_slot_state(
 
   if (!req || req->version != SLOTTEE_DEBUG_VERSION ||
       (req->op != SLOTTEE_DEBUG_OP_REENTRY_STATUS &&
-       req->op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR))
+       req->op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR &&
+       req->op != SLOTTEE_DEBUG_OP_CAP_KEY_STATUS &&
+       req->op != SLOTTEE_DEBUG_OP_MINT_CAP))
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   spin_lock(&encl_lock);
@@ -1004,6 +1090,33 @@ unsigned long debug_enclave_slot_state(
   if (req->op == SLOTTEE_DEBUG_OP_REENTRY_CLEAR)
     clear_enclave_slot_reentry_template(eid);
 
+  if (req->op == SLOTTEE_DEBUG_OP_MINT_CAP) {
+    struct slot_cap_t cap = req->cap;
+
+    if (cap.slot_id == 0 || cap.slot_id >= SLOTTEE_MAX_SLOTS ||
+        !enclaves[eid].cap_key_ready) {
+      ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+      goto out;
+    }
+
+    if (cap.cap_seq == 0)
+      cap.cap_seq = SLOTTEE_DEFAULT_CAP_SEQ;
+    if (cap.rights == 0)
+      cap.rights = SLOTTEE_CAP_RIGHT_ENTER;
+    if (cap.max_lease_cycles == 0)
+      cap.max_lease_cycles = SLOTTEE_DEFAULT_MAX_LEASE_CYCLES;
+
+    if (cap.rights != SLOTTEE_CAP_RIGHT_ENTER ||
+        cap.max_lease_cycles == 0) {
+      ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+      goto out;
+    }
+
+    sign_slot_cap(eid, &cap);
+    if (resp)
+      resp->cap = cap;
+  }
+
 out:
   if (resp) {
     resp->status = ret;
@@ -1012,11 +1125,14 @@ out:
       resp->epoch = enclaves[eid].current_slot_epoch;
       resp->n_thread = enclaves[eid].n_thread;
       resp->busy_slots = count_busy_slot_leases(eid);
+      resp->cap_key_ready = enclaves[eid].cap_key_ready;
     } else {
       resp->reentry_ready = 0;
       resp->epoch = 0;
       resp->n_thread = 0;
       resp->busy_slots = 0;
+      resp->cap_key_ready = 0;
+      resp->cap = (struct slot_cap_t) {0};
     }
   }
   spin_unlock(&encl_lock);

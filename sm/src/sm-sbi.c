@@ -184,7 +184,9 @@ unsigned long sbi_sm_slottee_debug(
 
   ret = debug_enclave_slot_state((enclave_id) eid, &req, &resp);
   if (out_val)
-    *out_val = resp.reentry_ready;
+    *out_val = (req.op == SLOTTEE_DEBUG_OP_CAP_KEY_STATUS ||
+        req.op == SLOTTEE_DEBUG_OP_MINT_CAP) ?
+        resp.cap_key_ready : resp.reentry_ready;
 
   if (debug_resp && copy_from_sm(debug_resp, &resp, sizeof(resp)))
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;

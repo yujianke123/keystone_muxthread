@@ -106,6 +106,8 @@ struct enclave
   uintptr_t next_slot_lease_id;
   uintptr_t current_slot_epoch;
   struct slot_lease_t slot_leases[SLOTTEE_MAX_SLOTS];
+  byte cap_key[MDSIZE];
+  uintptr_t cap_key_ready;
 
   struct platform_enclave_data ped;
 };

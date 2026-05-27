@@ -28,6 +28,7 @@ enum class Error {
   EdgeCallHost,
   EnclaveInterrupted,
   EnclaveNotResumable,
+  EnclaveBadCap,
   IoctlErrorSlotteeDebug,
 };
 

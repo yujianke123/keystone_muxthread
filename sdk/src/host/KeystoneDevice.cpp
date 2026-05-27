@@ -142,6 +142,8 @@ KeystoneDevice::__run(bool resume, uintptr_t* ret) {
       return Error::EnclaveInterrupted;
     case SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE:
       return Error::EnclaveNotResumable;
+    case SBI_ERR_SM_ENCLAVE_BAD_CAP:
+      return Error::EnclaveBadCap;
     case SBI_ERR_SM_ENCLAVE_SUCCESS:
       if (ret) {
         *ret = encl.value;
@@ -386,10 +388,12 @@ MockKeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT)) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  } else if (isSlotCapMacZero(req.cap)) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_BAD_CAP;
   } else if (req.cap.epoch != SLOTTEE_INITIAL_EPOCH) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
   } else if (req.cap.rights != SLOTTEE_CAP_RIGHT_ENTER || req.cap.cap_seq == 0 ||
-             req.cap.max_lease_cycles == 0 || !isSlotCapMacZero(req.cap)) {
+             req.cap.max_lease_cycles == 0) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   } else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_SUCCESS;
@@ -474,13 +478,29 @@ MockKeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_r
 
   if (req.version != SLOTTEE_DEBUG_VERSION ||
       (req.op != SLOTTEE_DEBUG_OP_REENTRY_STATUS &&
-       req.op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR)) {
+       req.op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR &&
+       req.op != SLOTTEE_DEBUG_OP_CAP_KEY_STATUS &&
+       req.op != SLOTTEE_DEBUG_OP_MINT_CAP)) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   } else {
     local_resp.status = SBI_ERR_SM_ENCLAVE_SUCCESS;
     local_resp.reentry_ready =
         req.op == SLOTTEE_DEBUG_OP_REENTRY_CLEAR ? 0 : 1;
     local_resp.epoch = SLOTTEE_INITIAL_EPOCH;
+    local_resp.cap_key_ready = 1;
+    if (req.op == SLOTTEE_DEBUG_OP_MINT_CAP) {
+      local_resp.cap = req.cap;
+      local_resp.cap.version = SLOTTEE_ENTER_SLOT_VERSION;
+      local_resp.cap.eid = 1;
+      local_resp.cap.epoch = SLOTTEE_INITIAL_EPOCH;
+      local_resp.cap.cap_seq = local_resp.cap.cap_seq ?
+          local_resp.cap.cap_seq : SLOTTEE_DEFAULT_CAP_SEQ;
+      local_resp.cap.rights = local_resp.cap.rights ?
+          local_resp.cap.rights : SLOTTEE_CAP_RIGHT_ENTER;
+      local_resp.cap.max_lease_cycles = local_resp.cap.max_lease_cycles ?
+          local_resp.cap.max_lease_cycles : SLOTTEE_DEFAULT_MAX_LEASE_CYCLES;
+      local_resp.cap.cap_mac[0] = 0x51514d4143UL;
+    }
   }
 
   if (resp) {
