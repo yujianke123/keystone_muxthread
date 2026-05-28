@@ -30,7 +30,8 @@ set(slottee_fault_test_bins
   test-lt-user-first-busy-revoke)
 
 set(slottee_explicit_test_bins
-  test-lt-user-mint-cap)
+  test-lt-user-mint-cap
+  test-lt-user-paper-eval)
 
 # and (2) define the recipe of the test below:
 
@@ -84,6 +85,10 @@ target_link_libraries(test-lt-user-ocall ${KEYSTONE_LIB_EAPP})
 # SlotTEE RT-authorized capability minting probe
 add_executable(test-lt-user-mint-cap lt-user-mint-cap/lt-user-mint-cap.c)
 target_link_libraries(test-lt-user-mint-cap ${KEYSTONE_LIB_EAPP})
+
+# SlotTEE paper-evaluation eapp: RT-authorized cap mint/export plus OCALL reentry.
+add_executable(test-lt-user-paper-eval lt-user-paper-eval/lt-user-paper-eval.c)
+target_link_libraries(test-lt-user-paper-eval ${KEYSTONE_LIB_EAPP})
 
 # SlotTEE LT-aware U-mode fault probes. These are packaged for explicit
 # wrappers only; the default full tests.ke run must not intentionally fault.
@@ -276,6 +281,14 @@ file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-debug-mint-gate\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-stack eyrie-rt loader.bin --load-only --slottee-debug-mint-gate\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-paper-eval\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-paper-eval eyrie-rt loader.bin --slottee-paper-eval\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-ticket-demo\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-paper-eval eyrie-rt loader.bin --slottee-ticket-demo\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 foreach (test IN ITEMS ${all_test_bins})

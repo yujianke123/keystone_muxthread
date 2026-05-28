@@ -16,6 +16,7 @@
 #include "verifier/test_dev_key.h"
 
 const char* longstr = "hellohellohellohellohellohellohellohellohellohello";
+static int suppress_enclave_prints;
 
 unsigned long
 print_buffer(char* str) {
@@ -25,7 +26,8 @@ print_buffer(char* str) {
 
 void
 print_value(unsigned long val) {
-  printf("Enclave said value: %u\n", val);
+  if (!suppress_enclave_prints)
+    printf("Enclave said value: %u\n", val);
   return;
 }
 
@@ -36,8 +38,19 @@ get_host_string() {
 
 static struct report_t report;
 static struct slot_cap_t copied_slot_cap;
+static struct slot_cap_t copied_slot_caps[SLOTTEE_MAX_SLOTS];
 static int copied_slot_cap_ready;
+static int copied_slot_cap_ready_by_slot[SLOTTEE_MAX_SLOTS];
 static const uintptr_t enter_slot_bench_iters = 3;
+static const uintptr_t slottee_paper_eval_iters = 5;
+static const uintptr_t slottee_ticket_total = 20;
+static const uintptr_t slottee_ticket_windows = 3;
+static const uintptr_t slottee_ticket_retry_limit = 128;
+static const char* slottee_null_enter_baseline_commit = "d4e1754";
+static const uintptr_t slottee_null_enter_baseline_count = 3;
+static const uintptr_t slottee_null_enter_baseline_min = 430912;
+static const uintptr_t slottee_null_enter_baseline_max = 2520128;
+static const unsigned long long slottee_null_enter_baseline_total = 3891424ULL;
 static const uintptr_t enter_slot_pool_workers = 2;
 static const uintptr_t enter_slot_resume_limit = 8;
 static const uintptr_t enter_slot_revoke_stress_rounds = 3;
@@ -74,6 +87,10 @@ copy_slot_cap(void* buffer, size_t size) {
   if (size == sizeof(copied_slot_cap)) {
     memcpy(&copied_slot_cap, buffer, size);
     copied_slot_cap_ready = 1;
+    if (copied_slot_cap.slot_id < SLOTTEE_MAX_SLOTS) {
+      copied_slot_caps[copied_slot_cap.slot_id] = copied_slot_cap;
+      copied_slot_cap_ready_by_slot[copied_slot_cap.slot_id] = 1;
+    }
   }
 }
 
@@ -3551,6 +3568,558 @@ run_slottee_debug_mint_gate(const char* eapp_file,
   return 0;
 }
 
+struct slottee_cycle_stats {
+  uintptr_t count;
+  uintptr_t min;
+  uintptr_t max;
+  unsigned long long total;
+};
+
+static void
+slottee_stats_init(slottee_cycle_stats* stats)
+{
+  stats->count = 0;
+  stats->min = ~(uintptr_t)0;
+  stats->max = 0;
+  stats->total = 0;
+}
+
+static void
+slottee_stats_add(slottee_cycle_stats* stats, uintptr_t cycles)
+{
+  if (cycles < stats->min)
+    stats->min = cycles;
+  if (cycles > stats->max)
+    stats->max = cycles;
+  stats->total += cycles;
+  stats->count++;
+}
+
+static double
+slottee_stats_avg(const slottee_cycle_stats* stats)
+{
+  return stats->count ? (double)stats->total / (double)stats->count : 0.0;
+}
+
+static double
+slottee_null_enter_baseline_avg()
+{
+  return (double)slottee_null_enter_baseline_total /
+      (double)slottee_null_enter_baseline_count;
+}
+
+static void
+reset_copied_slot_caps()
+{
+  memset(&copied_slot_cap, 0, sizeof(copied_slot_cap));
+  memset(copied_slot_caps, 0, sizeof(copied_slot_caps));
+  memset(copied_slot_cap_ready_by_slot, 0, sizeof(copied_slot_cap_ready_by_slot));
+  copied_slot_cap_ready = 0;
+}
+
+static int
+get_copied_slot_cap(uintptr_t slot_id, slot_cap_t* cap)
+{
+  if (!cap || slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS ||
+      !copied_slot_cap_ready_by_slot[slot_id] ||
+      !slot_cap_mac_nonzero(copied_slot_caps[slot_id]))
+    return 1;
+
+  *cap = copied_slot_caps[slot_id];
+  return 0;
+}
+
+static Keystone::Error
+seed_rt_authorized_caps(Keystone::Enclave& enclave, uintptr_t max_slot,
+    uintptr_t* value, uintptr_t* ocalls, uintptr_t* resumes, uintptr_t* cycles)
+{
+  uintptr_t start;
+  uintptr_t end;
+  Keystone::Error ret;
+
+  reset_copied_slot_caps();
+  suppress_enclave_prints = 1;
+  start = read_cycle_counter();
+  ret = run_enclave_ocall_round(enclave, value, ocalls, resumes);
+  end = read_cycle_counter();
+  suppress_enclave_prints = 0;
+
+  if (cycles)
+    *cycles = end - start;
+
+  if (ret != Keystone::Error::Success)
+    return ret;
+  if (value && *value != SLOTTEE_LT_USER_OCALL_MAGIC)
+    return Keystone::Error::DeviceError;
+
+  for (uintptr_t slot = 1; slot <= max_slot; slot++) {
+    slot_cap_t cap = {};
+    if (get_copied_slot_cap(slot, &cap))
+      return Keystone::Error::DeviceError;
+  }
+
+  return Keystone::Error::Success;
+}
+
+static int
+init_eval_enclave_with_caps(Keystone::Enclave& enclave, const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params,
+    uintptr_t max_slot, uintptr_t* seed_cycles)
+{
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] slottee_eval failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  ret = seed_rt_authorized_caps(enclave, max_slot, &value, &ocalls, &resumes,
+      seed_cycles);
+  if (ret != Keystone::Error::Success) {
+    printf("[FAIL] slottee_eval failed to seed RT-authorized caps ret=%d value=%lu ocalls=%lu resumes=%lu\n",
+        (int)ret, value, ocalls, resumes);
+    enclave.destroy();
+    return 1;
+  }
+
+  return 0;
+}
+
+static int
+run_slottee_eval_null_enter(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  slottee_cycle_stats current;
+
+  slottee_stats_init(&current);
+  printf("slottee_eval_null_enter,variant,iter,ret,status,value,cycles,baseline_commit\n");
+  printf("slottee_eval_null_enter,baseline_no_mac,0,0,100100,1,2520128,%s\n",
+      slottee_null_enter_baseline_commit);
+  printf("slottee_eval_null_enter,baseline_no_mac,1,0,100100,1,940384,%s\n",
+      slottee_null_enter_baseline_commit);
+  printf("slottee_eval_null_enter,baseline_no_mac,2,0,100100,1,430912,%s\n",
+      slottee_null_enter_baseline_commit);
+
+  for (uintptr_t iter = 0; iter < slottee_paper_eval_iters; iter++) {
+    Keystone::Enclave enclave;
+    slot_cap_t cap = {};
+    uintptr_t seed_cycles = 0;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+
+    if (init_eval_enclave_with_caps(enclave, eapp_file, rt_file, ld_file,
+            params, 1, &seed_cycles))
+      return 1;
+    if (get_copied_slot_cap(1, &cap)) {
+      enclave.destroy();
+      return 1;
+    }
+
+    uintptr_t start = read_cycle_counter();
+    Keystone::Error ret = enter_slot_request_once_with_cap(enclave, cap,
+        SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, NULL);
+    uintptr_t cycles = read_cycle_counter() - start;
+    slottee_stats_add(&current, cycles);
+
+    printf("slottee_eval_null_enter,current_with_mac,%lu,%d,%lu,%lu,%lu,%s\n",
+        iter, (int)ret, status, value, cycles,
+        slottee_null_enter_baseline_commit);
+    fflush(stdout);
+
+    if (ret != Keystone::Error::Success || status != SBI_ERR_SM_NOT_IMPLEMENTED) {
+      printf("[FAIL] slottee_eval null_enter iter %lu ret=%d status=%lu\n",
+          iter, (int)ret, status);
+      enclave.destroy();
+      return 1;
+    }
+
+    enclave.destroy();
+  }
+
+  double baseline_avg = slottee_null_enter_baseline_avg();
+  double current_avg = slottee_stats_avg(&current);
+  double overhead_cycles = current_avg - baseline_avg;
+  double overhead_pct = baseline_avg ?
+      (overhead_cycles * 100.0) / baseline_avg : 0.0;
+
+  printf("slottee_eval_null_enter_summary,variant,count,min,avg,max,total,baseline_commit,baseline_cycles,overhead_cycles,overhead_pct\n");
+  printf("slottee_eval_null_enter_summary,baseline_no_mac,%lu,%lu,%.2f,%lu,%llu,%s,%.2f,0.00,0.00\n",
+      slottee_null_enter_baseline_count, slottee_null_enter_baseline_min,
+      baseline_avg, slottee_null_enter_baseline_max,
+      slottee_null_enter_baseline_total,
+      slottee_null_enter_baseline_commit);
+  printf("slottee_eval_null_enter_summary,current_with_mac,%lu,%lu,%.2f,%lu,%llu,%s,%.2f,%.2f,%.2f\n",
+      current.count, current.min, current_avg, current.max,
+      current.total, slottee_null_enter_baseline_commit,
+      baseline_avg, overhead_cycles, overhead_pct);
+  fflush(stdout);
+  return 0;
+}
+
+static int
+run_slottee_eval_ocall_roundtrip(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  slottee_cycle_stats mint_stats;
+  slottee_cycle_stats reenter_stats;
+  slottee_cycle_stats total_stats;
+
+  slottee_stats_init(&mint_stats);
+  slottee_stats_init(&reenter_stats);
+  slottee_stats_init(&total_stats);
+  printf("slottee_eval_ocall_roundtrip,iter,mint_export_cycles,reenter_cycles,total_cycles,mint_ocalls,mint_resumes,reenter_ocalls,reenter_resumes,status,value,lease\n");
+
+  for (uintptr_t iter = 0; iter < slottee_paper_eval_iters; iter++) {
+    Keystone::Enclave enclave;
+    slot_cap_t cap = {};
+    uintptr_t seed_cycles = 0;
+    uintptr_t seed_value = 0;
+    uintptr_t seed_ocalls = 0;
+    uintptr_t seed_resumes = 0;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+    uintptr_t lease = 0;
+    uintptr_t ocalls = 0;
+    uintptr_t resumes = 0;
+
+    params.setFreeMemSize(8 * 1024 * 1024);
+    params.setUntrustedSize(64 * 1024);
+    if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+        Keystone::Error::Success) {
+      printf("[FAIL] slottee_eval ocall failed to init enclave\n");
+      return 1;
+    }
+    edge_init(&enclave);
+    Keystone::Error ret = seed_rt_authorized_caps(enclave, 1, &seed_value,
+        &seed_ocalls, &seed_resumes, &seed_cycles);
+    if (ret != Keystone::Error::Success || get_copied_slot_cap(1, &cap)) {
+      printf("[FAIL] slottee_eval ocall failed to seed cap ret=%d\n", (int)ret);
+      enclave.destroy();
+      return 1;
+    }
+
+    suppress_enclave_prints = 1;
+    uintptr_t start = read_cycle_counter();
+    ret = enter_slot_user_ocall_round_with_cap(enclave, cap, &status, &value,
+        &lease, &ocalls, &resumes);
+    uintptr_t reenter_cycles = read_cycle_counter() - start;
+    suppress_enclave_prints = 0;
+    uintptr_t total_cycles = seed_cycles + reenter_cycles;
+    slottee_stats_add(&mint_stats, seed_cycles);
+    slottee_stats_add(&reenter_stats, reenter_cycles);
+    slottee_stats_add(&total_stats, total_cycles);
+
+    printf("slottee_eval_ocall_roundtrip,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+        iter, seed_cycles, reenter_cycles, total_cycles,
+        seed_ocalls, seed_resumes, ocalls, resumes, status, value, lease);
+    fflush(stdout);
+
+    if (ret != Keystone::Error::Success ||
+        status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+        value != SLOTTEE_LT_USER_OCALL_MAGIC || lease == 0) {
+      printf("[FAIL] slottee_eval ocall roundtrip iter %lu ret=%d status=%lu value=%lu lease=%lu\n",
+          iter, (int)ret, status, value, lease);
+      enclave.destroy();
+      return 1;
+    }
+
+    enclave.destroy();
+  }
+
+  printf("slottee_eval_ocall_roundtrip_summary,count,mint_avg,reenter_avg,total_min,total_avg,total_max,total_cycles\n");
+  printf("slottee_eval_ocall_roundtrip_summary,%lu,%.2f,%.2f,%lu,%.2f,%lu,%llu\n",
+      total_stats.count, slottee_stats_avg(&mint_stats),
+      slottee_stats_avg(&reenter_stats), total_stats.min,
+      slottee_stats_avg(&total_stats), total_stats.max, total_stats.total);
+  fflush(stdout);
+  return 0;
+}
+
+static int
+run_slottee_eval_revoke_latency(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  slottee_cycle_stats mark_stats;
+  slottee_cycle_stats cleanup_stats;
+  slottee_cycle_stats total_stats;
+
+  slottee_stats_init(&mark_stats);
+  slottee_stats_init(&cleanup_stats);
+  slottee_stats_init(&total_stats);
+  printf("slottee_eval_revoke_latency,iter,enter_ret,enter_status,mark_ret,mark_status,epoch,resume_ret,mark_cycles,cleanup_cycles,total_cycles\n");
+
+  for (uintptr_t iter = 0; iter < slottee_paper_eval_iters; iter++) {
+    Keystone::Enclave enclave;
+    slot_cap_t cap = {};
+    uintptr_t seed_cycles = 0;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+    uintptr_t lease = 0;
+    uintptr_t epoch = 0;
+
+    if (init_eval_enclave_with_caps(enclave, eapp_file, rt_file, ld_file,
+            params, 2, &seed_cycles))
+      return 1;
+    if (get_copied_slot_cap(2, &cap)) {
+      enclave.destroy();
+      return 1;
+    }
+
+    suppress_enclave_prints = 1;
+    Keystone::Error enter_ret = enter_slot_request_once_with_cap(enclave, cap,
+        SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value, &lease);
+    suppress_enclave_prints = 0;
+    if (enter_ret != Keystone::Error::Success ||
+        status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || lease == 0) {
+      printf("[FAIL] slottee_eval revoke setup iter %lu ret=%d status=%lu lease=%lu\n",
+          iter, (int)enter_ret, status, lease);
+      enclave.destroy();
+      return 1;
+    }
+
+    uintptr_t start = read_cycle_counter();
+    Keystone::Error mark_ret = enclave.markRevoke(2, &status, &epoch);
+    uintptr_t after_mark = read_cycle_counter();
+    Keystone::Error resume_ret = enclave.resume(&value);
+    uintptr_t end = read_cycle_counter();
+    uintptr_t mark_cycles = after_mark - start;
+    uintptr_t cleanup_cycles = end - after_mark;
+    uintptr_t total_cycles = end - start;
+    slottee_stats_add(&mark_stats, mark_cycles);
+    slottee_stats_add(&cleanup_stats, cleanup_cycles);
+    slottee_stats_add(&total_stats, total_cycles);
+
+    printf("slottee_eval_revoke_latency,%lu,%d,%lu,%d,%lu,%lu,%d,%lu,%lu,%lu\n",
+        iter, (int)enter_ret, SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST,
+        (int)mark_ret, status, epoch, (int)resume_ret,
+        mark_cycles, cleanup_cycles, total_cycles);
+    fflush(stdout);
+
+    if (mark_ret != Keystone::Error::Success ||
+        status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+        epoch != SLOTTEE_INITIAL_EPOCH + 1 ||
+        resume_ret != Keystone::Error::EnclaveNotResumable) {
+      printf("[FAIL] slottee_eval revoke latency iter %lu mark_ret=%d status=%lu epoch=%lu resume_ret=%d\n",
+          iter, (int)mark_ret, status, epoch, (int)resume_ret);
+      enclave.destroy();
+      return 1;
+    }
+
+    enclave.destroy();
+  }
+
+  printf("slottee_eval_revoke_latency_summary,count,mark_avg,cleanup_avg,total_min,total_avg,total_max,total_cycles\n");
+  printf("slottee_eval_revoke_latency_summary,%lu,%.2f,%.2f,%lu,%.2f,%lu,%llu\n",
+      total_stats.count, slottee_stats_avg(&mark_stats),
+      slottee_stats_avg(&cleanup_stats), total_stats.min,
+      slottee_stats_avg(&total_stats), total_stats.max, total_stats.total);
+  fflush(stdout);
+  return 0;
+}
+
+struct slottee_ticket_worker_arg {
+  Keystone::Enclave* enclave;
+  slot_cap_t cap;
+  uintptr_t slot_id;
+  uintptr_t tickets_total;
+  uintptr_t* next_ticket;
+  pthread_mutex_t* ticket_lock;
+  pthread_mutex_t* ioctl_lock;
+  uintptr_t sold;
+  uintptr_t retries;
+  uintptr_t failures;
+  uintptr_t cycles;
+  Keystone::Error last_ret;
+  uintptr_t last_status;
+  uintptr_t last_value;
+};
+
+static void*
+slottee_ticket_worker(void* opaque)
+{
+  slottee_ticket_worker_arg* arg = (slottee_ticket_worker_arg*)opaque;
+
+  arg->sold = 0;
+  arg->retries = 0;
+  arg->failures = 0;
+  arg->cycles = 0;
+  arg->last_ret = Keystone::Error::Success;
+  arg->last_status = 0;
+  arg->last_value = 0;
+
+  while (1) {
+    pthread_mutex_lock(arg->ticket_lock);
+    if (*arg->next_ticket >= arg->tickets_total) {
+      pthread_mutex_unlock(arg->ticket_lock);
+      break;
+    }
+    pthread_mutex_unlock(arg->ticket_lock);
+
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+    uintptr_t start = read_cycle_counter();
+    if (arg->ioctl_lock)
+      pthread_mutex_lock(arg->ioctl_lock);
+    Keystone::Error ret = arg->enclave->enterSlotWithCap(
+        arg->cap, SLOTTEE_ENTER_SLOT_FLAG_REAL, &status, &value);
+    if (arg->ioctl_lock)
+      pthread_mutex_unlock(arg->ioctl_lock);
+    uintptr_t cycles = read_cycle_counter() - start;
+
+    arg->cycles += cycles;
+
+    if (ret == Keystone::Error::Success &&
+        status == SBI_ERR_SM_ENCLAVE_SUCCESS &&
+        value == SLOTTEE_SLOT_MAGIC) {
+      pthread_mutex_lock(arg->ticket_lock);
+      if (*arg->next_ticket < arg->tickets_total) {
+        ++(*arg->next_ticket);
+        arg->sold++;
+        arg->last_ret = ret;
+        arg->last_status = status;
+        arg->last_value = value;
+      }
+      pthread_mutex_unlock(arg->ticket_lock);
+    } else {
+      arg->retries++;
+      if (arg->retries > slottee_ticket_retry_limit) {
+        arg->failures++;
+        arg->last_ret = ret;
+        arg->last_status = status;
+        arg->last_value = value;
+        break;
+      }
+      sched_yield();
+    }
+  }
+
+  return NULL;
+}
+
+static int
+run_slottee_ticket_demo_case(const char* mode, uintptr_t workers,
+    const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  pthread_t threads[slottee_ticket_windows];
+  slottee_ticket_worker_arg args[slottee_ticket_windows];
+  pthread_mutex_t ticket_lock = PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_t ioctl_lock = PTHREAD_MUTEX_INITIALIZER;
+  uintptr_t next_ticket = 0;
+  uintptr_t total_sold = 0;
+  uintptr_t total_retries = 0;
+  uintptr_t total_failures = 0;
+  uintptr_t worker_cycles = 0;
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+
+  if (workers == 0 || workers > slottee_ticket_windows)
+    return 1;
+
+  if (init_eval_enclave_with_caps(enclave, eapp_file, rt_file, ld_file,
+          params, workers, NULL))
+    return 1;
+
+  printf("slottee_eval_ticket_worker,mode,harts,slot,sold,retries,failures,cycles,last_ret,last_status,last_value\n");
+  uintptr_t start = read_cycle_counter();
+  for (uintptr_t worker = 0; worker < workers; worker++) {
+    slot_cap_t cap = {};
+    if (get_copied_slot_cap(worker + 1, &cap)) {
+      enclave.destroy();
+      return 1;
+    }
+
+    memset(&args[worker], 0, sizeof(args[worker]));
+    args[worker].enclave = &enclave;
+    args[worker].cap = cap;
+    args[worker].slot_id = worker + 1;
+    args[worker].tickets_total = slottee_ticket_total;
+    args[worker].next_ticket = &next_ticket;
+    args[worker].ticket_lock = &ticket_lock;
+    args[worker].ioctl_lock = workers == 1 ? &ioctl_lock : NULL;
+
+    if (pthread_create(&threads[worker], NULL, slottee_ticket_worker,
+            &args[worker]) != 0) {
+      printf("[FAIL] slottee ticket demo failed to create worker %lu\n", worker);
+      enclave.destroy();
+      return 1;
+    }
+  }
+
+  for (uintptr_t worker = 0; worker < workers; worker++) {
+    if (pthread_join(threads[worker], NULL) != 0) {
+      printf("[FAIL] slottee ticket demo failed to join worker %lu\n", worker);
+      enclave.destroy();
+      return 1;
+    }
+  }
+  uintptr_t total_cycles = read_cycle_counter() - start;
+
+  for (uintptr_t worker = 0; worker < workers; worker++) {
+    total_sold += args[worker].sold;
+    total_retries += args[worker].retries;
+    total_failures += args[worker].failures;
+    worker_cycles += args[worker].cycles;
+    printf("slottee_eval_ticket_worker,%s,%ld,%lu,%lu,%lu,%lu,%lu,%d,%lu,%lu\n",
+        mode, online_harts, args[worker].slot_id, args[worker].sold,
+        args[worker].retries, args[worker].failures, args[worker].cycles,
+        (int)args[worker].last_ret, args[worker].last_status,
+        args[worker].last_value);
+  }
+
+  double throughput = total_cycles ?
+      ((double)total_sold * 1000000.0) / (double)total_cycles : 0.0;
+  printf("slottee_eval_ticket_demo,mode,harts,workers,tickets,total_cycles,worker_cycles,throughput_tickets_per_mcycle,retries,failures\n");
+  printf("slottee_eval_ticket_demo,%s,%ld,%lu,%lu,%lu,%lu,%.6f,%lu,%lu\n",
+      mode, online_harts, workers, total_sold, total_cycles, worker_cycles,
+      throughput, total_retries, total_failures);
+  fflush(stdout);
+
+  enclave.destroy();
+  pthread_mutex_destroy(&ticket_lock);
+  pthread_mutex_destroy(&ioctl_lock);
+
+  if (total_sold != slottee_ticket_total || total_failures != 0) {
+    printf("[FAIL] slottee ticket demo mode=%s sold=%lu failures=%lu\n",
+        mode, total_sold, total_failures);
+    return 1;
+  }
+
+  return 0;
+}
+
+static int
+run_slottee_ticket_demo(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  if (run_slottee_ticket_demo_case("single_window", 1, eapp_file, rt_file,
+          ld_file, params))
+    return 1;
+  return run_slottee_ticket_demo_case("three_window", slottee_ticket_windows,
+      eapp_file, rt_file, ld_file, params);
+}
+
+static int
+run_slottee_paper_eval(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  if (run_slottee_eval_null_enter(eapp_file, rt_file, ld_file, params))
+    return 1;
+  if (run_slottee_eval_ocall_roundtrip(eapp_file, rt_file, ld_file, params))
+    return 1;
+  if (run_slottee_eval_revoke_latency(eapp_file, rt_file, ld_file, params))
+    return 1;
+  return run_slottee_ticket_demo(eapp_file, rt_file, ld_file, params);
+}
+
 int
 main(int argc, char** argv) {
   if (argc < 4 || argc > 24) {
@@ -3589,6 +4158,7 @@ main(int argc, char** argv) {
         "[--enter-slot-cap-generation-replay] "
         "[--enter-slot-rt-authorized-mint] "
         "[--slottee-debug-mint-gate] "
+        "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -3638,6 +4208,8 @@ main(int argc, char** argv) {
   int enter_slot_cap_generation_replay = 0;
   int enter_slot_rt_authorized_mint = 0;
   int slottee_debug_mint_gate = 0;
+  int slottee_paper_eval = 0;
+  int slottee_ticket_demo = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -3705,6 +4277,8 @@ main(int argc, char** argv) {
       {"enter-slot-rt-authorized-mint", no_argument,
        &enter_slot_rt_authorized_mint, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
+      {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
+      {"slottee-ticket-demo", no_argument, &slottee_ticket_demo, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -3884,6 +4458,14 @@ main(int argc, char** argv) {
 
   if (slottee_debug_mint_gate) {
     return run_slottee_debug_mint_gate(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_paper_eval) {
+    return run_slottee_paper_eval(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_ticket_demo) {
+    return run_slottee_ticket_demo(eapp_file, rt_file, ld_file, params);
   }
 
   Keystone::Enclave enclave;
