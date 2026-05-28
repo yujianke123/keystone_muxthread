@@ -1,6 +1,7 @@
 #include "slottee_sched.h"
 
 #include "call/sbi.h"
+#include "util/printf.h"
 
 #define SLOTTEE_LT_CONTEXT_VERSION 1
 #define SLOTTEE_LT_STACK_WORDS     1024
@@ -18,6 +19,7 @@
 #define SLOTTEE_LT_TRAP_SAFE_BOUNDARY_BASE    ((uintptr_t)0x51570000)
 #define SLOTTEE_LT_ECALL_STACK_GUARD_BASE     ((uintptr_t)0x515a0000)
 #define SLOTTEE_LT_ECALL_TLS_MARKER_BASE      ((uintptr_t)0x515b0000)
+#define SLOTTEE_LT_SCHED_THREAD_COUNT         3
 
 enum slottee_lt_state {
   SLOTTEE_LT_EMPTY = 0,
@@ -288,6 +290,151 @@ slottee_lt_yield_trace_ok(const struct slottee_lt_desc* lt)
       lt->state_trace[4] == SLOTTEE_LT_EXITED;
 }
 
+static uintptr_t
+slottee_lt_scheduler_slot_id(uintptr_t thread_index)
+{
+  return thread_index + 1;
+}
+
+static int
+slottee_lt_scheduler_create_threads(uintptr_t lease_id, uintptr_t* created)
+{
+  uintptr_t thread_index;
+
+  if (!created || SLOTTEE_LT_SCHED_THREAD_COUNT == 0 ||
+      SLOTTEE_LT_SCHED_THREAD_COUNT >= SLOTTEE_MAX_SLOTS)
+    return 0;
+
+  *created = 0;
+  slottee_queue_reset();
+
+  for (thread_index = 0; thread_index < SLOTTEE_LT_SCHED_THREAD_COUNT;
+       thread_index++) {
+    uintptr_t lt_slot = slottee_lt_scheduler_slot_id(thread_index);
+    struct slottee_lt_desc* lt = &slottee_lts[lt_slot];
+
+    slottee_lt_prepare(lt, lt_slot, lease_id);
+    slottee_lt_context_init(lt);
+
+    if (!slottee_lt_context_isolated(lt) ||
+        !slottee_queue_enqueue(lt_slot))
+      return 0;
+
+    (*created)++;
+  }
+
+  return *created == SLOTTEE_LT_SCHED_THREAD_COUNT;
+}
+
+static int
+slottee_lt_scheduler_yield_ready_threads(
+    uintptr_t* scheduled, uintptr_t* yielded)
+{
+  uintptr_t thread_index;
+
+  if (!scheduled || !yielded)
+    return 0;
+
+  *scheduled = 0;
+  *yielded = 0;
+
+  for (thread_index = 0; thread_index < SLOTTEE_LT_SCHED_THREAD_COUNT;
+       thread_index++) {
+    uintptr_t queued_slot = 0;
+    struct slottee_lt_desc* lt;
+
+    if (!slottee_queue_dequeue(&queued_slot) ||
+        queued_slot == 0 || queued_slot >= SLOTTEE_MAX_SLOTS)
+      return 0;
+
+    lt = &slottee_lts[queued_slot];
+    if (lt->state != SLOTTEE_LT_READY)
+      return 0;
+
+    slottee_lt_set_state(lt, SLOTTEE_LT_RUNNING);
+    lt->run_count++;
+    (*scheduled)++;
+
+    slottee_lt_write_scratch(lt);
+    slottee_lt_set_state(lt, SLOTTEE_LT_YIELDED);
+    lt->yield_count++;
+    lt->last_reason = SLOTTEE_LT_YIELD_REASON_TEST;
+    (*yielded)++;
+
+    if (!slottee_lt_scratch_ok(lt) ||
+        !slottee_queue_enqueue(queued_slot))
+      return 0;
+  }
+
+  return 1;
+}
+
+static int
+slottee_lt_scheduler_resume_yielded_threads(
+    uintptr_t* scheduled, uintptr_t* resumed, uintptr_t* exited)
+{
+  uintptr_t thread_index;
+
+  if (!scheduled || !resumed || !exited)
+    return 0;
+
+  for (thread_index = 0; thread_index < SLOTTEE_LT_SCHED_THREAD_COUNT;
+       thread_index++) {
+    uintptr_t queued_slot = 0;
+    struct slottee_lt_desc* lt;
+
+    if (!slottee_queue_dequeue(&queued_slot) ||
+        queued_slot == 0 || queued_slot >= SLOTTEE_MAX_SLOTS)
+      return 0;
+
+    lt = &slottee_lts[queued_slot];
+    if (lt->state != SLOTTEE_LT_YIELDED ||
+        !slottee_lt_scratch_ok(lt))
+      return 0;
+
+    slottee_lt_set_state(lt, SLOTTEE_LT_RUNNING);
+    lt->run_count++;
+    lt->resume_count++;
+    (*scheduled)++;
+    (*resumed)++;
+
+    if (!slottee_lt_scratch_ok(lt))
+      return 0;
+
+    slottee_lt_set_state(lt, SLOTTEE_LT_EXITED);
+    (*exited)++;
+  }
+
+  return 1;
+}
+
+static int
+slottee_lt_scheduler_threads_done(void)
+{
+  uintptr_t thread_index;
+
+  if (slottee_ready_queue.count != 0)
+    return 0;
+
+  for (thread_index = 0; thread_index < SLOTTEE_LT_SCHED_THREAD_COUNT;
+       thread_index++) {
+    uintptr_t lt_slot = slottee_lt_scheduler_slot_id(thread_index);
+    const struct slottee_lt_desc* lt = &slottee_lts[lt_slot];
+
+    if (lt->state != SLOTTEE_LT_EXITED ||
+        lt->run_count != 2 ||
+        lt->yield_count != 1 ||
+        lt->resume_count != 1 ||
+        lt->last_reason != SLOTTEE_LT_YIELD_REASON_TEST ||
+        !slottee_lt_scratch_ok(lt) ||
+        !slottee_lt_yield_trace_ok(lt) ||
+        !slottee_lt_context_isolated(lt))
+      return 0;
+  }
+
+  return 1;
+}
+
 static void
 slottee_lt_binding_entry(void* opaque)
 {
@@ -492,17 +639,28 @@ slottee_lt_ecall_probe_ok(const struct slottee_lt_desc* lt)
 uintptr_t
 slottee_lt_scheduler_run(uintptr_t slot_id, uintptr_t lease_id)
 {
-  struct slottee_lt_desc* lt;
+  uintptr_t created = 0;
+  uintptr_t scheduled = 0;
+  uintptr_t yielded = 0;
+  uintptr_t resumed = 0;
+  uintptr_t exited = 0;
+  int ok;
 
   if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
     return SLOTTEE_SLOT_MAGIC;
 
-  lt = &slottee_lts[slot_id];
-  slottee_lt_prepare(lt, slot_id, lease_id);
+  ok = slottee_lt_scheduler_create_threads(lease_id, &created) &&
+      slottee_lt_scheduler_yield_ready_threads(&scheduled, &yielded) &&
+      slottee_lt_scheduler_resume_yielded_threads(
+          &scheduled, &resumed, &exited) &&
+      slottee_lt_scheduler_threads_done();
 
-  slottee_lt_set_state(lt, SLOTTEE_LT_RUNNING);
-  lt->run_count++;
-  slottee_lt_set_state(lt, SLOTTEE_LT_EXITED);
+  printf("[slottee] lt_sched_multi,anchor_slot=%lu,lease=%lu,threads=%lu,created=%lu,scheduled=%lu,yielded=%lu,resumed=%lu,exited=%lu,ok=%lu\r\n",
+      slot_id, lease_id, (uintptr_t)SLOTTEE_LT_SCHED_THREAD_COUNT,
+      created, scheduled, yielded, resumed, exited, (uintptr_t)ok);
+
+  if (!ok)
+    return SLOTTEE_SLOT_MAGIC;
 
   return SLOTTEE_LT_SCHED_MAGIC;
 }

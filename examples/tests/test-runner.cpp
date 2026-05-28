@@ -496,25 +496,90 @@ run_enter_slot_pthread_pool(const char* eapp_file, const char* rt_file,
       SLOTTEE_SLOT_MAGIC, eapp_file, rt_file, ld_file, params);
 }
 
+static Keystone::Error
+enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& cap,
+    uintptr_t flags, uintptr_t* status, uintptr_t* value, uintptr_t* lease_id);
+static int
+get_copied_slot_cap(uintptr_t slot_id, slot_cap_t* cap);
+static int
+init_eval_enclave_with_caps(Keystone::Enclave& enclave, const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params,
+    uintptr_t max_slot, uintptr_t* seed_cycles);
+
+static int
+run_enter_slot_with_seeded_caps(const char* label, uintptr_t flags,
+    uintptr_t expected_value, uintptr_t workers, const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (workers == 0 || workers >= SLOTTEE_MAX_SLOTS)
+    return 1;
+
+  if (init_eval_enclave_with_caps(enclave, eapp_file, rt_file, ld_file,
+          params, workers, NULL))
+    return 1;
+
+  printf("%s_seeded_worker,slot,status,value,lease\n", label);
+  fflush(stdout);
+
+  for (uintptr_t worker = 0; worker < workers; worker++) {
+    uintptr_t slot_id = worker + 1;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+    uintptr_t lease = 0;
+    slot_cap_t cap = {};
+    Keystone::Error ret;
+
+    if (get_copied_slot_cap(slot_id, &cap)) {
+      enclave.destroy();
+      return 1;
+    }
+
+    ret = enter_slot_request_once_with_cap(enclave, cap, flags, &status,
+        &value, &lease);
+    printf("%s_seeded_worker,%lu,%lu,%lu,%lu\n",
+        label, slot_id, status, value, lease);
+
+    if (expect_enter_slot_status("ENTER_SLOT seeded pool", ret, status,
+            value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
+        expect_enter_slot_bench_value(
+            label, worker, value, expected_value) ||
+        lease == 0) {
+      enclave.destroy();
+      return 1;
+    }
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
 static int
 run_enter_slot_lt_scheduler(const char* eapp_file, const char* rt_file,
     const char* ld_file, Keystone::Params params) {
-  return run_enter_slot_pool_case("lt_sched", SLOTTEE_ENTER_SLOT_FLAG_REAL_LT,
-      SLOTTEE_LT_SCHED_MAGIC, eapp_file, rt_file, ld_file, params);
+  return run_enter_slot_with_seeded_caps("lt_sched",
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT, SLOTTEE_LT_SCHED_MAGIC,
+      enter_slot_pool_workers, eapp_file, rt_file, ld_file, params);
 }
 
 static int
 run_enter_slot_lt_context(const char* eapp_file, const char* rt_file,
     const char* ld_file, Keystone::Params params) {
-  return run_enter_slot_pool_case("lt_context", SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT,
-      SLOTTEE_LT_CONTEXT_MAGIC, eapp_file, rt_file, ld_file, params);
+  return run_enter_slot_with_seeded_caps("lt_context",
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT, SLOTTEE_LT_CONTEXT_MAGIC,
+      enter_slot_pool_workers, eapp_file, rt_file, ld_file, params);
 }
 
 static int
 run_enter_slot_lt_yield(const char* eapp_file, const char* rt_file,
     const char* ld_file, Keystone::Params params) {
-  return run_enter_slot_pool_case("lt_yield", SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD,
-      SLOTTEE_LT_YIELD_MAGIC, eapp_file, rt_file, ld_file, params);
+  return run_enter_slot_with_seeded_caps("lt_yield",
+      SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_YIELD, SLOTTEE_LT_YIELD_MAGIC,
+      enter_slot_pool_workers, eapp_file, rt_file, ld_file, params);
 }
 
 static int
