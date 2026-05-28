@@ -183,10 +183,13 @@ unsigned long sbi_sm_slottee_debug(
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   ret = debug_enclave_slot_state((enclave_id) eid, &req, &resp);
-  if (out_val)
-    *out_val = (req.op == SLOTTEE_DEBUG_OP_CAP_KEY_STATUS ||
-        req.op == SLOTTEE_DEBUG_OP_MINT_CAP) ?
-        resp.cap_key_ready : resp.reentry_ready;
+  if (out_val) {
+    int wants_cap_key = req.op == SLOTTEE_DEBUG_OP_CAP_KEY_STATUS;
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
+    wants_cap_key = wants_cap_key || req.op == SLOTTEE_DEBUG_OP_MINT_CAP;
+#endif
+    *out_val = wants_cap_key ? resp.cap_key_ready : resp.reentry_ready;
+  }
 
   if (debug_resp && copy_from_sm(debug_resp, &resp, sizeof(resp)))
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;

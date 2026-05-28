@@ -215,7 +215,9 @@ struct mint_slot_cap_resp_t {
 #define SLOTTEE_DEBUG_OP_REENTRY_CLEAR     2
 #define SLOTTEE_DEBUG_OP_CAP_KEY_STATUS    3
 /* Legacy host-side debug/test mint. Production mint is RT-authorized and SM-signed. */
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
 #define SLOTTEE_DEBUG_OP_MINT_CAP          4
+#endif
 
 struct slottee_debug_req_t {
   uintptr_t version;

@@ -17,12 +17,20 @@ endif
 KEYSTONE_SM_DEPENDENCIES += host-keystone-sdk
 $(KEYSTONE_SM_CONFIGURE): host-keystone-sdk-install
 
+SLOTTEE_DEBUG_MINT_ENABLE ?= 0
+ifeq ($(filter 1 y yes true ON,$(SLOTTEE_DEBUG_MINT_ENABLE)),)
+SLOTTEE_SM_CFLAGS :=
+else
+SLOTTEE_SM_CFLAGS := -DSLOTTEE_DEBUG_MINT_ENABLE
+endif
+
 ifeq ($(KEYSTONE_PLATFORM),mpfs)
 HSS_DEPENDENCIES += keystone-sm
 $(HSS_TARGET_CONFIGURE): keystone-sm-install
 
 # Point HSS at the SM
 HSS_MAKE_OPTS += KEYSTONE_SM=$(KEYSTONE_SM_BUILDDIR)
+HSS_MAKE_OPTS += SLOTTEE_SM_CFLAGS="$(SLOTTEE_SM_CFLAGS)"
 
 # Make keystone-sm dircleans also trigger hss-dircleans
 keystone-sm-dirclean: hss-dirclean
@@ -35,6 +43,7 @@ OPENSBI_MAKE_ENV += PLATFORM_DIR=$(KEYSTONE_SM_BUILDDIR)/plat/
 
 # For abi issue
 OPENSBI_MAKE_ENV += PLATFORM_RISCV_TOOLCHAIN_DEFAULT=1
+OPENSBI_MAKE_ENV += SLOTTEE_SM_CFLAGS="$(SLOTTEE_SM_CFLAGS)"
 
 # Make keystone-sm dircleans also trigger opensbi-dirclean
 keystone-sm-dirclean: opensbi-dirclean

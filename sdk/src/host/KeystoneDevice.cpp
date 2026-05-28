@@ -476,11 +476,21 @@ MockKeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_r
   slottee_debug_resp_t local_resp;
   memset(&local_resp, 0, sizeof(local_resp));
 
-  if (req.version != SLOTTEE_DEBUG_VERSION ||
-      (req.op != SLOTTEE_DEBUG_OP_REENTRY_STATUS &&
-       req.op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR &&
-       req.op != SLOTTEE_DEBUG_OP_CAP_KEY_STATUS &&
-       req.op != SLOTTEE_DEBUG_OP_MINT_CAP)) {
+  if (req.version != SLOTTEE_DEBUG_VERSION) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  } else if (
+#ifndef SLOTTEE_DEBUG_MINT_ENABLE
+      req.op == 4) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED;
+  } else if (
+#endif
+      req.op != SLOTTEE_DEBUG_OP_REENTRY_STATUS &&
+      req.op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR &&
+      req.op != SLOTTEE_DEBUG_OP_CAP_KEY_STATUS
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
+      && req.op != SLOTTEE_DEBUG_OP_MINT_CAP
+#endif
+      ) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   } else {
     local_resp.status = SBI_ERR_SM_ENCLAVE_SUCCESS;
@@ -489,6 +499,7 @@ MockKeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_r
     local_resp.epoch = SLOTTEE_INITIAL_EPOCH;
     local_resp.cap_key_ready = 1;
     local_resp.cap_key_generation = 1;
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
     if (req.op == SLOTTEE_DEBUG_OP_MINT_CAP) {
       local_resp.cap = req.cap;
       local_resp.cap.version = SLOTTEE_ENTER_SLOT_VERSION;
@@ -502,6 +513,7 @@ MockKeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_r
           local_resp.cap.max_lease_cycles : SLOTTEE_DEFAULT_MAX_LEASE_CYCLES;
       local_resp.cap.cap_mac[0] = 0x51514d4143UL;
     }
+#endif
   }
 
   if (resp) {

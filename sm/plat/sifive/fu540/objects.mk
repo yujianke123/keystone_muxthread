@@ -9,6 +9,7 @@
 PLATFORM = sifive/fu540
 KEYSTONE_SM_REL=../../../
 platform-genflags-y += "-DTARGET_PLATFORM_HEADER=\"platform/$(PLATFORM)/platform.h\""
+platform-genflags-y += $(SLOTTEE_SM_CFLAGS)
 
 platform-objs-y += $(KEYSTONE_SM_REL)src/attest.o
 platform-objs-y += $(KEYSTONE_SM_REL)src/cpu.o

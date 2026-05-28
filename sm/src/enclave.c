@@ -1138,11 +1138,24 @@ unsigned long debug_enclave_slot_state(
 {
   unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
 
-  if (!req || req->version != SLOTTEE_DEBUG_VERSION ||
-      (req->op != SLOTTEE_DEBUG_OP_REENTRY_STATUS &&
-       req->op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR &&
-       req->op != SLOTTEE_DEBUG_OP_CAP_KEY_STATUS &&
-       req->op != SLOTTEE_DEBUG_OP_MINT_CAP))
+  if (!req || req->version != SLOTTEE_DEBUG_VERSION)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+#ifndef SLOTTEE_DEBUG_MINT_ENABLE
+  if (req->op == 4) {
+    if (resp)
+      resp->status = SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED;
+    return SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED;
+  }
+#endif
+
+  if (req->op != SLOTTEE_DEBUG_OP_REENTRY_STATUS &&
+      req->op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR &&
+      req->op != SLOTTEE_DEBUG_OP_CAP_KEY_STATUS
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
+      && req->op != SLOTTEE_DEBUG_OP_MINT_CAP
+#endif
+      )
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   spin_lock(&encl_lock);
@@ -1154,6 +1167,7 @@ unsigned long debug_enclave_slot_state(
   if (req->op == SLOTTEE_DEBUG_OP_REENTRY_CLEAR)
     clear_enclave_slot_reentry_template(eid);
 
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
   if (req->op == SLOTTEE_DEBUG_OP_MINT_CAP) {
     struct slot_cap_t cap = req->cap;
 
@@ -1180,6 +1194,7 @@ unsigned long debug_enclave_slot_state(
     if (resp)
       resp->cap = cap;
   }
+#endif
 
 out:
   if (resp) {

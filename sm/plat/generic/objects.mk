@@ -7,6 +7,7 @@ include $(src_dir)/platform/$(PLATFORM)/objects.mk
 
 # And then also define custom keystone SM functionality
 platform-genflags-y += "-DTARGET_PLATFORM_HEADER=\"platform/$(PLATFORM)/platform.h\""
+platform-genflags-y += $(SLOTTEE_SM_CFLAGS)
 
 include $(KEYSTONE_SM)/src/objects.mk
 platform-objs-y += $(addprefix ../../src/,$(subst .c,.o,$(keystone-sm-sources)))

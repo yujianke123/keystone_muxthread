@@ -43,6 +43,7 @@ static const uintptr_t enter_slot_resume_limit = 8;
 static const uintptr_t enter_slot_revoke_stress_rounds = 3;
 static const uintptr_t enter_slot_active_revoke_timer_rounds = 3;
 static const uintptr_t enter_slot_active_revoke_probe_limit = 128;
+static const uintptr_t slottee_debug_mint_op_value = 4;
 static const unsigned int enter_slot_active_revoke_mark_delay_us = 2000;
 static const unsigned int enter_slot_active_revoke_ready_settle_us = 1000;
 
@@ -108,6 +109,7 @@ make_enter_slot_test_cap(uintptr_t slot_id) {
 static Keystone::Error
 mint_enter_slot_test_cap_with_resp(
     Keystone::Enclave& enclave, slot_cap_t* cap, slottee_debug_resp_t* debug_resp) {
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
   slottee_debug_req_t req = {};
   slottee_debug_resp_t resp = {};
   Keystone::Error ret;
@@ -132,6 +134,16 @@ mint_enter_slot_test_cap_with_resp(
   if (debug_resp)
     *debug_resp = resp;
   return Keystone::Error::Success;
+#else
+  (void)enclave;
+  (void)cap;
+  if (debug_resp) {
+    memset(debug_resp, 0, sizeof(*debug_resp));
+    debug_resp->status = SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED;
+  }
+  printf("[slottee] debug mint compile gate disabled\n");
+  return Keystone::Error::DeviceError;
+#endif
 }
 
 static Keystone::Error
@@ -3485,6 +3497,60 @@ run_enter_slot_rt_authorized_mint(const char* eapp_file,
   return 0;
 }
 
+static int
+run_slottee_debug_mint_gate(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  slottee_debug_req_t req = {};
+  slottee_debug_resp_t resp = {};
+  Keystone::Error ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] debug mint gate failed to init enclave\n");
+    return 1;
+  }
+
+  req.version = SLOTTEE_DEBUG_VERSION;
+  req.op = slottee_debug_mint_op_value;
+  req.cap = make_enter_slot_test_cap(1);
+
+  ret = enclave.slotteeDebug(req, &resp);
+  printf("debug_mint_gate,enabled,ret,status,cap_key_ready,mac0\n");
+  printf("debug_mint_gate,%d,%d,%lu,%lu,%lu\n",
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
+      1,
+#else
+      0,
+#endif
+      (int)ret, resp.status, resp.cap_key_ready, resp.cap.cap_mac[0]);
+  fflush(stdout);
+
+  enclave.destroy();
+
+  if (ret != Keystone::Error::Success)
+    return 1;
+
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
+  if (resp.status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+      !slot_cap_mac_nonzero(resp.cap)) {
+    printf("[FAIL] debug mint gate expected enabled mint success\n");
+    return 1;
+  }
+#else
+  if (resp.status != SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED) {
+    printf("[FAIL] debug mint gate expected SBI_PROHIBITED when disabled\n");
+    return 1;
+  }
+#endif
+
+  return 0;
+}
+
 int
 main(int argc, char** argv) {
   if (argc < 4 || argc > 24) {
@@ -3522,6 +3588,7 @@ main(int argc, char** argv) {
         "[--enter-slot-cap-mac-forge] "
         "[--enter-slot-cap-generation-replay] "
         "[--enter-slot-rt-authorized-mint] "
+        "[--slottee-debug-mint-gate] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -3570,6 +3637,7 @@ main(int argc, char** argv) {
   int enter_slot_cap_mac_forge = 0;
   int enter_slot_cap_generation_replay = 0;
   int enter_slot_rt_authorized_mint = 0;
+  int slottee_debug_mint_gate = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -3636,6 +3704,7 @@ main(int argc, char** argv) {
        &enter_slot_cap_generation_replay, 1},
       {"enter-slot-rt-authorized-mint", no_argument,
        &enter_slot_rt_authorized_mint, 1},
+      {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -3811,6 +3880,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_rt_authorized_mint) {
     return run_enter_slot_rt_authorized_mint(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_debug_mint_gate) {
+    return run_slottee_debug_mint_gate(eapp_file, rt_file, ld_file, params);
   }
 
   Keystone::Enclave enclave;

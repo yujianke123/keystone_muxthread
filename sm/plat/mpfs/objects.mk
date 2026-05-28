@@ -21,6 +21,7 @@ include $(KEYSTONE_SM)/src/objects.mk
 platform-genflags-y += -I$(KEYSTONE_SM)/plat/$(PLATFORM) -I$(KEYSTONE_SM)/src \
                         -I$(KEYSTONE_SDK_DIR)/include/shared
 platform-genflags-y += -DTARGET_PLATFORM_HEADER=\"platform/$(PLATFORM)/platform.h\"
+platform-genflags-y += $(SLOTTEE_SM_CFLAGS)
 
 platform-objs-y += $(addprefix $(KEYSTONE_SM)/src/,$(subst .c,.o,$(keystone-sm-sources)))
 platform-objs-y += $(KEYSTONE_SM)/plat/$(PLATFORM)/crypto_interpose.o

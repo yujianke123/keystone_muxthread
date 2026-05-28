@@ -45,6 +45,21 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_C_FLAGS ${CMAKE_C_FLAGS} -g)
 endif()
 
+if (NOT DEFINED SLOTTEE_DEBUG_MINT_ENABLE)
+  if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(SLOTTEE_DEBUG_MINT_ENABLE ON CACHE BOOL "Compile legacy SlotTEE host debug mint")
+  else()
+    set(SLOTTEE_DEBUG_MINT_ENABLE OFF CACHE BOOL "Compile legacy SlotTEE host debug mint")
+  endif()
+endif()
+
+if (SLOTTEE_DEBUG_MINT_ENABLE)
+  if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(FATAL_ERROR "SLOTTEE_DEBUG_MINT_ENABLE is only valid for Debug builds")
+  endif()
+  add_definitions(-DSLOTTEE_DEBUG_MINT_ENABLE)
+endif()
+
 use_riscv_toolchain(${KEYSTONE_BITS})
 ################################################################################
 # BUILD PROJECTS
