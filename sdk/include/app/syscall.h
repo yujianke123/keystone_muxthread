@@ -63,4 +63,7 @@ typedef void (*slottee_lt_fn_t)(void*);
 int
 slottee_lt_spawn(uintptr_t slot_id, slottee_lt_fn_t fn, void* arg);
 
+int
+slottee_lt_wait_value(const long* ptr, long target, uintptr_t op);
+
 #endif /* syscall.h */

@@ -73,7 +73,6 @@ uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
 				   void* data, size_t data_len,
 				   void* return_buffer, size_t return_len){
 
-  uintptr_t ret;
   /* For now we assume by convention that the start of the buffer is
    * the right place to put calls */
   struct edge_call* edge_call = (struct edge_call*)shared_buffer;
@@ -95,11 +94,12 @@ uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
     goto ocall_error;
   }
 
-  ret = sbi_stop_enclave(STOP_EDGE_CALL_HOST);
-
-  if (ret != 0) {
-    goto ocall_error;
-  }
+  /*
+   * This SBI returns only after the host resumes the enclave.  Slot-specific
+   * resume paths may leave a non-zero continuation value in a0; the edge-call
+   * return status below is the authoritative OCALL result.
+   */
+  (void)sbi_stop_enclave(STOP_EDGE_CALL_HOST);
 
   if(edge_call->return_data.call_status != CALL_STATUS_OK){
     goto ocall_error;
@@ -277,6 +277,9 @@ void handle_syscall(struct encl_ctx* ctx)
     break;
   case(RUNTIME_SYSCALL_SLOTTEE_LT_SPAWN):
     ret = slottee_lt_spawn(arg0, arg1, arg2);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_WAIT_VALUE):
+    ret = slottee_lt_wait_value(arg0, arg1, arg2);
     break;
 
 

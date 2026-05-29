@@ -34,6 +34,10 @@ void copy_slot_cap(void* shared_buffer, size_t size);
 void copy_multihart_ticket_report_wrapper(void* buffer);
 void copy_multihart_ticket_report(void* shared_buffer, size_t size);
 
+void get_multihart_ticket_config_wrapper(void* buffer);
+void get_multihart_ticket_config(
+    struct slottee_multihart_ticket_config* config);
+
 void get_host_string_wrapper(void* buffer);
 const char* get_host_string();
 

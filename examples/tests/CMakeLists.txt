@@ -25,7 +25,9 @@ set(slottee_fault_test_bins
   test-lt-user-illegal
   test-lt-user-page-fault
   test-lt-user-illegal-cleanup
-  test-lt-user-page-fault-cleanup
+  test-lt-user-page-fault-cleanup)
+
+set(slottee_stress_test_bins
   test-lt-user-busy-revoke
   test-lt-user-first-busy-revoke)
 
@@ -274,7 +276,7 @@ file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-ocall eyrie-rt load
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-cap-mac-forge\" ]; then\n")
-file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-ocall eyrie-rt loader.bin --load-only --enter-slot-cap-mac-forge\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-cap-mac-forge\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-cap-generation-replay\" ]; then\n")
@@ -301,6 +303,17 @@ file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-multihart-ticket\" ]; 
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-multihart-ticket eyrie-rt loader.bin --slottee-multihart-ticket\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-multihart-ticket-max\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-multihart-ticket eyrie-rt loader.bin --slottee-multihart-ticket-max\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-multihart-stress\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-multihart-ticket eyrie-rt loader.bin --slottee-multihart-stress || exit $?\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-active-revoke-timer-stress || exit $?\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-first-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-active-revoke-destroy-race || exit $?\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-first-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-active-revoke-multislot-stress\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
 foreach (test IN ITEMS ${all_test_bins})
   file(APPEND ${test_script_tmp} "echo 'testing ${test}'\n")
   if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${test}/retval)
@@ -316,7 +329,8 @@ file(COPY ${test_script_tmp} DESTINATION ${CMAKE_CURRENT_BINARY_DIR}
 file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/tmp)
 
 # linker flags for all tests
-set_target_properties(${all_test_bins} ${slottee_fault_test_bins} ${slottee_explicit_test_bins}
+set_target_properties(${all_test_bins} ${slottee_fault_test_bins}
+  ${slottee_explicit_test_bins} ${slottee_stress_test_bins}
   PROPERTIES LINK_FLAGS "-nostdlib -static -T ${CMAKE_CURRENT_SOURCE_DIR}/app.lds")
 ###############################################
 
@@ -337,7 +351,8 @@ add_eyrie_runtime(test-eyrie
 add_keystone_package(test-package
   ${package_name}
   ${package_script}
-  ${test_script} ${eyrie_files_to_copy} ${all_test_bins} ${slottee_fault_test_bins} ${slottee_explicit_test_bins} ${host_bin}
+  ${test_script} ${eyrie_files_to_copy} ${all_test_bins} ${slottee_fault_test_bins}
+  ${slottee_explicit_test_bins} ${slottee_stress_test_bins} ${host_bin}
   )
 
 add_dependencies(test-package test-eyrie)

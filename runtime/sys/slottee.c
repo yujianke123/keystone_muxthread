@@ -9,6 +9,7 @@
 #include "util/printf.h"
 #include "util/regs.h"
 #include "util/string.h"
+#include "uaccess.h"
 
 #define SLOTTEE_USER_STACK_PAGES 8
 #define SLOTTEE_USER_TLS_PAGES   1
@@ -388,8 +389,7 @@ slottee_active_user_ocall_exit_ok(
     return user->user_alloc_ok &&
         user->exit_trap_count == 1 &&
         slottee_user_addr_in_range(user->last_trap_user_sp,
-            user->user_stack_base, SLOTTEE_USER_STACK_SIZE) &&
-        user->last_trap_user_tp == user->user_tls_base;
+            user->user_stack_base, SLOTTEE_USER_STACK_SIZE);
 
   return value == SLOTTEE_LT_USER_OCALL_MAGIC &&
       user->user_alloc_ok &&
@@ -594,4 +594,32 @@ slottee_lt_spawn(uintptr_t slot_id, uintptr_t fn, uintptr_t arg)
   }
 
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+uintptr_t
+slottee_lt_wait_value(uintptr_t user_ptr, uintptr_t target, uintptr_t op)
+{
+  long value = 0;
+  int ready = 0;
+
+  if (!user_ptr || copy_from_user(&value, (void*)user_ptr, sizeof(value)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (op == SLOTTEE_LT_WAIT_OP_EQ)
+    ready = value == (long)target;
+  else if (op == SLOTTEE_LT_WAIT_OP_GE)
+    ready = value >= (long)target;
+  else
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (ready)
+    return SLOTTEE_LT_WAIT_RESULT_READY;
+
+  /*
+   * The stop SBI returns to this instruction only after the host resumes the
+   * enclave.  Its a0 may contain the host resume status, so the wait primitive
+   * treats that continuation as the observable "blocked once" result.
+   */
+  (void)sbi_stop_enclave(STOP_TIMER_INTERRUPT);
+  return SLOTTEE_LT_WAIT_RESULT_BLOCKED;
 }

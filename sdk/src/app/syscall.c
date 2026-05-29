@@ -44,3 +44,8 @@ int
 slottee_lt_spawn(uintptr_t slot_id, slottee_lt_fn_t fn, void* arg) {
   return SYSCALL_3(RUNTIME_SYSCALL_SLOTTEE_LT_SPAWN, slot_id, fn, arg);
 }
+
+int
+slottee_lt_wait_value(const long* ptr, long target, uintptr_t op) {
+  return SYSCALL_3(RUNTIME_SYSCALL_SLOTTEE_LT_WAIT_VALUE, ptr, target, op);
+}

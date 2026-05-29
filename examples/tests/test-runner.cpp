@@ -7,6 +7,7 @@
 #include <sched.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include "edge_wrapper.h"
@@ -43,10 +44,15 @@ static int copied_slot_cap_ready;
 static int copied_slot_cap_ready_by_slot[SLOTTEE_MAX_SLOTS];
 static struct slottee_multihart_ticket_report copied_multihart_ticket_report;
 static int copied_multihart_ticket_report_ready;
+static struct slottee_multihart_ticket_config multihart_ticket_config;
 static const uintptr_t enter_slot_bench_iters = 3;
 static const uintptr_t slottee_paper_eval_iters = 5;
 static const uintptr_t slottee_ticket_total = 20;
-static const uintptr_t slottee_ticket_windows = 3;
+static const uintptr_t slottee_ticket_windows = SLOTTEE_MULTIHART_TICKET_WINDOWS;
+static const uintptr_t slottee_ticket_max_windows =
+    SLOTTEE_MULTIHART_TICKET_MAX_WINDOWS;
+static const uintptr_t slottee_multihart_resume_limit = 512;
+static const uintptr_t slottee_multihart_wait_budget = 4096;
 static const uintptr_t slottee_ticket_retry_limit = 128;
 static const char* slottee_null_enter_baseline_commit = "d4e1754";
 static const uintptr_t slottee_null_enter_baseline_count = 3;
@@ -102,6 +108,12 @@ copy_multihart_ticket_report(void* buffer, size_t size) {
     memcpy(&copied_multihart_ticket_report, buffer, size);
     copied_multihart_ticket_report_ready = 1;
   }
+}
+
+void
+get_multihart_ticket_config(struct slottee_multihart_ticket_config* config) {
+  if (config)
+    *config = multihart_ticket_config;
 }
 
 static int
@@ -512,6 +524,12 @@ enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& c
     uintptr_t* bound_hart = nullptr);
 static int
 get_copied_slot_cap(uintptr_t slot_id, slot_cap_t* cap);
+static Keystone::Error
+seed_rt_authorized_caps(Keystone::Enclave& enclave, uintptr_t max_slot,
+    uintptr_t* value, uintptr_t* ocalls, uintptr_t* resumes, uintptr_t* cycles);
+static Keystone::Error
+resume_rt_authorized_caps(Keystone::Enclave& enclave, uintptr_t max_slot,
+    uintptr_t* value, uintptr_t* ocalls, uintptr_t* resumes, uintptr_t* cycles);
 static int
 init_eval_enclave_with_caps(Keystone::Enclave& enclave, const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params,
@@ -855,7 +873,8 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
     const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value,
     uintptr_t* lease_id,
     uintptr_t* ocall_count, uintptr_t* resume_count,
-    uintptr_t* bound_hart = nullptr)
+    uintptr_t* bound_hart = nullptr,
+    uintptr_t max_resumes = enter_slot_resume_limit)
 {
   Keystone::Error ret;
 
@@ -872,12 +891,13 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
         lease_id ? *lease_id : 0);
   }
   for (uintptr_t retry = 0; ret == Keystone::Error::Success &&
-       retry < enter_slot_resume_limit; retry++) {
+       retry < max_resumes; retry++) {
     if (*status == SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST) {
       incoming_call_dispatch(enclave.getSharedBuffer());
       if (ocall_count)
         (*ocall_count)++;
-      ret = enter_slot_resume_once(enclave, status, value);
+      ret = enter_slot_resume_once_with_cap(enclave, cap,
+          lease_id ? *lease_id : 0, status, value);
       if (resume_count)
         (*resume_count)++;
       if (ret == Keystone::Error::Success &&
@@ -898,8 +918,11 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
       if (ret == Keystone::Error::Success &&
           *status == SBI_ERR_SM_ENCLAVE_SUCCESS)
         break;
-      if (ret != Keystone::Error::EnclaveInterrupted)
+      if (ret != Keystone::Error::Success &&
+          ret != Keystone::Error::EnclaveInterrupted)
         break;
+      sched_yield();
+      usleep(1000);
       ret = Keystone::Error::Success;
       continue;
     }
@@ -914,11 +937,12 @@ static Keystone::Error
 enter_slot_user_ocall_round_with_cap(Keystone::Enclave& enclave, const slot_cap_t& cap,
     uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
     uintptr_t* ocall_count, uintptr_t* resume_count,
-    uintptr_t* bound_hart = nullptr)
+    uintptr_t* bound_hart = nullptr,
+    uintptr_t max_resumes = enter_slot_resume_limit)
 {
   return enter_slot_user_ocall_round_with_cap_and_flags(enclave, cap,
       SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, status, value, lease_id,
-      ocall_count, resume_count, bound_hart);
+      ocall_count, resume_count, bound_hart, max_resumes);
 }
 
 static Keystone::Error
@@ -2173,8 +2197,11 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
   uintptr_t fresh_lease = 0;
   uintptr_t ocalls = 0;
   uintptr_t resumes = 0;
+  uintptr_t seed_value = 0;
+  uintptr_t seed_ocalls = 0;
+  uintptr_t seed_resumes = 0;
+  slot_cap_t baseline_cap;
   Keystone::Error ret;
-  Keystone::Error resume_ret;
 
   params.setFreeMemSize(8 * 1024 * 1024);
   params.setUntrustedSize(64 * 1024);
@@ -2189,8 +2216,15 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
   printf("active_revoke_timer_stress,round,phase,ret,status,value,lease,epoch,ocalls,resumes\n");
   fflush(stdout);
 
-  ret = enter_slot_user_ocall_round(
-      enclave, 1, &status, &value, &baseline_lease, &ocalls, &resumes);
+  ret = seed_rt_authorized_caps(enclave, 3, &seed_value, &seed_ocalls,
+      &seed_resumes, NULL);
+  if (ret != Keystone::Error::Success ||
+      get_copied_slot_cap(1, &baseline_cap)) {
+    enclave.destroy();
+    return 1;
+  }
+  ret = enter_slot_user_ocall_round_with_cap(enclave, baseline_cap, &status,
+      &value, &baseline_lease, &ocalls, &resumes);
   printf("active_revoke_timer_stress,0,baseline,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
       (int)ret, status, value, baseline_lease, epoch, ocalls, resumes);
   fflush(stdout);
@@ -2216,9 +2250,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
     memset(&arg, 0, sizeof(arg));
     arg.enclave = &enclave;
     arg.slot_id = 2;
-    arg.cap = make_enter_slot_test_cap(arg.slot_id);
-    arg.cap.epoch = epoch;
-    if (mint_enter_slot_test_cap(enclave, &arg.cap) != Keystone::Error::Success) {
+    if (get_copied_slot_cap(arg.slot_id, &arg.cap)) {
       enclave.destroy();
       return 1;
     }
@@ -2285,20 +2317,6 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
       return 1;
     }
 
-    value = 0;
-    resume_ret = enclave.resume(&value);
-    printf("active_revoke_timer_stress,%lu,old_resume,%d,0,%lu,0,%lu,0,0\n",
-        round, (int)resume_ret, value, arg.mark_epoch);
-    fflush(stdout);
-    if (resume_ret != Keystone::Error::EnclaveNotResumable) {
-      printf("[FAIL] ENTER_SLOT active revoke timer stress returned unexpected old resume status round %lu\n",
-          round);
-      enclave.destroy();
-      pthread_mutex_destroy(&arg.lock);
-      pthread_cond_destroy(&arg.cond);
-      return 1;
-    }
-
     ret = enter_slot_request_once_with_cap(enclave, arg.cap,
         SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value,
         &old_replay_lease);
@@ -2313,9 +2331,10 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
       return 1;
     }
 
-    fresh_cap = make_enter_slot_test_cap(arg.slot_id);
-    fresh_cap.epoch = arg.mark_epoch;
-    if (mint_enter_slot_test_cap(enclave, &fresh_cap) != Keystone::Error::Success) {
+    ret = resume_rt_authorized_caps(enclave, 3, &seed_value, &seed_ocalls,
+        &seed_resumes, NULL);
+    if (ret != Keystone::Error::Success ||
+        get_copied_slot_cap(arg.slot_id, &fresh_cap)) {
       enclave.destroy();
       pthread_mutex_destroy(&arg.lock);
       pthread_cond_destroy(&arg.cond);
@@ -2672,8 +2691,9 @@ run_enter_slot_active_revoke_destroy_race(const char* eapp_file,
 {
   Keystone::Enclave enclave;
   enter_slot_active_revoke_timer_arg arg;
-  uintptr_t value = 0;
-  Keystone::Error resume_ret;
+  uintptr_t seed_value = 0;
+  uintptr_t seed_ocalls = 0;
+  uintptr_t seed_resumes = 0;
   Keystone::Error final_destroy_ret;
 
   params.setFreeMemSize(8 * 1024 * 1024);
@@ -2688,8 +2708,9 @@ run_enter_slot_active_revoke_destroy_race(const char* eapp_file,
   memset(&arg, 0, sizeof(arg));
   arg.enclave = &enclave;
   arg.slot_id = 2;
-  arg.cap = make_enter_slot_test_cap(arg.slot_id);
-  if (mint_enter_slot_test_cap(enclave, &arg.cap) != Keystone::Error::Success) {
+  if (seed_rt_authorized_caps(enclave, 3, &seed_value, &seed_ocalls,
+          &seed_resumes, NULL) != Keystone::Error::Success ||
+      get_copied_slot_cap(arg.slot_id, &arg.cap)) {
     enclave.destroy();
     return 1;
   }
@@ -2742,18 +2763,6 @@ run_enter_slot_active_revoke_destroy_race(const char* eapp_file,
     return 1;
   }
 
-  resume_ret = enclave.resume(&value);
-  printf("active_revoke_destroy_race,old_resume,%d,0,%lu,0,%lu,0,0\n",
-      (int)resume_ret, value, arg.mark_epoch);
-  fflush(stdout);
-  if (resume_ret != Keystone::Error::EnclaveNotResumable) {
-    printf("[FAIL] ENTER_SLOT active revoke destroy race returned unexpected old resume status\n");
-    enclave.destroy();
-    pthread_mutex_destroy(&arg.lock);
-    pthread_cond_destroy(&arg.cond);
-    return 1;
-  }
-
   final_destroy_ret = enclave.destroy();
   printf("active_revoke_destroy_race,final_destroy,%d,0,0,0,%lu,0,0\n",
       (int)final_destroy_ret, arg.mark_epoch);
@@ -2783,6 +2792,9 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
   uintptr_t fresh_lease = 0;
   uintptr_t ocalls = 0;
   uintptr_t resumes = 0;
+  uintptr_t seed_value = 0;
+  uintptr_t seed_ocalls = 0;
+  uintptr_t seed_resumes = 0;
   slottee_debug_resp_t debug_resp = {};
   Keystone::Error ret;
   Keystone::Error resume_ret;
@@ -2799,15 +2811,15 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
   memset(&arg, 0, sizeof(arg));
   arg.enclave = &enclave;
   arg.slot_id = 2;
-  arg.cap = make_enter_slot_test_cap(arg.slot_id);
-  if (mint_enter_slot_test_cap(enclave, &arg.cap) != Keystone::Error::Success) {
+  if (seed_rt_authorized_caps(enclave, 3, &seed_value, &seed_ocalls,
+          &seed_resumes, NULL) != Keystone::Error::Success ||
+      get_copied_slot_cap(arg.slot_id, &arg.cap)) {
     enclave.destroy();
     return 1;
   }
   arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL;
   arg.run_second_slot_after_mark = 1;
-  arg.second_cap = make_enter_slot_test_cap(3);
-  if (mint_enter_slot_test_cap(enclave, &arg.second_cap) != Keystone::Error::Success) {
+  if (get_copied_slot_cap(3, &arg.second_cap)) {
     enclave.destroy();
     return 1;
   }
@@ -2886,19 +2898,6 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
     return 1;
   }
 
-  value = 0;
-  resume_ret = enclave.resume(&value);
-  printf("active_revoke_multislot_stress,old_resume,%d,0,%lu,0,%lu,0,0\n",
-      (int)resume_ret, value, arg.mark_epoch);
-  fflush(stdout);
-  if (resume_ret != Keystone::Error::EnclaveNotResumable) {
-    printf("[FAIL] ENTER_SLOT active revoke multislot stress returned unexpected old resume status\n");
-    enclave.destroy();
-    pthread_mutex_destroy(&arg.lock);
-    pthread_cond_destroy(&arg.cond);
-    return 1;
-  }
-
   ret = enter_slot_request_once_with_cap(enclave, arg.cap,
       SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value,
       &old_replay_lease);
@@ -2913,9 +2912,10 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
     return 1;
   }
 
-  fresh_cap = make_enter_slot_test_cap(arg.slot_id);
-  fresh_cap.epoch = arg.mark_epoch;
-  if (mint_enter_slot_test_cap(enclave, &fresh_cap) != Keystone::Error::Success) {
+  ret = resume_rt_authorized_caps(enclave, 3, &seed_value, &seed_ocalls,
+      &seed_resumes, NULL);
+  if (ret != Keystone::Error::Success ||
+      get_copied_slot_cap(arg.slot_id, &fresh_cap)) {
     enclave.destroy();
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
@@ -3223,12 +3223,15 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
   Keystone::Enclave cross_enclave;
   slottee_debug_resp_t debug_resp = {};
   slot_cap_t cap;
+  slot_cap_t slot2_cap;
   slot_cap_t tampered;
   uintptr_t status = 0;
   uintptr_t value = 0;
   uintptr_t lease = 0;
   uintptr_t ocalls = 0;
   uintptr_t resumes = 0;
+  uintptr_t seed_ocalls = 0;
+  uintptr_t seed_resumes = 0;
   Keystone::Error ret;
 
   params.setFreeMemSize(8 * 1024 * 1024);
@@ -3254,12 +3257,24 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
     return 1;
   }
 
-  cap = make_enter_slot_test_cap(1);
-  if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
+  ret = seed_rt_authorized_caps(enclave, 2, &value, &seed_ocalls,
+      &seed_resumes, NULL);
+  if (ret != Keystone::Error::Success ||
+      get_copied_slot_cap(1, &cap) ||
+      get_copied_slot_cap(2, &slot2_cap)) {
+    enclave.destroy();
+    return 1;
+  }
+  if (expect_cap_mac_forge_row("rt_seed", Keystone::Error::Success,
+          SBI_ERR_SM_ENCLAVE_SUCCESS, value, 0, debug_resp.epoch,
+          debug_resp.cap_key_ready, seed_ocalls, seed_resumes,
+          SBI_ERR_SM_ENCLAVE_SUCCESS)) {
     enclave.destroy();
     return 1;
   }
 
+  ocalls = 0;
+  resumes = 0;
   ret = enter_slot_user_ocall_round_with_cap(enclave, cap, &status, &value,
       &lease, &ocalls, &resumes);
   if (expect_cap_mac_forge_row("valid", ret, status, value, lease,
@@ -3271,11 +3286,7 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
     return 1;
   }
 
-  cap = make_enter_slot_test_cap(2);
-  if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-    enclave.destroy();
-    return 1;
-  }
+  cap = slot2_cap;
 
   tampered = cap;
   tampered.slot_id = 3;
@@ -3339,6 +3350,7 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
   }
   cross_enclave.destroy();
 
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
   cap = make_enter_slot_test_cap(2);
   cap.max_lease_cycles = SLOTTEE_TEST_MAX_LEASE_CYCLES;
   if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
@@ -3367,6 +3379,15 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
     enclave.destroy();
     return 1;
   }
+#else
+  if (expect_cap_mac_forge_row("ttl_replay_debug_mint_disabled",
+          Keystone::Error::Success, SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED, 0, 0,
+          debug_resp.epoch, debug_resp.cap_key_ready, 0, 0,
+          SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED)) {
+    enclave.destroy();
+    return 1;
+  }
+#endif
 
   enclave.destroy();
   return 0;
@@ -3746,18 +3767,33 @@ seed_rt_authorized_caps(Keystone::Enclave& enclave, uintptr_t max_slot,
   Keystone::Error ret;
 
   reset_copied_slot_caps();
+  if (ocalls)
+    *ocalls = 0;
+  if (resumes)
+    *resumes = 0;
   suppress_enclave_prints = 1;
   start = read_cycle_counter();
-  ret = run_enclave_ocall_round(enclave, value, ocalls, resumes);
+  ret = enclave.runRaw(value);
+  for (uintptr_t retry = 0; ret == Keystone::Error::EdgeCallHost &&
+       retry < enter_slot_resume_limit; retry++) {
+    incoming_call_dispatch(enclave.getSharedBuffer());
+    if (ocalls)
+      (*ocalls)++;
+    ret = enclave.resume(value);
+    if (resumes)
+      (*resumes)++;
+  }
   end = read_cycle_counter();
   suppress_enclave_prints = 0;
 
   if (cycles)
     *cycles = end - start;
 
-  if (ret != Keystone::Error::Success)
+  if (ret != Keystone::Error::Success &&
+      ret != Keystone::Error::EnclaveInterrupted)
     return ret;
-  if (value && *value != SLOTTEE_LT_USER_OCALL_MAGIC)
+  if (ret == Keystone::Error::Success && value &&
+      *value != SLOTTEE_LT_USER_OCALL_MAGIC)
     return Keystone::Error::DeviceError;
 
   for (uintptr_t slot = 1; slot <= max_slot; slot++) {
@@ -3766,7 +3802,57 @@ seed_rt_authorized_caps(Keystone::Enclave& enclave, uintptr_t max_slot,
       return Keystone::Error::DeviceError;
   }
 
-  return Keystone::Error::Success;
+  return ret == Keystone::Error::EnclaveInterrupted ?
+      Keystone::Error::Success : ret;
+}
+
+static Keystone::Error
+resume_rt_authorized_caps(Keystone::Enclave& enclave, uintptr_t max_slot,
+    uintptr_t* value, uintptr_t* ocalls, uintptr_t* resumes, uintptr_t* cycles)
+{
+  uintptr_t start;
+  uintptr_t end;
+  Keystone::Error ret;
+
+  reset_copied_slot_caps();
+  if (ocalls)
+    *ocalls = 0;
+  if (resumes)
+    *resumes = 0;
+
+  suppress_enclave_prints = 1;
+  start = read_cycle_counter();
+  ret = enclave.resume(value);
+  for (uintptr_t retry = 0; ret == Keystone::Error::EdgeCallHost &&
+       retry < enter_slot_resume_limit; retry++) {
+    incoming_call_dispatch(enclave.getSharedBuffer());
+    if (ocalls)
+      (*ocalls)++;
+    ret = enclave.resume(value);
+    if (resumes)
+      (*resumes)++;
+  }
+  end = read_cycle_counter();
+  suppress_enclave_prints = 0;
+
+  if (cycles)
+    *cycles = end - start;
+
+  if (ret != Keystone::Error::Success &&
+      ret != Keystone::Error::EnclaveInterrupted)
+    return ret;
+  if (ret == Keystone::Error::Success && value &&
+      *value != SLOTTEE_LT_USER_OCALL_MAGIC)
+    return Keystone::Error::DeviceError;
+
+  for (uintptr_t slot = 1; slot <= max_slot; slot++) {
+    slot_cap_t cap = {};
+    if (get_copied_slot_cap(slot, &cap))
+      return Keystone::Error::DeviceError;
+  }
+
+  return ret == Keystone::Error::EnclaveInterrupted ?
+      Keystone::Error::Success : ret;
 }
 
 static int
@@ -4228,6 +4314,18 @@ struct slottee_multihart_worker_arg {
   uintptr_t resumes;
 };
 
+static void
+slottee_multihart_set_config(uintptr_t windows, uintptr_t total_tickets,
+    uintptr_t join_mode, uintptr_t wait_budget)
+{
+  memset(&multihart_ticket_config, 0, sizeof(multihart_ticket_config));
+  multihart_ticket_config.magic = SLOTTEE_MULTIHART_TICKET_CONFIG_MAGIC;
+  multihart_ticket_config.windows = windows;
+  multihart_ticket_config.total_tickets = total_tickets;
+  multihart_ticket_config.join_mode = join_mode;
+  multihart_ticket_config.wait_budget = wait_budget;
+}
+
 static void*
 slottee_multihart_worker(void* opaque)
 {
@@ -4236,17 +4334,17 @@ slottee_multihart_worker(void* opaque)
 
   arg->ret = enter_slot_user_ocall_round_with_cap(*arg->enclave, arg->cap,
       &arg->status, &arg->value, &arg->lease, &arg->ocalls, &arg->resumes,
-      &arg->bound_hart);
+      &arg->bound_hart, slottee_multihart_resume_limit);
   return NULL;
 }
 
 static int
 slottee_multihart_maybe_start_worker(Keystone::Enclave& enclave,
     uintptr_t slot_id, pthread_t* thread,
-    slottee_multihart_worker_arg* arg, int* started)
+    slottee_multihart_worker_arg* arg, int* started, uintptr_t windows)
 {
   if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS ||
-      slot_id >= SLOTTEE_MULTIHART_TICKET_WINDOWS + 1 ||
+      slot_id >= windows + 1 ||
       started[slot_id] || !copied_slot_cap_ready_by_slot[slot_id])
     return 0;
 
@@ -4263,12 +4361,26 @@ slottee_multihart_maybe_start_worker(Keystone::Enclave& enclave,
   }
 
   started[slot_id] = 1;
+  sched_yield();
+  usleep(1000);
   return 0;
 }
 
 static int
-run_slottee_multihart_ticket(const char* eapp_file,
-    const char* rt_file, const char* ld_file, Keystone::Params params)
+slottee_multihart_all_worker_caps_ready(uintptr_t windows)
+{
+  for (uintptr_t slot_id = 2; slot_id <= windows; slot_id++) {
+    if (!copied_slot_cap_ready_by_slot[slot_id])
+      return 0;
+  }
+
+  return 1;
+}
+
+static int
+run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
+    uintptr_t total_tickets, const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params)
 {
   Keystone::Enclave enclave;
   pthread_t worker_threads[SLOTTEE_MAX_SLOTS];
@@ -4282,9 +4394,19 @@ run_slottee_multihart_ticket(const char* eapp_file,
   Keystone::Error ret;
   long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
 
+  if (windows < 2 || windows > slottee_ticket_max_windows ||
+      windows >= SLOTTEE_MAX_SLOTS || total_tickets < windows ||
+      total_tickets > SLOTTEE_MULTIHART_TICKET_MAX_TOTAL) {
+    printf("[FAIL] slottee multihart invalid config label=%s windows=%lu tickets=%lu\n",
+        label, windows, total_tickets);
+    return 1;
+  }
+
   params.setFreeMemSize(8 * 1024 * 1024);
   params.setUntrustedSize(64 * 1024);
   reset_copied_slot_caps();
+  slottee_multihart_set_config(windows, total_tickets,
+      SLOTTEE_MULTIHART_JOIN_MODE_WAIT, slottee_multihart_wait_budget);
   memset(worker_threads, 0, sizeof(worker_threads));
   memset(worker_args, 0, sizeof(worker_args));
   memset(worker_started, 0, sizeof(worker_started));
@@ -4296,56 +4418,86 @@ run_slottee_multihart_ticket(const char* eapp_file,
   }
 
   edge_init(&enclave);
-  printf("slottee_multihart_ticket,phase,host_harts,slot,bound_hart,ret,status,value,lease,ocalls,resumes\n");
+  printf("slottee_multihart_ticket,label,phase,host_harts,windows,tickets,slot,bound_hart,ret,status,value,lease,ocalls,resumes\n");
   fflush(stdout);
 
   ret = enclave.runRaw(&value);
   for (uintptr_t retry = 0;
        (ret == Keystone::Error::EdgeCallHost ||
         ret == Keystone::Error::EnclaveInterrupted) &&
-       retry < enter_slot_resume_limit * SLOTTEE_MULTIHART_TICKET_WINDOWS;
+       retry < slottee_multihart_wait_budget * 2 + windows * 8;
        retry++) {
     if (ret == Keystone::Error::EdgeCallHost) {
       incoming_call_dispatch(enclave.getSharedBuffer());
       ocalls++;
-      for (uintptr_t slot_id = 2; slot_id <= SLOTTEE_MULTIHART_TICKET_WINDOWS;
-           slot_id++) {
-        if (slottee_multihart_maybe_start_worker(enclave, slot_id,
-                &worker_threads[slot_id], &worker_args[slot_id],
-                worker_started)) {
+      sched_yield();
+      usleep(1000);
+    } else if (ret == Keystone::Error::EnclaveInterrupted) {
+      if (slottee_multihart_all_worker_caps_ready(windows)) {
+        for (uintptr_t slot_id = 2; slot_id <= windows; slot_id++) {
+          if (slottee_multihart_maybe_start_worker(enclave, slot_id,
+                  &worker_threads[slot_id], &worker_args[slot_id],
+                  worker_started, windows)) {
+            enclave.destroy();
+            return 1;
+          }
+        }
+      }
+      for (uintptr_t slot_id = 2; slot_id <= windows; slot_id++) {
+        if (worker_started[slot_id] != 1 ||
+            worker_args[slot_id].ret == Keystone::Error::DeviceError)
+          continue;
+        if (pthread_join(worker_threads[slot_id], NULL) != 0) {
+          printf("[FAIL] slottee multihart failed to join slot%lu worker\n",
+              slot_id);
           enclave.destroy();
           return 1;
         }
+        worker_started[slot_id] = 2;
       }
+      sched_yield();
+      usleep(1000);
     }
 
     ret = enclave.resume(&value);
     resumes++;
   }
 
-  printf("slottee_multihart_ticket,main,%ld,1,0,%d,%lu,%lu,0,%lu,%lu\n",
-      online_harts, (int)ret,
+  printf("slottee_multihart_ticket,%s,main,%ld,%lu,%lu,1,0,%d,%lu,%lu,0,%lu,%lu\n",
+      label, online_harts, windows, total_tickets, (int)ret,
       ret == Keystone::Error::Success ? SBI_ERR_SM_ENCLAVE_SUCCESS : 0,
       value, ocalls, resumes);
   fflush(stdout);
 
   if (ret != Keystone::Error::Success ||
       value != SLOTTEE_LT_USER_OCALL_MAGIC) {
+    if (copied_multihart_ticket_report_ready) {
+      printf("[FAIL] slottee multihart report on main failure: windows=%lu total=%lu sold=%lu remaining=%lu active=%lu ready=%lu wait_calls=%lu wait_blocks=%lu failures=%lu\n",
+          copied_multihart_ticket_report.configured_windows,
+          copied_multihart_ticket_report.total_tickets,
+          copied_multihart_ticket_report.total_sold,
+          copied_multihart_ticket_report.remaining_tickets,
+          copied_multihart_ticket_report.active_workers,
+          copied_multihart_ticket_report.ready_windows,
+          copied_multihart_ticket_report.wait_calls,
+          copied_multihart_ticket_report.wait_blocks,
+          copied_multihart_ticket_report.failures);
+    }
     printf("[FAIL] slottee multihart main returned ret=%d value=%lu\n",
         (int)ret, value);
     enclave.destroy();
     return 1;
   }
 
-  for (uintptr_t slot_id = 2; slot_id <= SLOTTEE_MULTIHART_TICKET_WINDOWS;
-       slot_id++) {
-    if (!worker_started[slot_id]) {
+  for (uintptr_t slot_id = 2; slot_id <= windows; slot_id++) {
+    if (worker_started[slot_id] == 0) {
       printf("[FAIL] slottee multihart slot%lu worker was not started\n",
           slot_id);
       enclave.destroy();
       return 1;
     }
-    if (pthread_join(worker_threads[slot_id], NULL) != 0) {
+    if (worker_started[slot_id] == 1 &&
+        pthread_join(worker_threads[slot_id], NULL) != 0) {
       printf("[FAIL] slottee multihart failed to join slot%lu worker\n",
           slot_id);
       enclave.destroy();
@@ -4353,8 +4505,9 @@ run_slottee_multihart_ticket(const char* eapp_file,
     }
     total_worker_ocalls += worker_args[slot_id].ocalls;
     total_worker_resumes += worker_args[slot_id].resumes;
-    printf("slottee_multihart_ticket,worker,%ld,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu\n",
-        online_harts, slot_id, worker_args[slot_id].bound_hart,
+    printf("slottee_multihart_ticket,%s,worker,%ld,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu\n",
+        label, online_harts, windows, total_tickets, slot_id,
+        worker_args[slot_id].bound_hart,
         (int)worker_args[slot_id].ret, worker_args[slot_id].status,
         worker_args[slot_id].value, worker_args[slot_id].lease,
         worker_args[slot_id].ocalls, worker_args[slot_id].resumes);
@@ -4371,47 +4524,62 @@ run_slottee_multihart_ticket(const char* eapp_file,
   }
 
   if (!copied_multihart_ticket_report_ready ||
-      copied_multihart_ticket_report.magic != SLOTTEE_MULTIHART_TICKET_MAGIC) {
+      copied_multihart_ticket_report.magic != SLOTTEE_MULTIHART_TICKET_MAGIC ||
+      copied_multihart_ticket_report.configured_windows != windows ||
+      copied_multihart_ticket_report.total_tickets != total_tickets ||
+      copied_multihart_ticket_report.max_windows != slottee_ticket_max_windows) {
     printf("[FAIL] slottee multihart ticket report missing or invalid\n");
     enclave.destroy();
     return 1;
   }
 
-  printf("slottee_multihart_ticket,window,slot,hart,sold,retries,failures\n");
-  for (uintptr_t window = 0; window < SLOTTEE_MULTIHART_TICKET_WINDOWS;
-       window++) {
-    printf("slottee_multihart_ticket,%lu,%lu,%lu,%lu,0,%lu\n",
-        window + 1, window + 1, window,
+  printf("slottee_multihart_ticket,label,window,slot,hart,sold,retries,failures\n");
+  for (uintptr_t window = 0; window < windows; window++) {
+    printf("slottee_multihart_ticket,%s,%lu,%lu,%lu,%lu,0,%lu\n",
+        label, window + 1, window + 1, window,
         copied_multihart_ticket_report.sold[window],
         copied_multihart_ticket_report.failures);
   }
-  printf("slottee_multihart_ticket,total,-,-,%lu,%lu,%lu\n",
+  printf("slottee_multihart_ticket,%s,total,-,-,%lu,%lu,%lu\n",
+      label,
       copied_multihart_ticket_report.total_sold,
       total_worker_ocalls + ocalls,
       copied_multihart_ticket_report.failures);
-  printf("[slottee] multihart_join active_workers=%lu remaining=%lu ok=%d main_ocalls=%lu main_resumes=%lu worker_ocalls=%lu worker_resumes=%lu\n",
+  printf("[slottee] multihart_join label=%s windows=%lu max_windows=%lu total_tickets=%lu active_workers=%lu ready_windows=%lu remaining=%lu wait_calls=%lu wait_blocks=%lu ok=%d main_ocalls=%lu main_resumes=%lu worker_ocalls=%lu worker_resumes=%lu\n",
+      label,
+      copied_multihart_ticket_report.configured_windows,
+      copied_multihart_ticket_report.max_windows,
+      copied_multihart_ticket_report.total_tickets,
       copied_multihart_ticket_report.active_workers,
+      copied_multihart_ticket_report.ready_windows,
       copied_multihart_ticket_report.remaining_tickets,
+      copied_multihart_ticket_report.wait_calls,
+      copied_multihart_ticket_report.wait_blocks,
       copied_multihart_ticket_report.total_sold ==
-          SLOTTEE_MULTIHART_TICKET_TOTAL &&
+          total_tickets &&
           copied_multihart_ticket_report.remaining_tickets == 0 &&
           copied_multihart_ticket_report.active_workers == 0 &&
-          copied_multihart_ticket_report.failures == 0,
+          copied_multihart_ticket_report.ready_windows == windows &&
+          copied_multihart_ticket_report.failures == 0 &&
+          copied_multihart_ticket_report.wait_calls > 0 &&
+          copied_multihart_ticket_report.wait_blocks > 0,
       ocalls, resumes, total_worker_ocalls, total_worker_resumes);
   fflush(stdout);
 
   if (copied_multihart_ticket_report.total_sold !=
-          SLOTTEE_MULTIHART_TICKET_TOTAL ||
+          total_tickets ||
       copied_multihart_ticket_report.remaining_tickets != 0 ||
       copied_multihart_ticket_report.active_workers != 0 ||
-      copied_multihart_ticket_report.failures != 0) {
+      copied_multihart_ticket_report.ready_windows != windows ||
+      copied_multihart_ticket_report.failures != 0 ||
+      copied_multihart_ticket_report.wait_calls == 0 ||
+      copied_multihart_ticket_report.wait_blocks == 0) {
     printf("[FAIL] slottee multihart ticket totals invalid\n");
     enclave.destroy();
     return 1;
   }
 
-  for (uintptr_t window = 0; window < SLOTTEE_MULTIHART_TICKET_WINDOWS;
-       window++) {
+  for (uintptr_t window = 0; window < windows; window++) {
     if (copied_multihart_ticket_report.sold[window] == 0) {
       printf("[FAIL] slottee multihart window %lu sold zero tickets\n",
           window + 1);
@@ -4421,6 +4589,38 @@ run_slottee_multihart_ticket(const char* eapp_file,
   }
 
   enclave.destroy();
+  return 0;
+}
+
+static int
+run_slottee_multihart_ticket(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  return run_slottee_multihart_ticket_case("default", slottee_ticket_windows,
+      slottee_ticket_total, eapp_file, rt_file, ld_file, params);
+}
+
+static int
+run_slottee_multihart_ticket_max(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  return run_slottee_multihart_ticket_case("max", slottee_ticket_max_windows,
+      slottee_ticket_max_windows * 4, eapp_file, rt_file, ld_file, params);
+}
+
+static int
+run_slottee_multihart_stress(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  for (uintptr_t windows = 2; windows <= slottee_ticket_max_windows; windows++) {
+    char label[32];
+
+    snprintf(label, sizeof(label), "stress%lu", windows);
+    if (run_slottee_multihart_ticket_case(label, windows, windows * 4,
+            eapp_file, rt_file, ld_file, params))
+      return 1;
+  }
+
   return 0;
 }
 
@@ -4439,7 +4639,7 @@ run_slottee_paper_eval(const char* eapp_file,
 
 int
 main(int argc, char** argv) {
-  if (argc < 4 || argc > 24) {
+  if (argc < 4 || argc > 32) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
         "SIZE(K)] [--time] [--load-only] [--enter-slot-stub] "
@@ -4477,6 +4677,10 @@ main(int argc, char** argv) {
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
+        "[--slottee-multihart-ticket-max] "
+        "[--slottee-multihart-stress] "
+        "[--slottee-multihart-windows N] "
+        "[--slottee-multihart-tickets N] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -4529,11 +4733,15 @@ main(int argc, char** argv) {
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
   int slottee_multihart_ticket = 0;
+  int slottee_multihart_ticket_max = 0;
+  int slottee_multihart_stress = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
   bool retval_exist = false;
   unsigned long retval = 0;
+  uintptr_t slottee_multihart_windows = slottee_ticket_windows;
+  uintptr_t slottee_multihart_tickets = slottee_ticket_total;
 
   static struct option long_options[] = {
       {"time", no_argument, &self_timing, 1},
@@ -4599,6 +4807,11 @@ main(int argc, char** argv) {
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
       {"slottee-ticket-demo", no_argument, &slottee_ticket_demo, 1},
       {"slottee-multihart-ticket", no_argument, &slottee_multihart_ticket, 1},
+      {"slottee-multihart-ticket-max", no_argument,
+       &slottee_multihart_ticket_max, 1},
+      {"slottee-multihart-stress", no_argument, &slottee_multihart_stress, 1},
+      {"slottee-multihart-windows", required_argument, 0, 'W'},
+      {"slottee-multihart-tickets", required_argument, 0, 'T'},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -4611,7 +4824,7 @@ main(int argc, char** argv) {
   int c;
   int opt_index = 3;
   while (1) {
-    c = getopt_long(argc, argv, "u:f:", long_options, &opt_index);
+    c = getopt_long(argc, argv, "u:f:W:T:", long_options, &opt_index);
 
     if (c == -1) break;
 
@@ -4627,6 +4840,12 @@ main(int argc, char** argv) {
       case 'r':
         retval_exist = true;
         retval = atoi(optarg);
+        break;
+      case 'W':
+        slottee_multihart_windows = strtoul(optarg, NULL, 0);
+        break;
+      case 'T':
+        slottee_multihart_tickets = strtoul(optarg, NULL, 0);
         break;
     }
   }
@@ -4789,7 +5008,20 @@ main(int argc, char** argv) {
   }
 
   if (slottee_multihart_ticket) {
+    if (slottee_multihart_windows != slottee_ticket_windows ||
+        slottee_multihart_tickets != slottee_ticket_total)
+      return run_slottee_multihart_ticket_case("custom",
+          slottee_multihart_windows, slottee_multihart_tickets, eapp_file,
+          rt_file, ld_file, params);
     return run_slottee_multihart_ticket(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_multihart_ticket_max) {
+    return run_slottee_multihart_ticket_max(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_multihart_stress) {
+    return run_slottee_multihart_stress(eapp_file, rt_file, ld_file, params);
   }
 
   Keystone::Enclave enclave;

@@ -1397,7 +1397,9 @@ unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave
     lease = find_active_slot_lease_by_thread_index(eid, thread_index);
     complete_timer_revoke =
         request == STOP_TIMER_INTERRUPT && slot_lease_has_pending_revoke(lease);
-    enclaves[eid].stopped_thread_index = thread_index;
+    if (!(request == STOP_TIMER_INTERRUPT && thread_index > 0 &&
+          enclaves[eid].stopped_threads[0]))
+      enclaves[eid].stopped_thread_index = thread_index;
     if (thread_index < MAX_ENCL_THREADS)
       enclaves[eid].stopped_threads[thread_index] = 1;
     if (lease)
@@ -1442,7 +1444,13 @@ unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid)
   struct slot_lease_t *lease = NULL;
 
   spin_lock(&encl_lock);
-  thread_index = enclaves[eid].stopped_thread_index;
+  /*
+   * KEYSTONE_IOC_RESUME_ENCLAVE has no slot id, so keep it bound to the
+   * canonical thread-0 path when thread 0 is stopped.  Slot threads are resumed
+   * through resume_enclave_slot(), which carries slot_id + lease_id.
+   */
+  thread_index = enclaves[eid].stopped_threads[0] ?
+      0 : enclaves[eid].stopped_thread_index;
   if (thread_index != 0)
     lease = find_active_slot_lease_by_thread_index(eid, thread_index);
 
@@ -1457,6 +1465,7 @@ unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid)
                && (enclaves[eid].state == RUNNING || enclaves[eid].state == STOPPED)
                && enclaves[eid].n_thread < MAX_ENCL_THREADS
                && thread_index < MAX_ENCL_THREADS
+               && enclaves[eid].stopped_threads[thread_index]
                && (thread_index == 0 || lease));
 
   if(!resumable) {
@@ -1465,6 +1474,10 @@ unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid)
   } else {
     if (lease)
       lease->active_hart = csr_read(mhartid);
+    if (thread_index < MAX_ENCL_THREADS)
+      enclaves[eid].stopped_threads[thread_index] = 0;
+    if (enclaves[eid].stopped_thread_index == thread_index)
+      enclaves[eid].stopped_thread_index = 0;
     enclaves[eid].n_thread++;
     enclaves[eid].state = RUNNING;
   }
@@ -1517,7 +1530,8 @@ unsigned long resume_enclave_slot(
 
   lease->active_hart = csr_read(mhartid);
   enclaves[eid].stopped_threads[thread_index] = 0;
-  enclaves[eid].stopped_thread_index = 0;
+  if (enclaves[eid].stopped_thread_index == thread_index)
+    enclaves[eid].stopped_thread_index = 0;
   enclaves[eid].n_thread++;
   enclaves[eid].state = RUNNING;
   spin_unlock(&encl_lock);

@@ -14,6 +14,7 @@
 #define OCALL_GET_STRING 4
 #define OCALL_COPY_SLOT_CAP 5
 #define OCALL_REPORT_MULTIHART_TICKET 6
+#define OCALL_GET_MULTIHART_TICKET_CONFIG 7
 
 void
 edge_init(Keystone::Enclave* enclave) {
@@ -25,6 +26,8 @@ edge_init(Keystone::Enclave* enclave) {
   register_call(OCALL_COPY_SLOT_CAP, copy_slot_cap_wrapper);
   register_call(OCALL_REPORT_MULTIHART_TICKET,
       copy_multihart_ticket_report_wrapper);
+  register_call(OCALL_GET_MULTIHART_TICKET_CONFIG,
+      get_multihart_ticket_config_wrapper);
 
   edge_call_init_internals(
       (uintptr_t)enclave->getSharedBuffer(), enclave->getSharedBufferSize());
@@ -133,6 +136,22 @@ copy_multihart_ticket_report_wrapper(void* buffer) {
 
   copy_multihart_ticket_report((void*)call_args, args_len);
   edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+void
+get_multihart_ticket_config_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t data_section = edge_call_data_ptr();
+  struct slottee_multihart_ticket_config config;
+
+  get_multihart_ticket_config(&config);
+  memcpy((void*)data_section, &config, sizeof(config));
+
+  if (edge_call_setup_ret(edge_call, (void*)data_section, sizeof(config))) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_PTR;
+  } else {
+    edge_call->return_data.call_status = CALL_STATUS_OK;
+  }
 }
 
 void
