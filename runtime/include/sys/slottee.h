@@ -6,10 +6,14 @@
 struct encl_ctx;
 
 uintptr_t slottee_slot_trampoline(uintptr_t slot_token);
-uintptr_t slottee_slot_trampoline_with_arg(uintptr_t slot_token, uintptr_t* user_arg);
+uintptr_t slottee_slot_trampoline_with_arg(
+    uintptr_t slot_token, uintptr_t* user_arg, uintptr_t* user_sp);
 void slottee_set_user_entry(uintptr_t entry);
 uintptr_t slottee_lt_spawn(uintptr_t slot_id, uintptr_t fn, uintptr_t arg);
-uintptr_t slottee_lt_wait_value(uintptr_t user_ptr, uintptr_t target, uintptr_t op);
+uintptr_t slottee_lt_wait_value(
+    struct encl_ctx* ctx, uintptr_t user_ptr, uintptr_t target, uintptr_t op);
+uintptr_t slottee_lt_notify_value(struct encl_ctx* ctx, uintptr_t user_ptr);
+uintptr_t slottee_lt_collect_stats(uintptr_t stats_ptr);
 void slottee_active_user_record_syscall(struct encl_ctx* ctx, uintptr_t syscall_id);
 void slottee_active_user_record_ocall(struct encl_ctx* ctx);
 void slottee_active_user_record_ocall_resume(struct encl_ctx* ctx, uintptr_t value);

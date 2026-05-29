@@ -28,12 +28,48 @@ extern byte dev_public_key[PUBLIC_KEY_SIZE];
 
 static int enclave_has_busy_slot_leases(enclave_id eid);
 
+#define SLOTTEE_RT_USER_STACK_START 0x0000000040000000UL
+#define SLOTTEE_RT_USER_STACK_SIZE  0x20000UL
+#define SLOTTEE_RT_USER_STACK_END \
+  (SLOTTEE_RT_USER_STACK_START - SLOTTEE_RT_USER_STACK_SIZE)
+#define SLOTTEE_RT_LT_STACK_PAGES   8
+#define SLOTTEE_RT_LT_TLS_PAGES     1
+#define SLOTTEE_RT_LT_STACK_SIZE \
+  ((uintptr_t)(SLOTTEE_RT_LT_STACK_PAGES * PAGE_SIZE))
+#define SLOTTEE_RT_LT_TLS_SIZE \
+  ((uintptr_t)(SLOTTEE_RT_LT_TLS_PAGES * PAGE_SIZE))
+#define SLOTTEE_RT_LT_REGION_GAP    PAGE_SIZE
+#define SLOTTEE_RT_LT_SLOT_STRIDE \
+  (SLOTTEE_RT_LT_STACK_SIZE + SLOTTEE_RT_LT_TLS_SIZE + SLOTTEE_RT_LT_REGION_GAP)
+
 static uintptr_t read_cycle(void)
 {
   uintptr_t cycle;
 
   asm volatile ("rdcycle %0" : "=r" (cycle));
   return cycle;
+}
+
+static int slottee_slot_mode_uses_rt_user_context(uintptr_t slot_mode)
+{
+  return slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL ||
+      slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT;
+}
+
+static uintptr_t slottee_rt_user_stack_top(uintptr_t slot_id)
+{
+  uintptr_t stack_base = SLOTTEE_RT_USER_STACK_END -
+      ((slot_id + 1) * SLOTTEE_RT_LT_SLOT_STRIDE);
+
+  return stack_base + SLOTTEE_RT_LT_STACK_SIZE;
+}
+
+static uintptr_t slottee_rt_user_tls_base(uintptr_t slot_id)
+{
+  uintptr_t stack_base = SLOTTEE_RT_USER_STACK_END -
+      ((slot_id + 1) * SLOTTEE_RT_LT_SLOT_STRIDE);
+
+  return stack_base + SLOTTEE_RT_LT_STACK_SIZE + SLOTTEE_RT_LT_REGION_GAP;
 }
 
 static void clear_enclave_cap_key(enclave_id eid)
@@ -330,6 +366,8 @@ static int prepare_enclave_slot_reentry(
     enclave_id eid, uintptr_t thread_index, uintptr_t slot_token)
 {
   struct thread_state *thread;
+  uintptr_t slot_id = SLOTTEE_SLOT_TOKEN_SLOT_ID(slot_token);
+  uintptr_t slot_mode = SLOTTEE_SLOT_TOKEN_MODE(slot_token);
 
   if (!enclaves[eid].slot_reentry_ready ||
       thread_index == 0 || thread_index >= MAX_ENCL_THREADS ||
@@ -341,6 +379,14 @@ static int prepare_enclave_slot_reentry(
   thread->prev_csrs = enclaves[eid].slot_reentry_csrs;
   thread->prev_mstatus = enclaves[eid].slot_reentry_mstatus;
   thread->prev_mepc = enclaves[eid].params.slot_entry - 4;
+  if (slottee_slot_mode_uses_rt_user_context(slot_mode)) {
+    uintptr_t user_stack_top = slottee_rt_user_stack_top(slot_id);
+    uintptr_t user_tls_base = slottee_rt_user_tls_base(slot_id);
+
+    thread->prev_csrs.sscratch = user_stack_top;
+    thread->prev_state.sp = user_stack_top;
+    thread->prev_state.tp = user_tls_base;
+  }
   thread->prev_state.t6 = slot_token;
 
   return 1;

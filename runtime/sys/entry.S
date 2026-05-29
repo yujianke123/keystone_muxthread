@@ -147,17 +147,23 @@ slottee_runtime_reenter:
   la sp, kernel_stack_end
 2:
   mv a0, t6
-  addi sp, sp, -(2*REGBYTES)
+  addi sp, sp, -(3*REGBYTES)
   STORE zero, 0(sp)
+  STORE zero, 1*REGBYTES(sp)
   mv a1, sp
+  addi a2, sp, REGBYTES
   la t0, slottee_slot_trampoline_with_arg
   jalr t0
   LOAD a1, 0(sp)
-  addi sp, sp, 2*REGBYTES
+  LOAD t4, 1*REGBYTES(sp)
+  addi sp, sp, 3*REGBYTES
   beqz a0, 1f
   mv sp, a0
 
   /* Mirror the first-boot drop from runtime S-mode into the eapp. */
+  beqz t4, 3f
+  csrw sscratch, t4
+3:
   li t0, 0x100
   csrrc x0, sstatus, t0
   csrrw sp, sscratch, sp

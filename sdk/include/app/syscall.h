@@ -66,4 +66,10 @@ slottee_lt_spawn(uintptr_t slot_id, slottee_lt_fn_t fn, void* arg);
 int
 slottee_lt_wait_value(const long* ptr, long target, uintptr_t op);
 
+int
+slottee_lt_notify_value(const long* ptr);
+
+int
+slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats);
+
 #endif /* syscall.h */

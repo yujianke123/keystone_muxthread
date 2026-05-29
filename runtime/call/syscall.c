@@ -279,7 +279,13 @@ void handle_syscall(struct encl_ctx* ctx)
     ret = slottee_lt_spawn(arg0, arg1, arg2);
     break;
   case(RUNTIME_SYSCALL_SLOTTEE_LT_WAIT_VALUE):
-    ret = slottee_lt_wait_value(arg0, arg1, arg2);
+    ret = slottee_lt_wait_value(ctx, arg0, arg1, arg2);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_NOTIFY_VALUE):
+    ret = slottee_lt_notify_value(ctx, arg0);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS):
+    ret = slottee_lt_collect_stats(arg0);
     break;
 
 

@@ -49,3 +49,13 @@ int
 slottee_lt_wait_value(const long* ptr, long target, uintptr_t op) {
   return SYSCALL_3(RUNTIME_SYSCALL_SLOTTEE_LT_WAIT_VALUE, ptr, target, op);
 }
+
+int
+slottee_lt_notify_value(const long* ptr) {
+  return SYSCALL_1(RUNTIME_SYSCALL_SLOTTEE_LT_NOTIFY_VALUE, ptr);
+}
+
+int
+slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats) {
+  return SYSCALL_1(RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS, stats);
+}
