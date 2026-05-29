@@ -41,6 +41,8 @@ static struct slot_cap_t copied_slot_cap;
 static struct slot_cap_t copied_slot_caps[SLOTTEE_MAX_SLOTS];
 static int copied_slot_cap_ready;
 static int copied_slot_cap_ready_by_slot[SLOTTEE_MAX_SLOTS];
+static struct slottee_multihart_ticket_report copied_multihart_ticket_report;
+static int copied_multihart_ticket_report_ready;
 static const uintptr_t enter_slot_bench_iters = 3;
 static const uintptr_t slottee_paper_eval_iters = 5;
 static const uintptr_t slottee_ticket_total = 20;
@@ -94,6 +96,14 @@ copy_slot_cap(void* buffer, size_t size) {
   }
 }
 
+void
+copy_multihart_ticket_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_multihart_ticket_report)) {
+    memcpy(&copied_multihart_ticket_report, buffer, size);
+    copied_multihart_ticket_report_ready = 1;
+  }
+}
+
 static int
 expect_enter_slot_status(const char* label, Keystone::Error ret, uintptr_t status,
     uintptr_t value, uintptr_t expected) {
@@ -135,7 +145,7 @@ mint_enter_slot_test_cap_with_resp(
     return Keystone::Error::DeviceError;
 
   req.version = SLOTTEE_DEBUG_VERSION;
-  req.op = SLOTTEE_DEBUG_OP_MINT_CAP;
+  req.op = slottee_debug_mint_op_value;
   req.cap = *cap;
 
   ret = enclave.slotteeDebug(req, &resp);
@@ -498,7 +508,8 @@ run_enter_slot_pthread_pool(const char* eapp_file, const char* rt_file,
 
 static Keystone::Error
 enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& cap,
-    uintptr_t flags, uintptr_t* status, uintptr_t* value, uintptr_t* lease_id);
+    uintptr_t flags, uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
+    uintptr_t* bound_hart = nullptr);
 static int
 get_copied_slot_cap(uintptr_t slot_id, slot_cap_t* cap);
 static int
@@ -615,7 +626,8 @@ run_enter_slot_lt_user(const char* eapp_file, const char* rt_file,
 
 static Keystone::Error
 enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& cap,
-    uintptr_t flags, uintptr_t* status, uintptr_t* value, uintptr_t* lease_id) {
+    uintptr_t flags, uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
+    uintptr_t* bound_hart) {
   enter_slot_req_t req = {};
   enter_slot_resp_t resp = {};
 
@@ -630,6 +642,8 @@ enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& c
     *value = resp.value;
   if (lease_id)
     *lease_id = resp.lease_id;
+  if (bound_hart)
+    *bound_hart = resp.bound_hart;
 
   return ret;
 }
@@ -699,6 +713,29 @@ enter_slot_resume_once(Keystone::Enclave& enclave, uintptr_t* status, uintptr_t*
   }
 
   return resume_ret;
+}
+
+static Keystone::Error
+enter_slot_resume_once_with_cap(
+    Keystone::Enclave& enclave, const slot_cap_t& cap, uintptr_t lease_id,
+    uintptr_t* status, uintptr_t* value)
+{
+  enter_slot_req_t req = {};
+  enter_slot_resp_t resp = {};
+  Keystone::Error ret;
+
+  req.version = SLOTTEE_ENTER_SLOT_VERSION;
+  req.cap = cap;
+  req.flags = SLOTTEE_ENTER_SLOT_FLAG_RESUME_LT_USER_OCALL;
+  req.host_nonce = lease_id;
+
+  ret = enclave.enterSlotWithRequest(req, &resp);
+  if (status)
+    *status = resp.status;
+  if (value)
+    *value = resp.value;
+
+  return ret;
 }
 
 static Keystone::Error
@@ -817,7 +854,8 @@ static Keystone::Error
 enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
     const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value,
     uintptr_t* lease_id,
-    uintptr_t* ocall_count, uintptr_t* resume_count)
+    uintptr_t* ocall_count, uintptr_t* resume_count,
+    uintptr_t* bound_hart = nullptr)
 {
   Keystone::Error ret;
 
@@ -827,7 +865,7 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
     *resume_count = 0;
 
   ret = enter_slot_request_once_with_cap(enclave, cap,
-      flags, status, value, lease_id);
+      flags, status, value, lease_id, bound_hart);
   if (ret != Keystone::Error::Success) {
     printf("[FAIL] ENTER_SLOT LT user ocall slot%lu request failed ret=%d status=%lu value=%lu lease=%lu\n",
         cap.slot_id, (int)ret, status ? *status : 0, value ? *value : 0,
@@ -853,7 +891,8 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
     }
 
     if (*status == SBI_ERR_SM_ENCLAVE_INTERRUPTED) {
-      ret = enter_slot_resume_once(enclave, status, value);
+      ret = enter_slot_resume_once_with_cap(enclave, cap,
+          lease_id ? *lease_id : 0, status, value);
       if (resume_count)
         (*resume_count)++;
       if (ret == Keystone::Error::Success &&
@@ -874,11 +913,12 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
 static Keystone::Error
 enter_slot_user_ocall_round_with_cap(Keystone::Enclave& enclave, const slot_cap_t& cap,
     uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
-    uintptr_t* ocall_count, uintptr_t* resume_count)
+    uintptr_t* ocall_count, uintptr_t* resume_count,
+    uintptr_t* bound_hart = nullptr)
 {
   return enter_slot_user_ocall_round_with_cap_and_flags(enclave, cap,
       SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, status, value, lease_id,
-      ocall_count, resume_count);
+      ocall_count, resume_count, bound_hart);
 }
 
 static Keystone::Error
@@ -3679,7 +3719,10 @@ reset_copied_slot_caps()
   memset(&copied_slot_cap, 0, sizeof(copied_slot_cap));
   memset(copied_slot_caps, 0, sizeof(copied_slot_caps));
   memset(copied_slot_cap_ready_by_slot, 0, sizeof(copied_slot_cap_ready_by_slot));
+  memset(&copied_multihart_ticket_report, 0,
+      sizeof(copied_multihart_ticket_report));
   copied_slot_cap_ready = 0;
+  copied_multihart_ticket_report_ready = 0;
 }
 
 static int
@@ -4172,6 +4215,215 @@ run_slottee_ticket_demo(const char* eapp_file,
       eapp_file, rt_file, ld_file, params);
 }
 
+struct slottee_multihart_worker_arg {
+  Keystone::Enclave* enclave;
+  slot_cap_t cap;
+  uintptr_t slot_id;
+  Keystone::Error ret;
+  uintptr_t status;
+  uintptr_t value;
+  uintptr_t lease;
+  uintptr_t bound_hart;
+  uintptr_t ocalls;
+  uintptr_t resumes;
+};
+
+static void*
+slottee_multihart_worker(void* opaque)
+{
+  slottee_multihart_worker_arg* arg =
+      (slottee_multihart_worker_arg*)opaque;
+
+  arg->ret = enter_slot_user_ocall_round_with_cap(*arg->enclave, arg->cap,
+      &arg->status, &arg->value, &arg->lease, &arg->ocalls, &arg->resumes,
+      &arg->bound_hart);
+  return NULL;
+}
+
+static int
+slottee_multihart_maybe_start_worker(Keystone::Enclave& enclave,
+    uintptr_t slot_id, pthread_t* thread,
+    slottee_multihart_worker_arg* arg, int* started)
+{
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS ||
+      slot_id >= SLOTTEE_MULTIHART_TICKET_WINDOWS + 1 ||
+      started[slot_id] || !copied_slot_cap_ready_by_slot[slot_id])
+    return 0;
+
+  memset(arg, 0, sizeof(*arg));
+  arg->enclave = &enclave;
+  arg->cap = copied_slot_caps[slot_id];
+  arg->slot_id = slot_id;
+  arg->ret = Keystone::Error::DeviceError;
+
+  if (pthread_create(thread, NULL, slottee_multihart_worker, arg) != 0) {
+    printf("[FAIL] slottee multihart failed to create slot%lu worker\n",
+        slot_id);
+    return 1;
+  }
+
+  started[slot_id] = 1;
+  return 0;
+}
+
+static int
+run_slottee_multihart_ticket(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  pthread_t worker_threads[SLOTTEE_MAX_SLOTS];
+  slottee_multihart_worker_arg worker_args[SLOTTEE_MAX_SLOTS];
+  int worker_started[SLOTTEE_MAX_SLOTS];
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  uintptr_t total_worker_ocalls = 0;
+  uintptr_t total_worker_resumes = 0;
+  Keystone::Error ret;
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  reset_copied_slot_caps();
+  memset(worker_threads, 0, sizeof(worker_threads));
+  memset(worker_args, 0, sizeof(worker_args));
+  memset(worker_started, 0, sizeof(worker_started));
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] slottee multihart ticket failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  printf("slottee_multihart_ticket,phase,host_harts,slot,bound_hart,ret,status,value,lease,ocalls,resumes\n");
+  fflush(stdout);
+
+  ret = enclave.runRaw(&value);
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < enter_slot_resume_limit * SLOTTEE_MULTIHART_TICKET_WINDOWS;
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      ocalls++;
+      for (uintptr_t slot_id = 2; slot_id <= SLOTTEE_MULTIHART_TICKET_WINDOWS;
+           slot_id++) {
+        if (slottee_multihart_maybe_start_worker(enclave, slot_id,
+                &worker_threads[slot_id], &worker_args[slot_id],
+                worker_started)) {
+          enclave.destroy();
+          return 1;
+        }
+      }
+    }
+
+    ret = enclave.resume(&value);
+    resumes++;
+  }
+
+  printf("slottee_multihart_ticket,main,%ld,1,0,%d,%lu,%lu,0,%lu,%lu\n",
+      online_harts, (int)ret,
+      ret == Keystone::Error::Success ? SBI_ERR_SM_ENCLAVE_SUCCESS : 0,
+      value, ocalls, resumes);
+  fflush(stdout);
+
+  if (ret != Keystone::Error::Success ||
+      value != SLOTTEE_LT_USER_OCALL_MAGIC) {
+    printf("[FAIL] slottee multihart main returned ret=%d value=%lu\n",
+        (int)ret, value);
+    enclave.destroy();
+    return 1;
+  }
+
+  for (uintptr_t slot_id = 2; slot_id <= SLOTTEE_MULTIHART_TICKET_WINDOWS;
+       slot_id++) {
+    if (!worker_started[slot_id]) {
+      printf("[FAIL] slottee multihart slot%lu worker was not started\n",
+          slot_id);
+      enclave.destroy();
+      return 1;
+    }
+    if (pthread_join(worker_threads[slot_id], NULL) != 0) {
+      printf("[FAIL] slottee multihart failed to join slot%lu worker\n",
+          slot_id);
+      enclave.destroy();
+      return 1;
+    }
+    total_worker_ocalls += worker_args[slot_id].ocalls;
+    total_worker_resumes += worker_args[slot_id].resumes;
+    printf("slottee_multihart_ticket,worker,%ld,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu\n",
+        online_harts, slot_id, worker_args[slot_id].bound_hart,
+        (int)worker_args[slot_id].ret, worker_args[slot_id].status,
+        worker_args[slot_id].value, worker_args[slot_id].lease,
+        worker_args[slot_id].ocalls, worker_args[slot_id].resumes);
+    fflush(stdout);
+    if (worker_args[slot_id].ret != Keystone::Error::Success ||
+        worker_args[slot_id].status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+        worker_args[slot_id].value != SLOTTEE_LT_USER_OCALL_MAGIC ||
+        worker_args[slot_id].lease == 0) {
+      printf("[FAIL] slottee multihart slot%lu worker returned unexpected result\n",
+          slot_id);
+      enclave.destroy();
+      return 1;
+    }
+  }
+
+  if (!copied_multihart_ticket_report_ready ||
+      copied_multihart_ticket_report.magic != SLOTTEE_MULTIHART_TICKET_MAGIC) {
+    printf("[FAIL] slottee multihart ticket report missing or invalid\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  printf("slottee_multihart_ticket,window,slot,hart,sold,retries,failures\n");
+  for (uintptr_t window = 0; window < SLOTTEE_MULTIHART_TICKET_WINDOWS;
+       window++) {
+    printf("slottee_multihart_ticket,%lu,%lu,%lu,%lu,0,%lu\n",
+        window + 1, window + 1, window,
+        copied_multihart_ticket_report.sold[window],
+        copied_multihart_ticket_report.failures);
+  }
+  printf("slottee_multihart_ticket,total,-,-,%lu,%lu,%lu\n",
+      copied_multihart_ticket_report.total_sold,
+      total_worker_ocalls + ocalls,
+      copied_multihart_ticket_report.failures);
+  printf("[slottee] multihart_join active_workers=%lu remaining=%lu ok=%d main_ocalls=%lu main_resumes=%lu worker_ocalls=%lu worker_resumes=%lu\n",
+      copied_multihart_ticket_report.active_workers,
+      copied_multihart_ticket_report.remaining_tickets,
+      copied_multihart_ticket_report.total_sold ==
+          SLOTTEE_MULTIHART_TICKET_TOTAL &&
+          copied_multihart_ticket_report.remaining_tickets == 0 &&
+          copied_multihart_ticket_report.active_workers == 0 &&
+          copied_multihart_ticket_report.failures == 0,
+      ocalls, resumes, total_worker_ocalls, total_worker_resumes);
+  fflush(stdout);
+
+  if (copied_multihart_ticket_report.total_sold !=
+          SLOTTEE_MULTIHART_TICKET_TOTAL ||
+      copied_multihart_ticket_report.remaining_tickets != 0 ||
+      copied_multihart_ticket_report.active_workers != 0 ||
+      copied_multihart_ticket_report.failures != 0) {
+    printf("[FAIL] slottee multihart ticket totals invalid\n");
+    enclave.destroy();
+    return 1;
+  }
+
+  for (uintptr_t window = 0; window < SLOTTEE_MULTIHART_TICKET_WINDOWS;
+       window++) {
+    if (copied_multihart_ticket_report.sold[window] == 0) {
+      printf("[FAIL] slottee multihart window %lu sold zero tickets\n",
+          window + 1);
+      enclave.destroy();
+      return 1;
+    }
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
 static int
 run_slottee_paper_eval(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
@@ -4224,6 +4476,7 @@ main(int argc, char** argv) {
         "[--enter-slot-rt-authorized-mint] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
+        "[--slottee-multihart-ticket] "
         "[--utm-ptr 0xPTR] [--retval EXPECTED]\n",
         argv[0]);
     return 0;
@@ -4275,6 +4528,7 @@ main(int argc, char** argv) {
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
+  int slottee_multihart_ticket = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
   size_t freemem_size   = 48 * 1024 * 1024;
@@ -4344,6 +4598,7 @@ main(int argc, char** argv) {
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
       {"slottee-ticket-demo", no_argument, &slottee_ticket_demo, 1},
+      {"slottee-multihart-ticket", no_argument, &slottee_multihart_ticket, 1},
       {"utm-size", required_argument, 0, 'u'},
       {"freemem-size", required_argument, 0, 'f'},
       {"retval", required_argument, 0, 'r'},
@@ -4531,6 +4786,10 @@ main(int argc, char** argv) {
 
   if (slottee_ticket_demo) {
     return run_slottee_ticket_demo(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_multihart_ticket) {
+    return run_slottee_multihart_ticket(eapp_file, rt_file, ld_file, params);
   }
 
   Keystone::Enclave enclave;

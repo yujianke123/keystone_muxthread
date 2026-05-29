@@ -134,10 +134,26 @@ _start:
 
 .global slottee_runtime_reenter
 slottee_runtime_reenter:
+  /* Use a slot-indexed RT stack before touching memory on multihart reentry. */
+  andi t0, t6, 0xff
+  la t1, slottee_runtime_stacks
+  li t2, (8 * 4096)
+  mul t3, t0, t2
+  add t1, t1, t3
+  add sp, t1, t2
+  beqz t0, 1f
+  j 2f
+1:
   la sp, kernel_stack_end
+2:
   mv a0, t6
-  la t0, slottee_slot_trampoline
+  addi sp, sp, -(2*REGBYTES)
+  STORE zero, 0(sp)
+  mv a1, sp
+  la t0, slottee_slot_trampoline_with_arg
   jalr t0
+  LOAD a1, 0(sp)
+  addi sp, sp, 2*REGBYTES
   beqz a0, 1f
   mv sp, a0
 
@@ -145,7 +161,7 @@ slottee_runtime_reenter:
   li t0, 0x100
   csrrc x0, sstatus, t0
   csrrw sp, sscratch, sp
-  li a0, 0
+  mv a0, a1
   sret
 1:
   j 1b

@@ -275,6 +275,9 @@ void handle_syscall(struct encl_ctx* ctx)
   case(RUNTIME_SYSCALL_SLOTTEE_MINT_CAP):
     ret = handle_slottee_mint_cap(arg0, arg1);
     break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_SPAWN):
+    ret = slottee_lt_spawn(arg0, arg1, arg2);
+    break;
 
 
 #ifdef USE_LINUX_SYSCALL

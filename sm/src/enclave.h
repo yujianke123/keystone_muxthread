@@ -98,6 +98,7 @@ struct enclave
   /* enclave execution context */
   unsigned int n_thread;
   uintptr_t stopped_thread_index;
+  uintptr_t stopped_threads[MAX_ENCL_THREADS];
   struct thread_state threads[MAX_ENCL_THREADS];
   int slot_reentry_ready;
   struct csrs slot_reentry_csrs;
@@ -148,6 +149,8 @@ unsigned long create_enclave(unsigned long *eid, struct keystone_sbi_create_t cr
 unsigned long destroy_enclave(enclave_id eid);
 unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid);
+unsigned long resume_enclave_slot(
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id);
 unsigned long reserve_enclave_slot(
     enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp);
 unsigned long activate_enclave_slot(

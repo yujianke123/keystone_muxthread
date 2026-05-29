@@ -58,4 +58,9 @@ int
 slottee_mint_cap(
     const struct mint_slot_cap_req_t* req, struct mint_slot_cap_resp_t* resp);
 
+typedef void (*slottee_lt_fn_t)(void*);
+
+int
+slottee_lt_spawn(uintptr_t slot_id, slottee_lt_fn_t fn, void* arg);
+
 #endif /* syscall.h */

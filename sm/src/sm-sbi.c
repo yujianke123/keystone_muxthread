@@ -80,12 +80,31 @@ unsigned long sbi_sm_enter_slot(
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL &&
-       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT)) {
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT &&
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_RESUME_LT_USER_OCALL)) {
     ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
 
   req.cap.eid = eid;
+  if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_RESUME_LT_USER_OCALL) {
+    ret = resume_enclave_slot((struct sbi_trap_regs*)regs, (enclave_id)eid,
+        req.cap.slot_id, req.host_nonce);
+    if (out_val)
+      *out_val = ret;
+    resp.status = ret;
+    if (ret == SBI_ERR_SM_ENCLAVE_SUCCESS)
+      resp.value = 0;
+    if (enter_slot_resp && copy_from_sm(enter_slot_resp, &resp, sizeof(resp)))
+      return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    if (ret == SBI_ERR_SM_ENCLAVE_SUCCESS) {
+      regs->mepc += 4;
+      sbi_trap_exit(regs);
+      return 0;
+    }
+    goto out;
+  }
+
   if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT ||
       req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_CONTEXT ||

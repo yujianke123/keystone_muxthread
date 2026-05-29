@@ -386,7 +386,8 @@ MockKeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_ECALL &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER &&
        req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL &&
-       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT)) {
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT &&
+       req.flags != SLOTTEE_ENTER_SLOT_FLAG_RESUME_LT_USER_OCALL)) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   } else if (isSlotCapMacZero(req.cap)) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_BAD_CAP;
@@ -440,6 +441,11 @@ MockKeystoneDevice::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot
     local_resp.value = SLOTTEE_LT_USER_OCALL_MAGIC;
     local_resp.lease_id = 1;
     local_resp.expiry_cycle = req.cap.max_lease_cycles;
+  } else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_RESUME_LT_USER_OCALL) {
+    local_resp.status = SBI_ERR_SM_ENCLAVE_SUCCESS;
+    local_resp.value = SLOTTEE_LT_USER_OCALL_MAGIC;
+    local_resp.lease_id = req.host_nonce;
+    local_resp.expiry_cycle = req.cap.max_lease_cycles;
   } else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_SUCCESS;
     local_resp.value = SLOTTEE_LT_USER_PAGE_FAULT_MAGIC;
@@ -488,7 +494,7 @@ MockKeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_r
       req.op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR &&
       req.op != SLOTTEE_DEBUG_OP_CAP_KEY_STATUS
 #ifdef SLOTTEE_DEBUG_MINT_ENABLE
-      && req.op != SLOTTEE_DEBUG_OP_MINT_CAP
+      && req.op != 4
 #endif
       ) {
     local_resp.status = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
@@ -500,7 +506,7 @@ MockKeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_r
     local_resp.cap_key_ready = 1;
     local_resp.cap_key_generation = 1;
 #ifdef SLOTTEE_DEBUG_MINT_ENABLE
-    if (req.op == SLOTTEE_DEBUG_OP_MINT_CAP) {
+    if (req.op == 4) {
       local_resp.cap = req.cap;
       local_resp.cap.version = SLOTTEE_ENTER_SLOT_VERSION;
       local_resp.cap.eid = 1;

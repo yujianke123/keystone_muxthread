@@ -31,7 +31,8 @@ set(slottee_fault_test_bins
 
 set(slottee_explicit_test_bins
   test-lt-user-mint-cap
-  test-lt-user-paper-eval)
+  test-lt-user-paper-eval
+  test-lt-user-multihart-ticket)
 
 # and (2) define the recipe of the test below:
 
@@ -89,6 +90,11 @@ target_link_libraries(test-lt-user-mint-cap ${KEYSTONE_LIB_EAPP})
 # SlotTEE paper-evaluation eapp: RT-authorized cap mint/export plus OCALL reentry.
 add_executable(test-lt-user-paper-eval lt-user-paper-eval/lt-user-paper-eval.c)
 target_link_libraries(test-lt-user-paper-eval ${KEYSTONE_LIB_EAPP})
+
+# SlotTEE Phase 37 multihart LT ticket demo.
+add_executable(test-lt-user-multihart-ticket
+  lt-user-multihart-ticket/lt-user-multihart-ticket.c)
+target_link_libraries(test-lt-user-multihart-ticket ${KEYSTONE_LIB_EAPP})
 
 # SlotTEE LT-aware U-mode fault probes. These are packaged for explicit
 # wrappers only; the default full tests.ke run must not intentionally fault.
@@ -289,6 +295,10 @@ file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-ticket-demo\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-paper-eval eyrie-rt loader.bin --slottee-ticket-demo\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-multihart-ticket\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-multihart-ticket eyrie-rt loader.bin --slottee-multihart-ticket\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 foreach (test IN ITEMS ${all_test_bins})

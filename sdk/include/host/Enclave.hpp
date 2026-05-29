@@ -65,6 +65,7 @@ class Enclave {
       const char* eapppath, const char* runtimepath, const char* loaderpath, Params _params,
       uintptr_t alternatePhysAddr);
   Error destroy();
+  Error runRaw(uintptr_t* ret = nullptr);
   Error run(uintptr_t* ret = nullptr);
   Error resume(uintptr_t* ret = nullptr);
   Error enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value = nullptr);

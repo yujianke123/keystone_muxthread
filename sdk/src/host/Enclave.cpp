@@ -238,6 +238,11 @@ Enclave::destroy() {
 }
 
 Error
+Enclave::runRaw(uintptr_t* retval) {
+  return pDevice->run(retval);
+}
+
+Error
 Enclave::run(uintptr_t* retval) {
   Error ret = pDevice->run(retval);
   while (ret == Error::EdgeCallHost || ret == Error::EnclaveInterrupted) {
