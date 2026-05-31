@@ -33,6 +33,7 @@ set(slottee_stress_test_bins
 
 set(slottee_explicit_test_bins
   test-lt-user-mint-cap
+  test-lt-user-policy
   test-lt-user-watchdog-ttl
   test-lt-user-paper-eval
   test-lt-user-multihart-ticket)
@@ -89,6 +90,10 @@ target_link_libraries(test-lt-user-ocall ${KEYSTONE_LIB_EAPP})
 # SlotTEE RT-authorized capability minting probe
 add_executable(test-lt-user-mint-cap lt-user-mint-cap/lt-user-mint-cap.c)
 target_link_libraries(test-lt-user-mint-cap ${KEYSTONE_LIB_EAPP})
+
+# SlotTEE runtime slot-policy syscall probe.
+add_executable(test-lt-user-policy lt-user-policy/lt-user-policy.c)
+target_link_libraries(test-lt-user-policy ${KEYSTONE_LIB_EAPP})
 
 # SlotTEE watchdog TTL probe: RT-authorized short lease for host-side expiry.
 add_executable(test-lt-user-watchdog-ttl
@@ -291,6 +296,10 @@ file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-rt-authorized-mint\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-mint-cap eyrie-rt loader.bin --enter-slot-rt-authorized-mint\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-policy\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-policy eyrie-rt loader.bin --enter-slot-policy\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-watchdog-ttl\" ]; then\n")

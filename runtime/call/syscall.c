@@ -287,6 +287,12 @@ void handle_syscall(struct encl_ctx* ctx)
   case(RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS):
     ret = slottee_lt_collect_stats(arg0);
     break;
+  case(RUNTIME_SYSCALL_SLOTTEE_SLOT_REQUEST):
+    ret = slottee_slot_request(arg0);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_SLOT_RELEASE):
+    ret = slottee_slot_release(arg0);
+    break;
 
 
 #ifdef USE_LINUX_SYSCALL

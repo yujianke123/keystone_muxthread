@@ -13,6 +13,8 @@
 #define RUNTIME_SYSCALL_SLOTTEE_LT_WAIT_VALUE 1007
 #define RUNTIME_SYSCALL_SLOTTEE_LT_NOTIFY_VALUE 1008
 #define RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS 1009
+#define RUNTIME_SYSCALL_SLOTTEE_SLOT_REQUEST 1010
+#define RUNTIME_SYSCALL_SLOTTEE_SLOT_RELEASE 1011
 #define RUNTIME_SYSCALL_EXIT                1101
 
 #define SLOTTEE_LT_WAIT_OP_EQ          0
@@ -21,6 +23,12 @@
 #define SLOTTEE_LT_WAIT_RESULT_BLOCKED 1
 #define SLOTTEE_LT_NOTIFY_RESULT_MISS  0
 #define SLOTTEE_LT_NOTIFY_RESULT_WOKE  1
+
+struct slottee_slot_policy {
+  uintptr_t max_concurrent;
+  uintptr_t affinity_hint;
+  uintptr_t priority;
+};
 
 struct slottee_lt_runtime_stats {
   uintptr_t wait_blocks;

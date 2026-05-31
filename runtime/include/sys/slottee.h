@@ -5,10 +5,14 @@
 
 struct encl_ctx;
 
+#define SLOTTEE_MAX_CONCURRENT_DEFAULT 3
+
 uintptr_t slottee_slot_trampoline(uintptr_t slot_token);
 uintptr_t slottee_slot_trampoline_with_arg(
     uintptr_t slot_token, uintptr_t* user_arg, uintptr_t* user_sp);
 void slottee_set_user_entry(uintptr_t entry);
+uintptr_t slottee_slot_request(uintptr_t policy_ptr);
+uintptr_t slottee_slot_release(uintptr_t slot_id);
 uintptr_t slottee_lt_spawn(uintptr_t slot_id, uintptr_t fn, uintptr_t arg);
 uintptr_t slottee_lt_wait_value(
     struct encl_ctx* ctx, uintptr_t user_ptr, uintptr_t target, uintptr_t op);

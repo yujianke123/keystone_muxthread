@@ -58,6 +58,12 @@ int
 slottee_mint_cap(
     const struct mint_slot_cap_req_t* req, struct mint_slot_cap_resp_t* resp);
 
+int
+slottee_slot_request(const struct slottee_slot_policy* policy);
+
+int
+slottee_slot_release(uintptr_t slot_id);
+
 typedef void (*slottee_lt_fn_t)(void*);
 
 int

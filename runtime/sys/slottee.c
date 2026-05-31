@@ -74,12 +74,21 @@ struct slottee_lt_entry {
   uintptr_t registered;
 };
 
+struct slottee_slot_policy_entry {
+  uintptr_t active;
+  uintptr_t affinity_hint;
+  uintptr_t priority;
+};
+
 static struct slottee_active_user_context slottee_active_users[SLOTTEE_MAX_SLOTS];
 uintptr_t
     slottee_runtime_stacks[SLOTTEE_MAX_SLOTS][SLOTTEE_RUNTIME_STACK_WORDS]
     __attribute__((aligned(RISCV_PAGE_SIZE)));
 static uintptr_t slottee_user_entry_point;
 static struct slottee_lt_entry slottee_lt_entries[SLOTTEE_MAX_SLOTS];
+static struct slottee_slot_policy_entry
+    slottee_slot_policy_entries[SLOTTEE_MAX_SLOTS];
+static volatile int slottee_slot_policy_lock;
 static volatile int slottee_user_memory_lock;
 static uintptr_t slottee_global_wait_user_ptr;
 static uintptr_t slottee_global_wait_target;
@@ -87,6 +96,21 @@ static uintptr_t slottee_global_wait_op;
 static uintptr_t slottee_global_wait_block_count;
 static uintptr_t slottee_global_wait_wakeup_count;
 static uintptr_t slottee_global_notify_miss_count;
+
+static void
+slottee_slot_policy_lock_acquire(void)
+{
+  while (__sync_lock_test_and_set(&slottee_slot_policy_lock, 1))
+    __asm__ volatile("nop");
+  __sync_synchronize();
+}
+
+static void
+slottee_slot_policy_lock_release(void)
+{
+  __sync_synchronize();
+  __sync_lock_release(&slottee_slot_policy_lock);
+}
 
 static void
 slottee_user_memory_lock_acquire(void)
@@ -606,6 +630,90 @@ slottee_lt_export_cap(const struct slot_cap_t* cap)
   if (edge_call->return_data.call_status != CALL_STATUS_OK)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+static uintptr_t
+slottee_slot_policy_active_count(void)
+{
+  uintptr_t slot_id;
+  uintptr_t active = 0;
+
+  for (slot_id = 1; slot_id < SLOTTEE_MAX_SLOTS; slot_id++) {
+    if (slottee_slot_policy_entries[slot_id].active)
+      active++;
+  }
+
+  return active;
+}
+
+static uintptr_t
+slottee_slot_policy_next_free_slot(void)
+{
+  uintptr_t slot_id;
+
+  for (slot_id = 1; slot_id < SLOTTEE_MAX_SLOTS; slot_id++) {
+    if (!slottee_slot_policy_entries[slot_id].active)
+      return slot_id;
+  }
+
+  return 0;
+}
+
+uintptr_t
+slottee_slot_request(uintptr_t policy_ptr)
+{
+  struct slottee_slot_policy policy = {0};
+  uintptr_t max_concurrent;
+  uintptr_t active_slots;
+  uintptr_t slot_id;
+
+  if (!policy_ptr ||
+      copy_from_user(&policy, (void*)policy_ptr, sizeof(policy)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  max_concurrent = policy.max_concurrent ?
+      policy.max_concurrent : SLOTTEE_MAX_CONCURRENT_DEFAULT;
+  if (max_concurrent >= SLOTTEE_MAX_SLOTS)
+    max_concurrent = SLOTTEE_MAX_SLOTS - 1;
+  if (max_concurrent == 0)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  slottee_slot_policy_lock_acquire();
+  active_slots = slottee_slot_policy_active_count();
+  if (active_slots >= max_concurrent) {
+    slottee_slot_policy_lock_release();
+    return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
+  }
+
+  slot_id = slottee_slot_policy_next_free_slot();
+  if (!slot_id) {
+    slottee_slot_policy_lock_release();
+    return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
+  }
+
+  slottee_slot_policy_entries[slot_id].active = 1;
+  slottee_slot_policy_entries[slot_id].affinity_hint = policy.affinity_hint;
+  slottee_slot_policy_entries[slot_id].priority = policy.priority;
+  slottee_slot_policy_lock_release();
+  return slot_id;
+}
+
+uintptr_t
+slottee_slot_release(uintptr_t slot_id)
+{
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  slottee_slot_policy_lock_acquire();
+  if (!slottee_slot_policy_entries[slot_id].active) {
+    slottee_slot_policy_lock_release();
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  }
+
+  memset(&slottee_slot_policy_entries[slot_id], 0,
+      sizeof(slottee_slot_policy_entries[slot_id]));
+  slottee_slot_policy_lock_release();
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
 }
 

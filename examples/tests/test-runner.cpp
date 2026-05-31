@@ -18,6 +18,8 @@
 
 const char* longstr = "hellohellohellohellohellohellohellohellohellohello";
 static int suppress_enclave_prints;
+static uintptr_t copied_print_value;
+static int copied_print_value_ready;
 
 unsigned long
 print_buffer(char* str) {
@@ -27,6 +29,8 @@ print_buffer(char* str) {
 
 void
 print_value(unsigned long val) {
+  copied_print_value = val;
+  copied_print_value_ready = 1;
   if (!suppress_enclave_prints)
     printf("Enclave said value: %u\n", val);
   return;
@@ -3799,6 +3803,48 @@ run_enter_slot_rt_authorized_mint(const char* eapp_file,
 }
 
 static int
+run_enter_slot_policy(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  static const uintptr_t policy_report_ok = 0x3f;
+  Keystone::Error ret;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  copied_print_value = 0;
+  copied_print_value_ready = 0;
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] slottee policy failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  ret = run_enclave_ocall_round(enclave, &value, &ocalls, &resumes);
+  printf("slottee_policy,%d,%lu,%lu,%lu,%lu\n",
+      (int)ret, value, copied_print_value, ocalls, resumes);
+  fflush(stdout);
+
+  if (ret != Keystone::Error::Success ||
+      value != SLOTTEE_LT_USER_OCALL_MAGIC ||
+      !copied_print_value_ready ||
+      copied_print_value != policy_report_ok) {
+    printf("[FAIL] slottee policy returned unexpected result report=%lu ready=%d ocalls=%lu resumes=%lu\n",
+        copied_print_value, copied_print_value_ready, ocalls, resumes);
+    enclave.destroy();
+    return 1;
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
+static int
 run_slottee_debug_mint_gate(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
 {
@@ -4931,6 +4977,7 @@ main(int argc, char** argv) {
         "[--enter-slot-cap-mac-forge] "
         "[--enter-slot-cap-generation-replay] "
         "[--enter-slot-rt-authorized-mint] "
+        "[--enter-slot-policy] "
         "[--enter-slot-watchdog-ttl] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
@@ -4987,6 +5034,7 @@ main(int argc, char** argv) {
   int enter_slot_cap_mac_forge = 0;
   int enter_slot_cap_generation_replay = 0;
   int enter_slot_rt_authorized_mint = 0;
+  int enter_slot_policy = 0;
   int enter_slot_watchdog_ttl = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
@@ -5062,6 +5110,7 @@ main(int argc, char** argv) {
        &enter_slot_cap_generation_replay, 1},
       {"enter-slot-rt-authorized-mint", no_argument,
        &enter_slot_rt_authorized_mint, 1},
+      {"enter-slot-policy", no_argument, &enter_slot_policy, 1},
       {"enter-slot-watchdog-ttl", no_argument, &enter_slot_watchdog_ttl, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
@@ -5253,6 +5302,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_rt_authorized_mint) {
     return run_enter_slot_rt_authorized_mint(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_policy) {
+    return run_enter_slot_policy(eapp_file, rt_file, ld_file, params);
   }
 
   if (enter_slot_watchdog_ttl) {
