@@ -29,6 +29,17 @@ struct slottee_lt_runtime_stats {
   uintptr_t tls_entry_ok;
   uintptr_t tls_exit_ok;
   uintptr_t tls_exit_mismatch;
+  uintptr_t user_context_entries;
+  uintptr_t user_context_exits;
+  uintptr_t syscall_traps;
+  uintptr_t ocall_traps;
+  uintptr_t ocall_resumes;
+  uintptr_t exit_traps;
+  uintptr_t fault_traps;
+  uintptr_t timer_wait_stops;
+  uintptr_t stack_entry_ok;
+  uintptr_t stack_exit_ok;
+  uintptr_t tls_resume_ok;
 };
 
 #endif  // __EYRIE_CALL_H__

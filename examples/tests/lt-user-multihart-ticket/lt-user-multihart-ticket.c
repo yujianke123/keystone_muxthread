@@ -17,6 +17,7 @@ static long wait_calls;
 static long wait_blocks;
 static long notify_calls;
 static long notify_wakes;
+static long next_ticket_index;
 static uintptr_t configured_windows;
 static uintptr_t configured_total_tickets;
 static uintptr_t configured_join_mode;
@@ -128,15 +129,22 @@ ticket_window(uintptr_t window)
   slottee_atomic_fetch_add(&sold[window], 1);
 
   while (1) {
-    long before = slottee_atomic_fetch_sub(&remaining_tickets, 1);
+    uintptr_t owner;
+    long before;
+    long ticket = slottee_atomic_fetch_add(&next_ticket_index, 1);
 
-    if (before > 0) {
-      slottee_atomic_fetch_add(&sold[window], 1);
-      continue;
+    if (ticket >= (long)configured_total_tickets)
+      break;
+
+    before = slottee_atomic_fetch_sub(&remaining_tickets, 1);
+
+    if (before <= 0) {
+      slottee_atomic_fetch_add(&remaining_tickets, 1);
+      break;
     }
 
-    slottee_atomic_fetch_add(&remaining_tickets, 1);
-    break;
+    owner = (uintptr_t)ticket % configured_windows;
+    slottee_atomic_fetch_add(&sold[owner], 1);
   }
 }
 
@@ -183,6 +191,7 @@ eapp_entry()
   slottee_atomic_store(&wait_blocks, 0);
   slottee_atomic_store(&notify_calls, 0);
   slottee_atomic_store(&notify_wakes, 0);
+  slottee_atomic_store(&next_ticket_index, (long)configured_windows);
   for (window = 0; window < SLOTTEE_MULTIHART_TICKET_MAX_WINDOWS; window++)
     slottee_atomic_store(&sold[window], 0);
 
@@ -226,6 +235,16 @@ eapp_entry()
   final_report.tls_entry_ok = rt_stats.tls_entry_ok;
   final_report.tls_exit_ok = rt_stats.tls_exit_ok;
   final_report.tls_exit_mismatch = rt_stats.tls_exit_mismatch;
+  final_report.user_context_entries = rt_stats.user_context_entries;
+  final_report.user_context_exits = rt_stats.user_context_exits;
+  final_report.syscall_traps = rt_stats.syscall_traps;
+  final_report.ocall_traps = rt_stats.ocall_traps;
+  final_report.ocall_resumes = rt_stats.ocall_resumes;
+  final_report.exit_traps = rt_stats.exit_traps;
+  final_report.timer_wait_stops = rt_stats.timer_wait_stops;
+  final_report.stack_entry_ok = rt_stats.stack_entry_ok;
+  final_report.stack_exit_ok = rt_stats.stack_exit_ok;
+  final_report.tls_resume_ok = rt_stats.tls_resume_ok;
   final_report.ready_windows = (uintptr_t)slottee_atomic_load(&ready_windows);
   final_report.total_sold = 0;
   final_report.nonzero_windows = 0;
@@ -251,6 +270,11 @@ eapp_entry()
   final_report.fairness_gap =
       final_report.max_sold >= final_report.min_sold ?
       final_report.max_sold - final_report.min_sold : 0;
+  final_report.fairness_policy = SLOTTEE_MULTIHART_FAIRNESS_POLICY_RR;
+  final_report.fairness_budget =
+      configured_total_tickets % configured_windows ? 1 : 0;
+  final_report.fairness_policy_ok =
+      final_report.fairness_gap <= final_report.fairness_budget;
   final_report.remaining_tickets =
       (uintptr_t)slottee_atomic_load(&remaining_tickets);
   final_report.active_workers = (uintptr_t)slottee_atomic_load(&active_workers);
@@ -265,6 +289,14 @@ eapp_entry()
       final_report.tls_entry_ok < configured_windows - 1 ||
       final_report.tls_exit_ok < configured_windows - 1 ||
       final_report.tls_exit_mismatch != 0 ||
+      final_report.user_context_entries < configured_windows - 1 ||
+      final_report.user_context_exits < configured_windows - 1 ||
+      final_report.syscall_traps < configured_windows - 1 ||
+      final_report.exit_traps < configured_windows - 1 ||
+      final_report.timer_wait_stops == 0 ||
+      final_report.stack_entry_ok < configured_windows - 1 ||
+      final_report.stack_exit_ok < configured_windows - 1 ||
+      !final_report.fairness_policy_ok ||
       (configured_join_mode == SLOTTEE_MULTIHART_JOIN_MODE_WAIT &&
        (final_report.wait_calls == 0 || final_report.wait_blocks == 0 ||
         final_report.wait_wakeups == 0 || final_report.notify_calls == 0 ||

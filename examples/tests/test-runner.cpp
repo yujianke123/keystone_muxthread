@@ -52,7 +52,7 @@ static const uintptr_t slottee_ticket_windows = SLOTTEE_MULTIHART_TICKET_WINDOWS
 static const uintptr_t slottee_ticket_max_windows =
     SLOTTEE_MULTIHART_TICKET_MAX_WINDOWS;
 static const uintptr_t slottee_multihart_resume_limit = 512;
-static const uintptr_t slottee_multihart_wait_budget = 4096;
+static const uintptr_t slottee_multihart_wait_budget = 65536;
 static const uintptr_t slottee_ticket_retry_limit = 128;
 static const char* slottee_null_enter_baseline_commit = "d4e1754";
 static const uintptr_t slottee_null_enter_baseline_count = 3;
@@ -4475,7 +4475,7 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
   if (ret != Keystone::Error::Success ||
       value != SLOTTEE_LT_USER_OCALL_MAGIC) {
     if (copied_multihart_ticket_report_ready) {
-      printf("[FAIL] slottee multihart report on main failure: windows=%lu total=%lu sold=%lu remaining=%lu active=%lu ready=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu notify_calls=%lu notify_wakes=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_exit_mismatch=%lu nonzero_windows=%lu fairness_gap=%lu failures=%lu\n",
+      printf("[FAIL] slottee multihart report on main failure: windows=%lu total=%lu sold=%lu remaining=%lu active=%lu ready=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_calls=%lu notify_wakes=%lu user_entries=%lu user_exits=%lu syscalls=%lu ocalls=%lu ocall_resumes=%lu exits=%lu stack_entry_ok=%lu stack_exit_ok=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_resume_ok=%lu tls_mismatch=%lu nonzero_windows=%lu fairness_gap=%lu fairness_budget=%lu fairness_policy_ok=%lu failures=%lu\n",
           copied_multihart_ticket_report.configured_windows,
           copied_multihart_ticket_report.total_tickets,
           copied_multihart_ticket_report.total_sold,
@@ -4485,13 +4485,25 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
           copied_multihart_ticket_report.wait_calls,
           copied_multihart_ticket_report.wait_blocks,
           copied_multihart_ticket_report.wait_wakeups,
+          copied_multihart_ticket_report.timer_wait_stops,
           copied_multihart_ticket_report.notify_calls,
           copied_multihart_ticket_report.notify_wakes,
+          copied_multihart_ticket_report.user_context_entries,
+          copied_multihart_ticket_report.user_context_exits,
+          copied_multihart_ticket_report.syscall_traps,
+          copied_multihart_ticket_report.ocall_traps,
+          copied_multihart_ticket_report.ocall_resumes,
+          copied_multihart_ticket_report.exit_traps,
+          copied_multihart_ticket_report.stack_entry_ok,
+          copied_multihart_ticket_report.stack_exit_ok,
           copied_multihart_ticket_report.tls_entry_ok,
           copied_multihart_ticket_report.tls_exit_ok,
+          copied_multihart_ticket_report.tls_resume_ok,
           copied_multihart_ticket_report.tls_exit_mismatch,
           copied_multihart_ticket_report.nonzero_windows,
           copied_multihart_ticket_report.fairness_gap,
+          copied_multihart_ticket_report.fairness_budget,
+          copied_multihart_ticket_report.fairness_policy_ok,
           copied_multihart_ticket_report.failures);
     }
     printf("[FAIL] slottee multihart main returned ret=%d value=%lu\n",
@@ -4556,7 +4568,42 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       copied_multihart_ticket_report.total_sold,
       total_worker_ocalls + ocalls,
       copied_multihart_ticket_report.failures);
-  printf("[slottee] multihart_join label=%s windows=%lu max_windows=%lu total_tickets=%lu active_workers=%lu ready_windows=%lu remaining=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu notify_misses=%lu notify_calls=%lu notify_wakes=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_exit_mismatch=%lu nonzero_windows=%lu min_sold=%lu max_sold=%lu fairness_gap=%lu dominant_window=%lu ok=%d main_ocalls=%lu main_resumes=%lu worker_ocalls=%lu worker_resumes=%lu\n",
+  bool multihart_ok =
+      copied_multihart_ticket_report.total_sold == total_tickets &&
+      copied_multihart_ticket_report.remaining_tickets == 0 &&
+      copied_multihart_ticket_report.active_workers == 0 &&
+      copied_multihart_ticket_report.ready_windows == windows &&
+      copied_multihart_ticket_report.nonzero_windows == windows &&
+      copied_multihart_ticket_report.failures == 0 &&
+      copied_multihart_ticket_report.wait_calls > 0 &&
+      copied_multihart_ticket_report.wait_blocks > 0 &&
+      copied_multihart_ticket_report.wait_wakeups > 0 &&
+      copied_multihart_ticket_report.notify_calls > 0 &&
+      copied_multihart_ticket_report.notify_wakes > 0 &&
+      copied_multihart_ticket_report.user_context_entries >= windows - 1 &&
+      copied_multihart_ticket_report.user_context_exits >= windows - 1 &&
+      copied_multihart_ticket_report.syscall_traps >= windows - 1 &&
+      copied_multihart_ticket_report.exit_traps >= windows - 1 &&
+      copied_multihart_ticket_report.timer_wait_stops > 0 &&
+      copied_multihart_ticket_report.stack_entry_ok >= windows - 1 &&
+      copied_multihart_ticket_report.stack_exit_ok >= windows - 1 &&
+      copied_multihart_ticket_report.tls_entry_ok >= windows - 1 &&
+      copied_multihart_ticket_report.tls_exit_ok >= windows - 1 &&
+      copied_multihart_ticket_report.tls_exit_mismatch == 0 &&
+      copied_multihart_ticket_report.max_sold >=
+          copied_multihart_ticket_report.min_sold &&
+      copied_multihart_ticket_report.fairness_gap ==
+          copied_multihart_ticket_report.max_sold -
+          copied_multihart_ticket_report.min_sold &&
+      copied_multihart_ticket_report.fairness_policy ==
+          SLOTTEE_MULTIHART_FAIRNESS_POLICY_RR &&
+      copied_multihart_ticket_report.fairness_gap <=
+          copied_multihart_ticket_report.fairness_budget &&
+      copied_multihart_ticket_report.fairness_policy_ok &&
+      copied_multihart_ticket_report.dominant_window >= 1 &&
+      copied_multihart_ticket_report.dominant_window <= windows;
+
+  printf("[slottee] multihart_join label=%s windows=%lu max_windows=%lu total_tickets=%lu active_workers=%lu ready_windows=%lu remaining=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_misses=%lu notify_calls=%lu notify_wakes=%lu user_entries=%lu user_exits=%lu syscalls=%lu ocalls=%lu ocall_resumes=%lu exits=%lu stack_entry_ok=%lu stack_exit_ok=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_resume_ok=%lu tls_exit_mismatch=%lu nonzero_windows=%lu min_sold=%lu max_sold=%lu fairness_gap=%lu fairness_budget=%lu fairness_policy=%lu fairness_policy_ok=%lu dominant_window=%lu ok=%d main_ocalls=%lu main_resumes=%lu worker_ocalls=%lu worker_resumes=%lu\n",
       label,
       copied_multihart_ticket_report.configured_windows,
       copied_multihart_ticket_report.max_windows,
@@ -4567,39 +4614,31 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       copied_multihart_ticket_report.wait_calls,
       copied_multihart_ticket_report.wait_blocks,
       copied_multihart_ticket_report.wait_wakeups,
+      copied_multihart_ticket_report.timer_wait_stops,
       copied_multihart_ticket_report.wait_notify_misses,
       copied_multihart_ticket_report.notify_calls,
       copied_multihart_ticket_report.notify_wakes,
+      copied_multihart_ticket_report.user_context_entries,
+      copied_multihart_ticket_report.user_context_exits,
+      copied_multihart_ticket_report.syscall_traps,
+      copied_multihart_ticket_report.ocall_traps,
+      copied_multihart_ticket_report.ocall_resumes,
+      copied_multihart_ticket_report.exit_traps,
+      copied_multihart_ticket_report.stack_entry_ok,
+      copied_multihart_ticket_report.stack_exit_ok,
       copied_multihart_ticket_report.tls_entry_ok,
       copied_multihart_ticket_report.tls_exit_ok,
+      copied_multihart_ticket_report.tls_resume_ok,
       copied_multihart_ticket_report.tls_exit_mismatch,
       copied_multihart_ticket_report.nonzero_windows,
       copied_multihart_ticket_report.min_sold,
       copied_multihart_ticket_report.max_sold,
       copied_multihart_ticket_report.fairness_gap,
+      copied_multihart_ticket_report.fairness_budget,
+      copied_multihart_ticket_report.fairness_policy,
+      copied_multihart_ticket_report.fairness_policy_ok,
       copied_multihart_ticket_report.dominant_window,
-      copied_multihart_ticket_report.total_sold ==
-          total_tickets &&
-          copied_multihart_ticket_report.remaining_tickets == 0 &&
-          copied_multihart_ticket_report.active_workers == 0 &&
-          copied_multihart_ticket_report.ready_windows == windows &&
-          copied_multihart_ticket_report.nonzero_windows == windows &&
-          copied_multihart_ticket_report.failures == 0 &&
-          copied_multihart_ticket_report.wait_calls > 0 &&
-          copied_multihart_ticket_report.wait_blocks > 0 &&
-          copied_multihart_ticket_report.wait_wakeups > 0 &&
-          copied_multihart_ticket_report.notify_calls > 0 &&
-          copied_multihart_ticket_report.notify_wakes > 0 &&
-          copied_multihart_ticket_report.tls_entry_ok >= windows - 1 &&
-          copied_multihart_ticket_report.tls_exit_ok >= windows - 1 &&
-          copied_multihart_ticket_report.tls_exit_mismatch == 0 &&
-          copied_multihart_ticket_report.max_sold >=
-              copied_multihart_ticket_report.min_sold &&
-          copied_multihart_ticket_report.fairness_gap ==
-              copied_multihart_ticket_report.max_sold -
-              copied_multihart_ticket_report.min_sold &&
-          copied_multihart_ticket_report.dominant_window >= 1 &&
-          copied_multihart_ticket_report.dominant_window <= windows,
+      multihart_ok,
       ocalls, resumes, total_worker_ocalls, total_worker_resumes);
   fflush(stdout);
 
@@ -4615,6 +4654,13 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       copied_multihart_ticket_report.wait_wakeups == 0 ||
       copied_multihart_ticket_report.notify_calls == 0 ||
       copied_multihart_ticket_report.notify_wakes == 0 ||
+      copied_multihart_ticket_report.user_context_entries < windows - 1 ||
+      copied_multihart_ticket_report.user_context_exits < windows - 1 ||
+      copied_multihart_ticket_report.syscall_traps < windows - 1 ||
+      copied_multihart_ticket_report.exit_traps < windows - 1 ||
+      copied_multihart_ticket_report.timer_wait_stops == 0 ||
+      copied_multihart_ticket_report.stack_entry_ok < windows - 1 ||
+      copied_multihart_ticket_report.stack_exit_ok < windows - 1 ||
       copied_multihart_ticket_report.tls_entry_ok < windows - 1 ||
       copied_multihart_ticket_report.tls_exit_ok < windows - 1 ||
       copied_multihart_ticket_report.tls_exit_mismatch != 0 ||
@@ -4623,6 +4669,11 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       copied_multihart_ticket_report.fairness_gap !=
           copied_multihart_ticket_report.max_sold -
           copied_multihart_ticket_report.min_sold ||
+      copied_multihart_ticket_report.fairness_policy !=
+          SLOTTEE_MULTIHART_FAIRNESS_POLICY_RR ||
+      copied_multihart_ticket_report.fairness_gap >
+          copied_multihart_ticket_report.fairness_budget ||
+      !copied_multihart_ticket_report.fairness_policy_ok ||
       copied_multihart_ticket_report.dominant_window == 0 ||
       copied_multihart_ticket_report.dominant_window > windows) {
     printf("[FAIL] slottee multihart ticket totals invalid\n");

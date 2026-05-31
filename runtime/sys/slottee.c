@@ -61,6 +61,10 @@ struct slottee_active_user_context {
   uintptr_t wait_block_count;
   uintptr_t wait_wakeup_count;
   uintptr_t wait_notify_miss_count;
+  uintptr_t timer_wait_stop_count;
+  uintptr_t user_stack_entry_ok;
+  uintptr_t user_stack_exit_ok;
+  uintptr_t tls_resume_ok;
 };
 
 struct slottee_lt_entry {
@@ -339,6 +343,10 @@ slottee_activate_user_context(uintptr_t slot_id, uintptr_t lease_id, uintptr_t m
   user->wait_block_count = 0;
   user->wait_wakeup_count = 0;
   user->wait_notify_miss_count = 0;
+  user->timer_wait_stop_count = 0;
+  user->user_stack_entry_ok = 0;
+  user->user_stack_exit_ok = 0;
+  user->tls_resume_ok = 0;
 
   if (slottee_mode_is_user_ocall(mode))
     slottee_prepare_user_memory(user, slot_id);
@@ -364,6 +372,10 @@ slottee_active_user_prepare_user_entry(
       user->user_tls_base, user->user_tls_size);
   if (user_sp)
     *user_sp = user->user_stack_top;
+  user->user_stack_entry_ok = user_sp &&
+      *user_sp == user->user_stack_top &&
+      slottee_user_addr_in_range(*user_sp - 1, user->user_stack_base,
+          SLOTTEE_USER_STACK_SIZE);
 
   __asm__ volatile("csrw sepc, %0" :: "r"(entry));
   __asm__ volatile("csrw sscratch, %0" :: "r"(user->user_stack_top));
@@ -405,6 +417,7 @@ slottee_active_user_record_ocall_resume(struct encl_ctx* ctx, uintptr_t value)
     return;
 
   user->ocall_resume_count++;
+  user->tls_resume_ok += ctx->regs.tp == user->entry_tls_base ? 1 : 0;
 }
 
 static int
@@ -449,17 +462,21 @@ slottee_active_user_exit(struct encl_ctx* ctx, uintptr_t value)
   user->exit_trap_count++;
   user->tls_exit_ok = user->last_trap_user_tp == user->entry_tls_base;
   user->tls_exit_mismatch += user->tls_exit_ok ? 0 : 1;
+  user->user_stack_exit_ok = slottee_user_addr_in_range(user->last_trap_user_sp,
+      user->user_stack_base, SLOTTEE_USER_STACK_SIZE);
   if (!slottee_active_user_ocall_exit_ok(user, value))
     value = SLOTTEE_LT_USER_ILLEGAL_MAGIC;
 
   if (slottee_mode_is_user_ocall(user->mode)) {
-    printf("[slottee] lt_user_exit slot=%lu value=%lu syscalls=%lu ocalls=%lu resumes=%lu exits=%lu faults=%lu sp=0x%lx tp=0x%lx tls_entry=%lu tls_exit=%lu tls_mismatch=%lu wait_blocks=%lu wait_wakeups=%lu notify_misses=%lu\r\n",
+    printf("[slottee] lt_user_exit slot=%lu value=%lu syscalls=%lu ocalls=%lu resumes=%lu exits=%lu faults=%lu sp=0x%lx tp=0x%lx stack_entry=%lu stack_exit=%lu tls_entry=%lu tls_exit=%lu tls_resume=%lu tls_mismatch=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_misses=%lu\r\n",
         user->slot_id, value, user->syscall_trap_count,
         user->ocall_trap_count, user->ocall_resume_count,
         user->exit_trap_count, user->fault_trap_count,
         user->last_trap_user_sp, user->last_trap_user_tp,
-        user->tls_entry_ok, user->tls_exit_ok, user->tls_exit_mismatch,
-        user->wait_block_count, user->wait_wakeup_count,
+        user->user_stack_entry_ok, user->user_stack_exit_ok,
+        user->tls_entry_ok, user->tls_exit_ok, user->tls_resume_ok,
+        user->tls_exit_mismatch, user->wait_block_count, user->wait_wakeup_count,
+        user->timer_wait_stop_count,
         user->wait_notify_miss_count);
   }
 
@@ -659,6 +676,7 @@ slottee_lt_wait_value(
     user->wait_target = target;
     user->wait_op = op;
     user->wait_block_count++;
+    user->timer_wait_stop_count++;
   } else {
     slottee_global_wait_user_ptr = user_ptr;
     slottee_global_wait_target = target;
@@ -728,6 +746,7 @@ slottee_lt_collect_stats(uintptr_t stats_ptr)
   stats.wait_blocks = slottee_global_wait_block_count;
   stats.wait_wakeups = slottee_global_wait_wakeup_count;
   stats.notify_misses = slottee_global_notify_miss_count;
+  stats.timer_wait_stops = slottee_global_wait_block_count;
 
   for (slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
     struct slottee_active_user_context* user = &slottee_active_users[slot];
@@ -738,6 +757,17 @@ slottee_lt_collect_stats(uintptr_t stats_ptr)
     stats.tls_entry_ok += user->tls_entry_ok;
     stats.tls_exit_ok += user->tls_exit_ok;
     stats.tls_exit_mismatch += user->tls_exit_mismatch;
+    stats.user_context_entries += user->enter_count;
+    stats.user_context_exits += user->exit_trap_count;
+    stats.syscall_traps += user->syscall_trap_count;
+    stats.ocall_traps += user->ocall_trap_count;
+    stats.ocall_resumes += user->ocall_resume_count;
+    stats.exit_traps += user->exit_trap_count;
+    stats.fault_traps += user->fault_trap_count;
+    stats.timer_wait_stops += user->timer_wait_stop_count;
+    stats.stack_entry_ok += user->user_stack_entry_ok;
+    stats.stack_exit_ok += user->user_stack_exit_ok;
+    stats.tls_resume_ok += user->tls_resume_ok;
   }
 
   if (copy_to_user((void*)stats_ptr, &stats, sizeof(stats)))

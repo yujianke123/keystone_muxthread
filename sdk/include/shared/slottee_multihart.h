@@ -9,6 +9,7 @@
 #define SLOTTEE_MULTIHART_TICKET_MAX_TOTAL   64
 #define SLOTTEE_MULTIHART_TICKET_MAGIC       0x51513737
 #define SLOTTEE_MULTIHART_TICKET_CONFIG_MAGIC 0x51513838
+#define SLOTTEE_MULTIHART_FAIRNESS_POLICY_RR 1
 #define SLOTTEE_MULTIHART_JOIN_MODE_SPIN     0
 #define SLOTTEE_MULTIHART_JOIN_MODE_WAIT     1
 
@@ -35,11 +36,24 @@ struct slottee_multihart_ticket_report {
   uintptr_t tls_entry_ok;
   uintptr_t tls_exit_ok;
   uintptr_t tls_exit_mismatch;
+  uintptr_t user_context_entries;
+  uintptr_t user_context_exits;
+  uintptr_t syscall_traps;
+  uintptr_t ocall_traps;
+  uintptr_t ocall_resumes;
+  uintptr_t exit_traps;
+  uintptr_t timer_wait_stops;
+  uintptr_t stack_entry_ok;
+  uintptr_t stack_exit_ok;
+  uintptr_t tls_resume_ok;
   uintptr_t ready_windows;
   uintptr_t nonzero_windows;
   uintptr_t min_sold;
   uintptr_t max_sold;
   uintptr_t fairness_gap;
+  uintptr_t fairness_policy;
+  uintptr_t fairness_budget;
+  uintptr_t fairness_policy_ok;
   uintptr_t dominant_window;
   uintptr_t total_sold;
   uintptr_t remaining_tickets;
