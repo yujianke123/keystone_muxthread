@@ -270,6 +270,26 @@ KeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_resp_
   return Error::Success;
 }
 
+Error
+KeystoneDevice::leaseWatchdogCheck(uintptr_t* status, uintptr_t* reclaimed) {
+  struct keystone_ioctl_lease_watchdog_check encl;
+  memset(&encl, 0, sizeof(encl));
+  encl.eid = eid;
+
+  if (ioctl(fd, KEYSTONE_IOC_LEASE_WATCHDOG_CHECK, &encl)) {
+    return Error::IoctlErrorLeaseWatchdogCheck;
+  }
+
+  if (status) {
+    *status = encl.status;
+  }
+  if (reclaimed) {
+    *reclaimed = encl.reclaimed;
+  }
+
+  return Error::Success;
+}
+
 void*
 KeystoneDevice::map(uintptr_t addr, size_t size) {
   assert(fd >= 0);
@@ -524,6 +544,17 @@ MockKeystoneDevice::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_r
 
   if (resp) {
     *resp = local_resp;
+  }
+  return Error::Success;
+}
+
+Error
+MockKeystoneDevice::leaseWatchdogCheck(uintptr_t* status, uintptr_t* reclaimed) {
+  if (status) {
+    *status = SBI_ERR_SM_ENCLAVE_SUCCESS;
+  }
+  if (reclaimed) {
+    *reclaimed = 1;
   }
   return Error::Success;
 }

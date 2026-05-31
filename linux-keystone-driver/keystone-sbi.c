@@ -44,3 +44,9 @@ struct sbiret sbi_sm_slottee_debug(
       SBI_SM_SLOTTEE_DEBUG,
       eid, (unsigned long) req, (unsigned long) resp, 0, 0, 0);
 }
+
+struct sbiret sbi_sm_lease_watchdog_check(unsigned long eid) {
+  return sbi_ecall(SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE,
+      SBI_SM_LEASE_WATCHDOG_CHECK,
+      eid, 0, 0, 0, 0, 0);
+}

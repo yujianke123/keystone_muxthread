@@ -312,6 +312,11 @@ Enclave::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_resp_t* resp
   return pDevice->slotteeDebug(req, resp);
 }
 
+Error
+Enclave::leaseWatchdogCheck(uintptr_t* status, uintptr_t* reclaimed) {
+  return pDevice->leaseWatchdogCheck(status, reclaimed);
+}
+
 void*
 Enclave::getSharedBuffer() {
   return shared_buffer;

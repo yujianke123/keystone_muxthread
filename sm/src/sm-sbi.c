@@ -216,6 +216,16 @@ unsigned long sbi_sm_slottee_debug(
   return ret;
 }
 
+unsigned long sbi_sm_lease_watchdog_check(unsigned long *out_val, unsigned long eid)
+{
+  unsigned long reclaimed = lease_watchdog_check((enclave_id)eid);
+
+  if (out_val)
+    *out_val = reclaimed;
+
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
 unsigned long sbi_sm_mint_slot_cap(
     unsigned long *out_val, uintptr_t mint_req, uintptr_t mint_resp)
 {

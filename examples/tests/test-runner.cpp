@@ -67,6 +67,9 @@ static const uintptr_t enter_slot_active_revoke_probe_limit = 128;
 static const uintptr_t slottee_debug_mint_op_value = 4;
 static const unsigned int enter_slot_active_revoke_mark_delay_us = 2000;
 static const unsigned int enter_slot_active_revoke_ready_settle_us = 1000;
+static const uintptr_t enter_slot_watchdog_ttl_rounds = 3;
+static const uintptr_t enter_slot_watchdog_ttl =
+    SLOTTEE_SM_WATCHDOG_TTL_CYCLES;
 
 void
 print_hex(void* buffer, size_t len) {
@@ -199,6 +202,17 @@ wait_for_enter_slot_ttl(uintptr_t cycles) {
   do {
     asm volatile("rdcycle %0" : "=r"(now));
   } while ((now - start) < cycles);
+}
+
+static void
+wait_until_enter_slot_expiry(uintptr_t expiry_cycle)
+{
+  uintptr_t now = 0;
+  uintptr_t target = expiry_cycle + SLOTTEE_TEST_MAX_LEASE_CYCLES;
+
+  do {
+    asm volatile("rdcycle %0" : "=r"(now));
+  } while (now < target);
 }
 
 static uintptr_t
@@ -521,7 +535,7 @@ run_enter_slot_pthread_pool(const char* eapp_file, const char* rt_file,
 static Keystone::Error
 enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& cap,
     uintptr_t flags, uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
-    uintptr_t* bound_hart = nullptr);
+    uintptr_t* bound_hart = nullptr, uintptr_t* expiry_cycle = nullptr);
 static int
 get_copied_slot_cap(uintptr_t slot_id, slot_cap_t* cap);
 static Keystone::Error
@@ -645,7 +659,7 @@ run_enter_slot_lt_user(const char* eapp_file, const char* rt_file,
 static Keystone::Error
 enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& cap,
     uintptr_t flags, uintptr_t* status, uintptr_t* value, uintptr_t* lease_id,
-    uintptr_t* bound_hart) {
+    uintptr_t* bound_hart, uintptr_t* expiry_cycle) {
   enter_slot_req_t req = {};
   enter_slot_resp_t resp = {};
 
@@ -662,6 +676,8 @@ enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& c
     *lease_id = resp.lease_id;
   if (bound_hart)
     *bound_hart = resp.bound_hart;
+  if (expiry_cycle)
+    *expiry_cycle = resp.expiry_cycle;
 
   return ret;
 }
@@ -687,6 +703,28 @@ slottee_debug_once(Keystone::Enclave& enclave, uintptr_t op, slottee_debug_resp_
   req.version = SLOTTEE_DEBUG_VERSION;
   req.op = op;
   return enclave.slotteeDebug(req, resp);
+}
+
+static int
+slottee_watchdog_debug_row(uintptr_t round, const char* phase, Keystone::Error ret,
+    const slottee_debug_resp_t& resp, uintptr_t expected_n_thread,
+    uintptr_t expected_busy_slots, uintptr_t expected_expired)
+{
+  printf("watchdog_ttl,%lu,%s,debug,%d,%lu,%lu,%lu,%lu,%lu\n", round,
+      phase, (int)ret, resp.status, resp.epoch, resp.n_thread,
+      resp.busy_slots, resp.lease_expired_count);
+  fflush(stdout);
+
+  if (ret != Keystone::Error::Success ||
+      resp.status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+      resp.n_thread != expected_n_thread ||
+      resp.busy_slots != expected_busy_slots ||
+      resp.lease_expired_count != expected_expired) {
+    printf("[FAIL] watchdog_ttl debug %s returned unexpected state\n", phase);
+    return 1;
+  }
+
+  return 0;
 }
 
 static int
@@ -1127,6 +1165,123 @@ run_enter_slot_lt_user_ocall_same_enclave(const char* eapp_file, const char* rt_
   }
 
   enclave.destroy();
+  return 0;
+}
+
+static int
+run_enter_slot_watchdog_ttl(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params)
+{
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+
+  printf("watchdog_ttl,round,phase,ret,status,value,lease,reclaimed,expired,busy,n_thread\n");
+  fflush(stdout);
+
+  for (uintptr_t round = 1; round <= enter_slot_watchdog_ttl_rounds; round++) {
+    Keystone::Enclave enclave;
+    slottee_debug_resp_t debug_resp = {};
+    slot_cap_t cap;
+    uintptr_t status = 0;
+    uintptr_t value = 0;
+    uintptr_t lease = 0;
+    uintptr_t expiry_cycle = 0;
+    uintptr_t seed_value = 0;
+    uintptr_t seed_ocalls = 0;
+    uintptr_t seed_resumes = 0;
+    uintptr_t watchdog_status = 0;
+    uintptr_t reclaimed = 0;
+    Keystone::Error ret;
+
+    if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+        Keystone::Error::Success) {
+      printf("[FAIL] ENTER_SLOT watchdog_ttl failed to init enclave round %lu\n",
+          round);
+      return 1;
+    }
+    edge_init(&enclave);
+
+    ret = seed_rt_authorized_caps(enclave, 1, &seed_value, &seed_ocalls,
+        &seed_resumes, NULL);
+    if (ret != Keystone::Error::Success || get_copied_slot_cap(1, &cap)) {
+      printf("[FAIL] watchdog_ttl failed to seed RT-authorized cap round %lu ret=%d value=%lu ocalls=%lu resumes=%lu\n",
+          round, (int)ret, seed_value, seed_ocalls, seed_resumes);
+      enclave.destroy();
+      return 1;
+    }
+    if (cap.max_lease_cycles != enter_slot_watchdog_ttl) {
+      printf("[FAIL] watchdog_ttl expected short cap TTL %lu got %lu round %lu\n",
+          enter_slot_watchdog_ttl, cap.max_lease_cycles, round);
+      enclave.destroy();
+      return 1;
+    }
+
+    ret = enter_slot_request_once_with_cap(enclave, cap,
+        SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value, &lease,
+        nullptr, &expiry_cycle);
+    printf("watchdog_ttl,%lu,enter,%d,%lu,%lu,%lu,0,0,0,0\n",
+        round, (int)ret, status, value, lease);
+    fflush(stdout);
+    if (ret != Keystone::Error::Success ||
+        status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || lease == 0) {
+      printf("[FAIL] watchdog_ttl expected first slot entry to stop on OCALL round %lu\n",
+          round);
+      enclave.destroy();
+      return 1;
+    }
+
+    ret = slottee_debug_once(enclave, SLOTTEE_DEBUG_OP_REENTRY_STATUS,
+        &debug_resp);
+    if (slottee_watchdog_debug_row(round, "before_expiry", ret, debug_resp,
+            0, 1, 0)) {
+      enclave.destroy();
+      return 1;
+    }
+
+    wait_until_enter_slot_expiry(expiry_cycle);
+
+    ret = enclave.leaseWatchdogCheck(&watchdog_status, &reclaimed);
+    printf("watchdog_ttl,%lu,watchdog,%d,%lu,0,0,%lu,0,0,0\n",
+        round, (int)ret, watchdog_status, reclaimed);
+    fflush(stdout);
+    if (ret != Keystone::Error::Success ||
+        watchdog_status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
+        reclaimed != 1) {
+      printf("[FAIL] watchdog_ttl expected watchdog to reclaim one expired lease round %lu\n",
+          round);
+      enclave.destroy();
+      return 1;
+    }
+
+    ret = slottee_debug_once(enclave, SLOTTEE_DEBUG_OP_REENTRY_STATUS,
+        &debug_resp);
+    if (slottee_watchdog_debug_row(round, "after_expiry", ret, debug_resp,
+            0, 0, 1)) {
+      enclave.destroy();
+      return 1;
+    }
+
+    ret = enter_slot_request_once_with_cap(enclave, cap,
+        SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL, &status, &value, &lease);
+    printf("watchdog_ttl,%lu,old_cap_replay,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+        round, (int)ret, status, value, lease, reclaimed,
+        debug_resp.lease_expired_count, debug_resp.busy_slots,
+        debug_resp.n_thread);
+    fflush(stdout);
+    if (ret != Keystone::Error::Success ||
+        status != SBI_ERR_SM_ENCLAVE_NOT_FRESH) {
+      printf("[FAIL] watchdog_ttl expected stale cap replay rejection after epoch advance round %lu\n",
+          round);
+      enclave.destroy();
+      return 1;
+    }
+
+    if (enclave.destroy() != Keystone::Error::Success) {
+      printf("[FAIL] watchdog_ttl failed clean destroy round %lu\n", round);
+      return 1;
+    }
+  }
+
   return 0;
 }
 
@@ -4776,6 +4931,7 @@ main(int argc, char** argv) {
         "[--enter-slot-cap-mac-forge] "
         "[--enter-slot-cap-generation-replay] "
         "[--enter-slot-rt-authorized-mint] "
+        "[--enter-slot-watchdog-ttl] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
@@ -4831,6 +4987,7 @@ main(int argc, char** argv) {
   int enter_slot_cap_mac_forge = 0;
   int enter_slot_cap_generation_replay = 0;
   int enter_slot_rt_authorized_mint = 0;
+  int enter_slot_watchdog_ttl = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
@@ -4905,6 +5062,7 @@ main(int argc, char** argv) {
        &enter_slot_cap_generation_replay, 1},
       {"enter-slot-rt-authorized-mint", no_argument,
        &enter_slot_rt_authorized_mint, 1},
+      {"enter-slot-watchdog-ttl", no_argument, &enter_slot_watchdog_ttl, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
       {"slottee-ticket-demo", no_argument, &slottee_ticket_demo, 1},
@@ -5095,6 +5253,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_rt_authorized_mint) {
     return run_enter_slot_rt_authorized_mint(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_watchdog_ttl) {
+    return run_enter_slot_watchdog_ttl(eapp_file, rt_file, ld_file, params);
   }
 
   if (slottee_debug_mint_gate) {

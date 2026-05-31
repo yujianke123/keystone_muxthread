@@ -18,6 +18,7 @@
 #define SBI_SM_ENTER_SLOT        2006
 #define SBI_SM_MARK_REVOKE       2007
 #define SBI_SM_SLOTTEE_DEBUG     2008
+#define SBI_SM_LEASE_WATCHDOG_CHECK 2009
 #define FID_RANGE_HOST           2999
 
 #define SLOTTEE_ENTER_SLOT_VERSION     1
@@ -38,6 +39,7 @@
 #define SLOTTEE_DEFAULT_CAP_SEQ        1
 #define SLOTTEE_DEFAULT_MAX_LEASE_CYCLES ((uintptr_t)-1 / 4)
 #define SLOTTEE_TEST_MAX_LEASE_CYCLES  1024
+#define SLOTTEE_SM_WATCHDOG_TTL_CYCLES (SLOTTEE_TEST_MAX_LEASE_CYCLES * 65536)
 #define SLOTTEE_CAP_MAC_WORDS          4
 #define SLOTTEE_MAX_SLOTS              8
 #define SLOTTEE_SLOT_TOKEN_SLOT_BITS   8
@@ -232,6 +234,7 @@ struct slottee_debug_resp_t {
   uintptr_t epoch;
   uintptr_t n_thread;
   uintptr_t busy_slots;
+  uintptr_t lease_expired_count;
   uintptr_t cap_key_ready;
   uintptr_t cap_key_generation;
   struct slot_cap_t cap;

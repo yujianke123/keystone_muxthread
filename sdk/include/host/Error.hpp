@@ -30,6 +30,7 @@ enum class Error {
   EnclaveNotResumable,
   EnclaveBadCap,
   IoctlErrorSlotteeDebug,
+  IoctlErrorLeaseWatchdogCheck,
 };
 
 }  // namespace Keystone

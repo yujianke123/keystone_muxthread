@@ -38,6 +38,7 @@ typedef enum {
   SLOT_LEASE_ACTIVE = 2,
   SLOT_LEASE_EXITING = 3,
   SLOT_LEASE_REVOKED = 4,
+  SLOT_LEASE_EXPIRED = 5,
 } slot_lease_state;
 
 struct slot_lease_t
@@ -106,6 +107,7 @@ struct enclave
 
   uintptr_t next_slot_lease_id;
   uintptr_t current_slot_epoch;
+  uintptr_t lease_expired_count;
   struct slot_lease_t slot_leases[SLOTTEE_MAX_SLOTS];
   byte cap_key[MDSIZE];
   uintptr_t cap_key_ready;
@@ -159,6 +161,7 @@ unsigned long mark_revoke_enclave_slot(
     enclave_id eid, const struct mark_revoke_req_t *req, struct mark_revoke_resp_t *resp);
 unsigned long debug_enclave_slot_state(
     enclave_id eid, const struct slottee_debug_req_t *req, struct slottee_debug_resp_t *resp);
+unsigned long lease_watchdog_check(enclave_id eid);
 void enter_activated_enclave_slot(
     struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
     uintptr_t slot_mode);

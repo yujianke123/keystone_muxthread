@@ -207,6 +207,7 @@ static void clear_enclave_slot_leases(enclave_id eid)
 
   enclaves[eid].next_slot_lease_id = 1;
   enclaves[eid].current_slot_epoch = SLOTTEE_INITIAL_EPOCH;
+  enclaves[eid].lease_expired_count = 0;
   for(slot = 0; slot < SLOTTEE_MAX_SLOTS; slot++) {
     enclaves[eid].slot_leases[slot].slot_id = slot;
     enclaves[eid].slot_leases[slot].lease_id = 0;
@@ -229,10 +230,37 @@ static void revoke_enclave_slot_lease(struct slot_lease_t *lease)
 {
   lease->rights = 0;
   lease->max_lease_cycles = 0;
+  lease->expiry_cycle = 0;
   lease->active_hart = 0;
   lease->thread_index = 0;
   lease->revoke_pending = 0;
   lease->state = SLOT_LEASE_REVOKED;
+}
+
+static void expire_enclave_slot_lease(enclave_id eid, struct slot_lease_t *lease)
+{
+  uintptr_t thread_index;
+
+  if (!lease)
+    return;
+
+  thread_index = lease->thread_index;
+  if (thread_index < MAX_ENCL_THREADS)
+    enclaves[eid].stopped_threads[thread_index] = 0;
+  if (enclaves[eid].stopped_thread_index == thread_index)
+    enclaves[eid].stopped_thread_index = 0;
+
+  lease->rights = 0;
+  lease->max_lease_cycles = 0;
+  lease->expiry_cycle = 0;
+  lease->active_hart = 0;
+  lease->thread_index = 0;
+  lease->revoke_pending = 0;
+  lease->state = SLOT_LEASE_EXPIRED;
+  enclaves[eid].lease_expired_count++;
+
+  if (enclaves[eid].n_thread == 0 && enclaves[eid].state == RUNNING)
+    enclaves[eid].state = STOPPED;
 }
 
 static void free_enclave_slot_lease(struct slot_lease_t *lease)
@@ -440,22 +468,26 @@ static void revoke_all_enclave_slot_leases(enclave_id eid)
     enclaves[eid].current_slot_epoch++;
 }
 
-static void reclaim_expired_enclave_slot_leases(enclave_id eid, uintptr_t now)
+static uintptr_t reclaim_expired_enclave_slot_leases(enclave_id eid, uintptr_t now)
 {
   size_t slot;
-  int revoked = 0;
+  uintptr_t reclaimed = 0;
 
   for(slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
     struct slot_lease_t *lease = &enclaves[eid].slot_leases[slot];
 
-    if (lease->state == SLOT_LEASE_RESERVED && now >= lease->expiry_cycle) {
-      revoke_enclave_slot_lease(lease);
-      revoked = 1;
+    if ((lease->state == SLOT_LEASE_RESERVED ||
+         slot_lease_is_stopped(lease)) &&
+        lease->expiry_cycle && now >= lease->expiry_cycle) {
+      expire_enclave_slot_lease(eid, lease);
+      reclaimed++;
     }
   }
 
-  if (revoked)
+  if (reclaimed)
     enclaves[eid].current_slot_epoch++;
+
+  return reclaimed;
 }
 
 /****************************
@@ -1279,6 +1311,7 @@ out:
       resp->epoch = enclaves[eid].current_slot_epoch;
       resp->n_thread = enclaves[eid].n_thread;
       resp->busy_slots = count_busy_slot_leases(eid);
+      resp->lease_expired_count = enclaves[eid].lease_expired_count;
       resp->cap_key_ready = enclaves[eid].cap_key_ready;
       resp->cap_key_generation = enclaves[eid].cap_key_generation;
     } else {
@@ -1286,6 +1319,7 @@ out:
       resp->epoch = 0;
       resp->n_thread = 0;
       resp->busy_slots = 0;
+      resp->lease_expired_count = 0;
       resp->cap_key_ready = 0;
       resp->cap_key_generation = 0;
       resp->cap = (struct slot_cap_t) {0};
@@ -1293,6 +1327,18 @@ out:
   }
   spin_unlock(&encl_lock);
   return ret;
+}
+
+unsigned long lease_watchdog_check(enclave_id eid)
+{
+  unsigned long reclaimed = 0;
+
+  spin_lock(&encl_lock);
+  if (ENCLAVE_EXISTS(eid) && enclaves[eid].state >= FRESH)
+    reclaimed = reclaim_expired_enclave_slot_leases(eid, read_cycle());
+  spin_unlock(&encl_lock);
+
+  return reclaimed;
 }
 
 void enter_activated_enclave_slot(
@@ -1453,6 +1499,7 @@ unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave
     enclaves[eid].n_thread--;
     if(enclaves[eid].n_thread == 0)
       enclaves[eid].state = STOPPED;
+    reclaim_expired_enclave_slot_leases(eid, read_cycle());
   }
   spin_unlock(&encl_lock);
 
@@ -1497,6 +1544,10 @@ unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid)
    */
   thread_index = enclaves[eid].stopped_threads[0] ?
       0 : enclaves[eid].stopped_thread_index;
+  if (thread_index != 0)
+    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+
+  reclaim_expired_enclave_slot_leases(eid, read_cycle());
   if (thread_index != 0)
     lease = find_active_slot_lease_by_thread_index(eid, thread_index);
 
@@ -1557,6 +1608,14 @@ unsigned long resume_enclave_slot(
     complete_pending_revoke_enclave_slot(eid, lease);
     if (thread_index < MAX_ENCL_THREADS)
       enclaves[eid].stopped_threads[thread_index] = 0;
+    spin_unlock(&encl_lock);
+    return SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE;
+  }
+
+  if (lease && lease->expiry_cycle && read_cycle() >= lease->expiry_cycle) {
+    save_enclave_slot_reentry_template(eid, thread_index);
+    expire_enclave_slot_lease(eid, lease);
+    enclaves[eid].current_slot_epoch++;
     spin_unlock(&encl_lock);
     return SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE;
   }

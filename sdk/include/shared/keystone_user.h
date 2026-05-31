@@ -32,6 +32,8 @@
   _IOR(KEYSTONE_IOC_MAGIC, 0x09, struct keystone_ioctl_mark_revoke)
 #define KEYSTONE_IOC_SLOTTEE_DEBUG \
   _IOR(KEYSTONE_IOC_MAGIC, 0x0a, struct keystone_ioctl_slottee_debug)
+#define KEYSTONE_IOC_LEASE_WATCHDOG_CHECK \
+  _IOR(KEYSTONE_IOC_MAGIC, 0x0b, struct keystone_ioctl_lease_watchdog_check)
 
 #define RT_NOEXEC 0
 #define USER_NOEXEC 1
@@ -81,6 +83,12 @@ struct keystone_ioctl_slottee_debug {
   uintptr_t eid;
   struct slottee_debug_req_t req;
   struct slottee_debug_resp_t resp;
+};
+
+struct keystone_ioctl_lease_watchdog_check {
+  uintptr_t eid;
+  uintptr_t status;
+  uintptr_t reclaimed;
 };
 
 #endif

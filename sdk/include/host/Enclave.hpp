@@ -82,6 +82,7 @@ class Enclave {
   Error enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp);
   Error markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch = nullptr);
   Error slotteeDebug(const slottee_debug_req_t& req, slottee_debug_resp_t* resp);
+  Error leaseWatchdogCheck(uintptr_t* status, uintptr_t* reclaimed);
 };
 
 uint64_t

@@ -42,6 +42,9 @@ sbi_sm_slottee_debug(
     uintptr_t debug_resp);
 
 unsigned long
+sbi_sm_lease_watchdog_check(unsigned long *out_val, unsigned long eid);
+
+unsigned long
 sbi_sm_mint_slot_cap(
     unsigned long *out_val, uintptr_t mint_req, uintptr_t mint_resp);
 

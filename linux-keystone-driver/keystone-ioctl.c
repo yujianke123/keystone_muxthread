@@ -315,6 +315,36 @@ int keystone_slottee_debug(unsigned long data)
   return 0;
 }
 
+int keystone_lease_watchdog_check(unsigned long data)
+{
+  struct sbiret ret;
+  struct keystone_ioctl_lease_watchdog_check *arg =
+      (struct keystone_ioctl_lease_watchdog_check*) data;
+  unsigned long ueid = arg->eid;
+  struct enclave* enclave;
+  enclave = get_enclave_by_id(ueid);
+
+  if (!enclave)
+  {
+    keystone_err("invalid enclave id\n");
+    return -EINVAL;
+  }
+
+  if (enclave->eid < 0) {
+    keystone_err("real enclave does not exist\n");
+    return -EINVAL;
+  }
+
+  arg->status = 0;
+  arg->reclaimed = 0;
+
+  ret = sbi_sm_lease_watchdog_check(enclave->eid);
+  arg->status = ret.error;
+  arg->reclaimed = ret.value;
+
+  return 0;
+}
+
 long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 {
   long ret;
@@ -355,6 +385,9 @@ long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
       break;
     case KEYSTONE_IOC_SLOTTEE_DEBUG:
       ret = keystone_slottee_debug((unsigned long) data);
+      break;
+    case KEYSTONE_IOC_LEASE_WATCHDOG_CHECK:
+      ret = keystone_lease_watchdog_check((unsigned long) data);
       break;
     /* Note that following commands could have been implemented as a part of ADD_PAGE ioctl.
      * However, there was a weird bug in compiler that generates a wrong control flow
