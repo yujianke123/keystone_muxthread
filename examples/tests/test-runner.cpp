@@ -4927,6 +4927,175 @@ run_slottee_multihart_stress(const char* eapp_file,
   return 0;
 }
 
+static const uintptr_t slottee_host_dos_rounds = 10;
+static const unsigned int slottee_host_dos_settle_us = 20000;
+
+static int
+run_slottee_host_dos_case(const char* label, uintptr_t started_workers,
+    const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  pthread_t worker_threads[2];
+  slottee_multihart_worker_arg worker_args[2];
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+  Keystone::Error destroy_ret = Keystone::Error::DeviceError;
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+  bool caps_ready = false;
+  uintptr_t retry_limit = slottee_multihart_wait_budget * 2 + 32;
+
+  if (started_workers > 2) {
+    printf("[FAIL] %s invalid worker count %lu\n", label, started_workers);
+    return 1;
+  }
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  reset_copied_slot_caps();
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] %s failed to init enclave\n", label);
+    return 1;
+  }
+
+  edge_init(&enclave);
+  slottee_multihart_set_config(slottee_ticket_windows, slottee_ticket_total,
+      SLOTTEE_MULTIHART_JOIN_MODE_WAIT, slottee_multihart_wait_budget);
+  memset(worker_threads, 0, sizeof(worker_threads));
+  memset(worker_args, 0, sizeof(worker_args));
+
+  ret = enclave.runRaw(&value);
+  for (uintptr_t retry = 0;
+       retry < retry_limit &&
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted);
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      ocalls++;
+    }
+
+    if (slottee_multihart_all_worker_caps_ready(slottee_ticket_windows)) {
+      caps_ready = true;
+      break;
+    }
+
+    ret = enclave.resume(&value);
+    resumes++;
+  }
+
+  printf("host_dos,%s,seed,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      label, (int)ret, value, ocalls, resumes,
+      slottee_ticket_windows, started_workers, online_harts);
+  fflush(stdout);
+
+  if (!caps_ready && !slottee_multihart_all_worker_caps_ready(slottee_ticket_windows)) {
+    printf("[FAIL] %s failed to reach caps-ready state value=%lu ocalls=%lu resumes=%lu ret=%d\n",
+        label, value, ocalls, resumes, (int)ret);
+    enclave.destroy();
+    return 1;
+  }
+
+  for (uintptr_t worker = 0; worker < started_workers; worker++) {
+    uintptr_t slot_id = worker + 2;
+
+    if (get_copied_slot_cap(slot_id, &worker_args[worker].cap)) {
+      printf("[FAIL] %s missing copied cap for slot%lu\n", label, slot_id);
+      enclave.destroy();
+      return 1;
+    }
+
+    worker_args[worker].enclave = &enclave;
+    worker_args[worker].slot_id = slot_id;
+    worker_args[worker].ret = Keystone::Error::DeviceError;
+    worker_args[worker].status = 0;
+    worker_args[worker].value = 0;
+    worker_args[worker].lease = 0;
+    worker_args[worker].bound_hart = 0;
+    worker_args[worker].ocalls = 0;
+    worker_args[worker].resumes = 0;
+
+    if (pthread_create(&worker_threads[worker], NULL, slottee_multihart_worker,
+            &worker_args[worker]) != 0) {
+      printf("[FAIL] %s failed to create worker thread for slot%lu\n",
+          label, slot_id);
+      enclave.destroy();
+      return 1;
+    }
+  }
+
+  sched_yield();
+  usleep(slottee_host_dos_settle_us);
+
+  for (uintptr_t worker = 0; worker < started_workers; worker++) {
+    if (pthread_join(worker_threads[worker], NULL) != 0) {
+      printf("[FAIL] %s failed to join worker %lu\n", label, worker + 2);
+      return 1;
+    }
+    printf("host_dos,%s,worker,%lu,%d,%lu,%lu,%lu,%lu,%lu\n",
+        label, worker + 2, (int)worker_args[worker].ret,
+        worker_args[worker].status, worker_args[worker].value,
+        worker_args[worker].lease, worker_args[worker].ocalls,
+        worker_args[worker].resumes);
+    fflush(stdout);
+  }
+
+  destroy_ret = enclave.destroy();
+  printf("host_dos,%s,destroy,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      label, (int)destroy_ret, value, ocalls, resumes,
+      slottee_ticket_windows, started_workers, online_harts);
+  fflush(stdout);
+  if (destroy_ret != Keystone::Error::Success) {
+    printf("[FAIL] %s destroy failed\n", label);
+  }
+
+  if (destroy_ret != Keystone::Error::Success) {
+    return 1;
+  }
+
+  Keystone::Enclave probe;
+  if (probe.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] %s failed to re-init probe enclave after destroy\n", label);
+    return 1;
+  }
+
+  edge_init(&probe);
+  if (probe.destroy() != Keystone::Error::Success) {
+    printf("[FAIL] %s probe destroy failed\n", label);
+    return 1;
+  }
+
+  return 0;
+}
+
+static int
+run_slottee_host_dos_stress(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params)
+{
+  for (uintptr_t round = 1; round <= slottee_host_dos_rounds; round++) {
+    char label[48];
+
+    snprintf(label, sizeof(label), "host_dos_a_%lu", round);
+    if (run_slottee_host_dos_case(label, 0, eapp_file, rt_file, ld_file, params))
+      return 1;
+
+    snprintf(label, sizeof(label), "host_dos_b_%lu", round);
+    if (run_slottee_host_dos_case(label, 1, eapp_file, rt_file, ld_file, params))
+      return 1;
+
+    snprintf(label, sizeof(label), "host_dos_c_%lu", round);
+    if (run_slottee_host_dos_case(label, 2, eapp_file, rt_file, ld_file, params))
+      return 1;
+  }
+
+  return 0;
+}
+
 static int
 run_slottee_paper_eval(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
@@ -4983,6 +5152,7 @@ main(int argc, char** argv) {
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
         "[--slottee-multihart-ticket-max] "
+        "[--slottee-host-dos-stress] "
         "[--slottee-multihart-stress] "
         "[--slottee-multihart-windows N] "
         "[--slottee-multihart-tickets N] "
@@ -5041,6 +5211,7 @@ main(int argc, char** argv) {
   int slottee_ticket_demo = 0;
   int slottee_multihart_ticket = 0;
   int slottee_multihart_ticket_max = 0;
+  int slottee_host_dos_stress = 0;
   int slottee_multihart_stress = 0;
 
   size_t untrusted_size = 2 * 1024 * 1024;
@@ -5118,6 +5289,7 @@ main(int argc, char** argv) {
       {"slottee-multihart-ticket", no_argument, &slottee_multihart_ticket, 1},
       {"slottee-multihart-ticket-max", no_argument,
        &slottee_multihart_ticket_max, 1},
+      {"slottee-host-dos-stress", no_argument, &slottee_host_dos_stress, 1},
       {"slottee-multihart-stress", no_argument, &slottee_multihart_stress, 1},
       {"slottee-multihart-windows", required_argument, 0, 'W'},
       {"slottee-multihart-tickets", required_argument, 0, 'T'},
@@ -5335,6 +5507,10 @@ main(int argc, char** argv) {
 
   if (slottee_multihart_ticket_max) {
     return run_slottee_multihart_ticket_max(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_host_dos_stress) {
+    return run_slottee_host_dos_stress(eapp_file, rt_file, ld_file, params);
   }
 
   if (slottee_multihart_stress) {
