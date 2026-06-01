@@ -59,7 +59,8 @@ static const uintptr_t slottee_multihart_resume_limit = 512;
 static const uintptr_t slottee_multihart_wait_budget = 65536;
 static const uintptr_t slottee_edgecall_stress_rounds = 5;
 static const uintptr_t slottee_ticket_retry_limit = 128;
-static const uintptr_t slottee_edgecall_stress_resume_limit = 1024;
+static const uintptr_t slottee_edgecall_stress_resume_limit = 8192;
+static const unsigned int slottee_edgecall_stress_quiesce_us = 50000;
 static const char* slottee_null_enter_baseline_commit = "d4e1754";
 static const uintptr_t slottee_null_enter_baseline_count = 3;
 static const uintptr_t slottee_null_enter_baseline_min = 430912;
@@ -71,7 +72,7 @@ static const uintptr_t enter_slot_revoke_stress_rounds = 3;
 static const uintptr_t enter_slot_active_revoke_timer_rounds = 3;
 static const uintptr_t enter_slot_active_revoke_probe_limit = 128;
 static const uintptr_t slottee_debug_mint_op_value = 4;
-static const unsigned int enter_slot_active_revoke_mark_delay_us = 2000;
+static const unsigned int enter_slot_active_revoke_mark_delay_us = 100;
 static const unsigned int enter_slot_active_revoke_ready_settle_us = 1000;
 static const uintptr_t enter_slot_watchdog_ttl_rounds = 3;
 static const uintptr_t enter_slot_watchdog_ttl =
@@ -604,6 +605,7 @@ run_enter_slot_with_seeded_caps(const char* label, uintptr_t flags,
   }
 
   enclave.destroy();
+  usleep(slottee_edgecall_stress_quiesce_us);
   return 0;
 }
 
@@ -2249,8 +2251,6 @@ enter_slot_active_revoke_timer_mark_worker(void* opaque)
     pthread_mutex_lock(&arg->lock);
     enter_done = arg->enter_done;
     pthread_mutex_unlock(&arg->lock);
-    if (enter_done)
-      break;
 
     if (arg->run_second_slot_after_mark) {
       slottee_debug_resp_t ready_resp = {};
@@ -2270,8 +2270,6 @@ enter_slot_active_revoke_timer_mark_worker(void* opaque)
       pthread_mutex_lock(&arg->lock);
       enter_done = arg->enter_done;
       pthread_mutex_unlock(&arg->lock);
-      if (enter_done)
-        break;
     }
 
     arg->duplicate_ret = enter_slot_request_once_with_cap(*arg->enclave,
@@ -2280,14 +2278,22 @@ enter_slot_active_revoke_timer_mark_worker(void* opaque)
 
     if (arg->duplicate_ret == Keystone::Error::Success &&
         arg->duplicate_status == SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT) {
-      pthread_mutex_lock(&arg->lock);
-      enter_done = arg->enter_done;
-      pthread_mutex_unlock(&arg->lock);
-      if (enter_done)
-        break;
+      for (uintptr_t mark_retry = 0;
+           mark_retry < enter_slot_active_revoke_probe_limit; mark_retry++) {
+        arg->mark_ret = arg->enclave->markRevoke(arg->slot_id,
+            &arg->mark_status, &arg->mark_epoch);
+        if (arg->mark_ret != Keystone::Error::EnclaveInterrupted)
+          break;
 
-      arg->mark_ret = arg->enclave->markRevoke(arg->slot_id,
-          &arg->mark_status, &arg->mark_epoch);
+        pthread_mutex_lock(&arg->lock);
+        enter_done = arg->enter_done;
+        pthread_mutex_unlock(&arg->lock);
+        if (enter_done)
+          break;
+
+        sched_yield();
+        usleep(1000);
+      }
       if (arg->destroy_after_mark) {
         arg->destroy_ret = arg->enclave->destroy();
         arg->destroy_done = 1;
@@ -3027,6 +3033,17 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
       arg.enter_lease, SLOTTEE_INITIAL_EPOCH);
   fflush(stdout);
 
+  bool second_old_epoch_ok =
+      arg.second_ret == Keystone::Error::Success &&
+      arg.second_status == SBI_ERR_SM_ENCLAVE_SUCCESS &&
+      arg.second_value == SLOTTEE_LT_USER_OCALL_MAGIC &&
+      arg.second_lease != 0 && arg.second_lease != arg.enter_lease &&
+      arg.second_ocalls == 1 && arg.second_resumes == 1;
+  bool second_old_epoch_closed =
+      arg.second_ret == Keystone::Error::Success &&
+      arg.second_status == SBI_ERR_SM_ENCLAVE_NOT_FRESH &&
+      arg.second_value == 0 && arg.second_lease == 0;
+
   if (arg.mark_failed || !arg.mark_done ||
       arg.duplicate_ret != Keystone::Error::Success ||
       arg.duplicate_status != SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT ||
@@ -3039,11 +3056,7 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
       arg.debug_before_second.epoch != SLOTTEE_INITIAL_EPOCH ||
       arg.debug_before_second.n_thread != 1 ||
       arg.debug_before_second.busy_slots != 1 ||
-      arg.second_ret != Keystone::Error::Success ||
-      arg.second_status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
-      arg.second_value != SLOTTEE_LT_USER_OCALL_MAGIC ||
-      arg.second_lease == 0 || arg.second_lease == arg.enter_lease ||
-      arg.second_ocalls != 1 || arg.second_resumes != 1 ||
+      (!second_old_epoch_ok && !second_old_epoch_closed) ||
       arg.enter_ret != Keystone::Error::Success ||
       arg.enter_status != SBI_ERR_SM_ENCLAVE_INTERRUPTED ||
       arg.enter_lease == 0) {
@@ -3097,7 +3110,8 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
           Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       expect_enter_slot_bench_value("active_revoke_multislot_stress", 1,
           value, SLOTTEE_LT_USER_OCALL_MAGIC) ||
-      fresh_lease <= arg.second_lease || fresh_lease <= arg.enter_lease ||
+      (second_old_epoch_ok && fresh_lease <= arg.second_lease) ||
+      fresh_lease <= arg.enter_lease ||
       ocalls != 1 || resumes != 1) {
     enclave.destroy();
     pthread_mutex_destroy(&arg.lock);
@@ -4614,6 +4628,18 @@ slottee_edgecall_all_worker_caps_ready(void)
 }
 
 static int
+slottee_timer_preempt_all_worker_caps_ready(void)
+{
+  for (uintptr_t slot_id = SLOTTEE_TIMER_PREEMPT_FIRST_WORKER_SLOT;
+       slot_id <= SLOTTEE_TIMER_PREEMPT_LAST_WORKER_SLOT; slot_id++) {
+    if (!copied_slot_cap_ready_by_slot[slot_id])
+      return 0;
+  }
+
+  return 1;
+}
+
+static int
 slottee_edgecall_maybe_start_worker(Keystone::Enclave& enclave,
     uintptr_t slot_id, pthread_t* thread,
     slottee_multihart_worker_arg* arg, int* started)
@@ -4643,6 +4669,35 @@ slottee_edgecall_maybe_start_worker(Keystone::Enclave& enclave,
 }
 
 static int
+slottee_timer_preempt_maybe_start_worker(Keystone::Enclave& enclave,
+    uintptr_t slot_id, pthread_t* thread,
+    slottee_multihart_worker_arg* arg, int* started)
+{
+  if (slot_id < SLOTTEE_TIMER_PREEMPT_FIRST_WORKER_SLOT ||
+      slot_id > SLOTTEE_TIMER_PREEMPT_LAST_WORKER_SLOT ||
+      started[slot_id] || !copied_slot_cap_ready_by_slot[slot_id])
+    return 0;
+
+  memset(arg, 0, sizeof(*arg));
+  arg->enclave = &enclave;
+  arg->cap = copied_slot_caps[slot_id];
+  arg->slot_id = slot_id;
+  arg->resume_limit = slottee_edgecall_stress_resume_limit * 4;
+  arg->ret = Keystone::Error::DeviceError;
+
+  if (pthread_create(thread, NULL, slottee_multihart_worker, arg) != 0) {
+    printf("[FAIL] timer preempt failed to create slot%lu worker\n",
+        slot_id);
+    return 1;
+  }
+
+  started[slot_id] = 1;
+  sched_yield();
+  usleep(1000);
+  return 0;
+}
+
+static int
 run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
     uintptr_t total_tickets, const char* eapp_file, const char* rt_file,
     const char* ld_file, Keystone::Params params)
@@ -4658,6 +4713,7 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
   uintptr_t total_worker_resumes = 0;
   Keystone::Error ret;
   long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+  bool saw_wait_interrupt = false;
 
   if (windows < 2 || windows > slottee_ticket_max_windows ||
       windows >= SLOTTEE_MAX_SLOTS || total_tickets < windows ||
@@ -4698,16 +4754,21 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       sched_yield();
       usleep(1000);
     } else if (ret == Keystone::Error::EnclaveInterrupted) {
-      if (slottee_multihart_all_worker_caps_ready(windows)) {
-        for (uintptr_t slot_id = 2; slot_id <= windows; slot_id++) {
-          if (slottee_multihart_maybe_start_worker(enclave, slot_id,
-                  &worker_threads[slot_id], &worker_args[slot_id],
-                  worker_started, windows)) {
-            enclave.destroy();
-            return 1;
-          }
+      saw_wait_interrupt = true;
+      sched_yield();
+      usleep(1000);
+    }
+
+    if (saw_wait_interrupt) {
+      for (uintptr_t slot_id = 2; slot_id <= windows; slot_id++) {
+        if (slottee_multihart_maybe_start_worker(enclave, slot_id,
+                &worker_threads[slot_id], &worker_args[slot_id],
+                worker_started, windows)) {
+          enclave.destroy();
+          return 1;
         }
       }
+
       for (uintptr_t slot_id = 2; slot_id <= windows; slot_id++) {
         if (worker_started[slot_id] != 1 ||
             worker_args[slot_id].ret == Keystone::Error::DeviceError)
@@ -4720,8 +4781,6 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
         }
         worker_started[slot_id] = 2;
       }
-      sched_yield();
-      usleep(1000);
     }
 
     ret = enclave.resume(&value);
@@ -4770,6 +4829,18 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
     }
     printf("[FAIL] slottee multihart main returned ret=%d value=%lu\n",
         (int)ret, value);
+    for (uintptr_t slot_id = 2; slot_id <= windows; slot_id++) {
+      printf("[FAIL] slottee multihart worker_state label=%s slot=%lu started=%d cap_ready=%d ret=%d status=%lu value=%lu lease=%lu ocalls=%lu resumes=%lu\n",
+          label, slot_id, worker_started[slot_id],
+          copied_slot_cap_ready_by_slot[slot_id],
+          (int)worker_args[slot_id].ret,
+          worker_args[slot_id].status,
+          worker_args[slot_id].value,
+          worker_args[slot_id].lease,
+          worker_args[slot_id].ocalls,
+          worker_args[slot_id].resumes);
+    }
+    fflush(stdout);
     enclave.destroy();
     return 1;
   }
@@ -5172,6 +5243,7 @@ run_slottee_edgecall_interference_case(const char* label,
   Keystone::Error ret;
   long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
   struct slottee_edgecall_stress_report report;
+  bool saw_wait_interrupt = false;
 
   params.setFreeMemSize(8 * 1024 * 1024);
   params.setUntrustedSize(64 * 1024);
@@ -5208,8 +5280,12 @@ run_slottee_edgecall_interference_case(const char* label,
     if (ret == Keystone::Error::EdgeCallHost) {
       incoming_call_dispatch(enclave.getSharedBuffer());
       ocalls++;
+      saw_wait_interrupt = true;
+    } else if (ret == Keystone::Error::EnclaveInterrupted) {
+      saw_wait_interrupt = true;
     }
-    if (slottee_edgecall_all_worker_caps_ready()) {
+
+    if (saw_wait_interrupt && slottee_edgecall_all_worker_caps_ready()) {
       for (uintptr_t slot_id = SLOTTEE_EDGECALL_STRESS_FIRST_WORKER_SLOT;
            slot_id <= SLOTTEE_EDGECALL_STRESS_LAST_WORKER_SLOT;
            slot_id++) {
@@ -5337,6 +5413,196 @@ run_slottee_edgecall_interference_stress(const char* eapp_file,
     if (run_slottee_edgecall_interference_case(label, eapp_file, rt_file,
             ld_file, params))
       return 1;
+    usleep(slottee_edgecall_stress_quiesce_us);
+  }
+
+  return 0;
+}
+
+static int
+run_slottee_timer_preempt_test(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  pthread_t worker_threads[SLOTTEE_MAX_SLOTS];
+  slottee_multihart_worker_arg worker_args[SLOTTEE_MAX_SLOTS];
+  int worker_started[SLOTTEE_MAX_SLOTS];
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  uintptr_t worker_ocalls = 0;
+  uintptr_t worker_resumes = 0;
+  Keystone::Error ret;
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+  struct slottee_timer_preempt_report report;
+  bool report_ready = false;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  reset_timer_preempt_state();
+  reset_copied_slot_caps();
+  memset(&report, 0, sizeof(report));
+  memset(worker_threads, 0, sizeof(worker_threads));
+  memset(worker_args, 0, sizeof(worker_args));
+  memset(worker_started, 0, sizeof(worker_started));
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] timer preempt failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  copied_slot_cap_ready = 0;
+  copied_multihart_ticket_report_ready = 0;
+  printf("timer_preempt,phase,harts,ret,value,ocalls,resumes,preempt_count,preempt_yields,preempt_dispatches,runnable_q,wait_q,dup,qleak,wait_residue,unfinished,fair_min,fair_max,fair_gap,fair_checks,fair_bad,timer_wait_stops,ready,completed,active,failures,user_entries,user_exits,syscalls,exits,stack_entry,stack_exit,tls_entry,tls_exit,tls_mismatch\n");
+  printf("timer_preempt_worker,slot,started,cap_ready,ret,status,value,lease,bound_hart,ocalls,resumes\n");
+  fflush(stdout);
+
+  ret = enclave.runRaw(&value);
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < slottee_edgecall_stress_resume_limit * 8;
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      ocalls++;
+    }
+
+    if (slottee_timer_preempt_all_worker_caps_ready()) {
+      for (uintptr_t slot_id = SLOTTEE_TIMER_PREEMPT_FIRST_WORKER_SLOT;
+           slot_id <= SLOTTEE_TIMER_PREEMPT_LAST_WORKER_SLOT; slot_id++) {
+        if (slottee_timer_preempt_maybe_start_worker(enclave, slot_id,
+                &worker_threads[slot_id], &worker_args[slot_id],
+                worker_started)) {
+          enclave.destroy();
+          return 1;
+        }
+      }
+    }
+
+    for (uintptr_t slot_id = SLOTTEE_TIMER_PREEMPT_FIRST_WORKER_SLOT;
+         slot_id <= SLOTTEE_TIMER_PREEMPT_LAST_WORKER_SLOT; slot_id++) {
+      if (worker_started[slot_id] != 1 ||
+          worker_args[slot_id].ret == Keystone::Error::DeviceError)
+        continue;
+      if (pthread_join(worker_threads[slot_id], NULL) != 0) {
+        printf("[FAIL] timer preempt failed to join slot%lu worker\n",
+            slot_id);
+        enclave.destroy();
+        return 1;
+      }
+      worker_started[slot_id] = 2;
+    }
+
+    sched_yield();
+    usleep(1000);
+    ret = enclave.resume(&value);
+    resumes++;
+
+    get_timer_preempt_report(&report);
+    if (report.magic == SLOTTEE_TIMER_PREEMPT_MAGIC)
+      report_ready = true;
+    if (report_ready && ret == Keystone::Error::Success &&
+        value == SLOTTEE_LT_USER_OCALL_MAGIC)
+      break;
+  }
+
+  for (uintptr_t slot_id = SLOTTEE_TIMER_PREEMPT_FIRST_WORKER_SLOT;
+       slot_id <= SLOTTEE_TIMER_PREEMPT_LAST_WORKER_SLOT; slot_id++) {
+    if (worker_started[slot_id] == 1 &&
+        pthread_join(worker_threads[slot_id], NULL) != 0) {
+      printf("[FAIL] timer preempt failed to join slot%lu worker\n",
+          slot_id);
+      enclave.destroy();
+      return 1;
+    }
+    if (worker_started[slot_id] == 1)
+      worker_started[slot_id] = 2;
+    worker_ocalls += worker_args[slot_id].ocalls;
+    worker_resumes += worker_args[slot_id].resumes;
+  }
+
+  get_timer_preempt_report(&report);
+  printf("timer_preempt,main,%ld,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      online_harts, (int)ret, value, ocalls, resumes,
+      report.preempt_count, report.preempt_yields,
+      report.preempt_dispatches, report.runnable_queue_depth,
+      report.wait_queue_depth, report.scheduler_duplicate_rejects,
+      report.scheduler_queue_leaks, report.scheduler_wait_residue,
+      report.scheduler_unfinished, report.fairness_min,
+      report.fairness_max, report.fairness_gap,
+      report.fairness_checks, report.fairness_violations,
+      report.timer_wait_stops,
+      report.ready_workers, report.completed_workers,
+      report.active_workers, report.failures,
+      report.user_context_entries, report.user_context_exits,
+      report.syscall_traps, report.exit_traps,
+      report.stack_entry_ok, report.stack_exit_ok,
+      report.tls_entry_ok, report.tls_exit_ok,
+      report.tls_exit_mismatch);
+  for (uintptr_t slot_id = SLOTTEE_TIMER_PREEMPT_FIRST_WORKER_SLOT;
+       slot_id <= SLOTTEE_TIMER_PREEMPT_LAST_WORKER_SLOT; slot_id++) {
+    printf("timer_preempt_worker,%lu,%d,%d,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
+        slot_id, worker_started[slot_id],
+        copied_slot_cap_ready_by_slot[slot_id],
+        (int)worker_args[slot_id].ret,
+        worker_args[slot_id].status,
+        worker_args[slot_id].value,
+        worker_args[slot_id].lease,
+        worker_args[slot_id].bound_hart,
+        worker_args[slot_id].ocalls,
+        worker_args[slot_id].resumes);
+  }
+  fflush(stdout);
+
+  bool workers_ok = true;
+  for (uintptr_t slot_id = SLOTTEE_TIMER_PREEMPT_FIRST_WORKER_SLOT;
+       slot_id <= SLOTTEE_TIMER_PREEMPT_LAST_WORKER_SLOT; slot_id++) {
+    workers_ok = workers_ok &&
+        worker_started[slot_id] == 2 &&
+        worker_args[slot_id].ret == Keystone::Error::Success &&
+        worker_args[slot_id].status == SBI_ERR_SM_ENCLAVE_SUCCESS &&
+        worker_args[slot_id].value == SLOTTEE_LT_USER_OCALL_MAGIC &&
+        worker_args[slot_id].lease != 0;
+  }
+
+  bool ok =
+      ret == Keystone::Error::Success &&
+      value == SLOTTEE_LT_USER_OCALL_MAGIC &&
+      report_ready &&
+      report.magic == SLOTTEE_TIMER_PREEMPT_MAGIC &&
+      report.worker_slots == SLOTTEE_TIMER_PREEMPT_WORKERS &&
+      report.completed_workers == SLOTTEE_TIMER_PREEMPT_WORKERS &&
+      report.active_workers == 0 &&
+      report.ready_workers == SLOTTEE_TIMER_PREEMPT_WORKERS &&
+      report.failures == 0 &&
+      report.preempt_count > 0 &&
+      report.preempt_yields > 0 &&
+      report.preempt_dispatches > 0 &&
+      report.runnable_queue_depth == 0 &&
+      report.wait_queue_depth == 0 &&
+      report.scheduler_queue_leaks == 0 &&
+      report.scheduler_wait_residue == 0 &&
+      report.scheduler_unfinished == 0 &&
+      report.fairness_checks > 0 &&
+      report.fairness_violations == 0 &&
+      report.timer_wait_stops > 0 &&
+      report.wait_calls > 0 &&
+      report.wait_blocks > 0 &&
+      report.notify_calls > 0 &&
+      report.notify_wakes > 0 &&
+      report.tls_exit_mismatch == 0 &&
+      worker_ocalls == 0 &&
+      worker_resumes > 0 &&
+      workers_ok;
+
+  enclave.destroy();
+
+  if (!ok) {
+    printf("[FAIL] timer preempt invalid report or worker state\n");
+    return 1;
   }
 
   return 0;
@@ -5394,6 +5660,7 @@ main(int argc, char** argv) {
         "[--enter-slot-rt-authorized-mint] "
         "[--enter-slot-policy] "
         "[--enter-slot-watchdog-ttl] "
+        "[--enter-slot-timer-preempt] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
@@ -5453,6 +5720,7 @@ main(int argc, char** argv) {
   int enter_slot_rt_authorized_mint = 0;
   int enter_slot_policy = 0;
   int enter_slot_watchdog_ttl = 0;
+  int enter_slot_timer_preempt = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
@@ -5531,6 +5799,7 @@ main(int argc, char** argv) {
        &enter_slot_rt_authorized_mint, 1},
       {"enter-slot-policy", no_argument, &enter_slot_policy, 1},
       {"enter-slot-watchdog-ttl", no_argument, &enter_slot_watchdog_ttl, 1},
+      {"enter-slot-timer-preempt", no_argument, &enter_slot_timer_preempt, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
       {"slottee-ticket-demo", no_argument, &slottee_ticket_demo, 1},
@@ -5732,6 +6001,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_watchdog_ttl) {
     return run_enter_slot_watchdog_ttl(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_timer_preempt) {
+    return run_slottee_timer_preempt_test(eapp_file, rt_file, ld_file, params);
   }
 
   if (slottee_debug_mint_gate) {

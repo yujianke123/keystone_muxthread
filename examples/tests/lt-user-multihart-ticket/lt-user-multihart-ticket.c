@@ -18,6 +18,7 @@ static long wait_blocks;
 static long notify_calls;
 static long notify_wakes;
 static long next_ticket_index;
+static long host_start_gate;
 static uintptr_t configured_windows;
 static uintptr_t configured_total_tickets;
 static uintptr_t configured_join_mode;
@@ -124,6 +125,22 @@ wait_until_value(const long* ptr, long target, uintptr_t op)
 }
 
 static void
+wait_block_once(const long* ptr, long target, uintptr_t op)
+{
+  int ret;
+
+  if (configured_join_mode != SLOTTEE_MULTIHART_JOIN_MODE_WAIT)
+    return;
+
+  ret = slottee_lt_wait_value(ptr, target, op);
+  slottee_atomic_fetch_add(&wait_calls, 1);
+  if (ret == SLOTTEE_LT_WAIT_RESULT_BLOCKED)
+    slottee_atomic_fetch_add(&wait_blocks, 1);
+  else if (ret != SLOTTEE_LT_WAIT_RESULT_READY)
+    slottee_atomic_fetch_add(&failures, 1);
+}
+
+static void
 ticket_window(uintptr_t window)
 {
   slottee_atomic_fetch_add(&sold[window], 1);
@@ -192,6 +209,7 @@ eapp_entry()
   slottee_atomic_store(&notify_calls, 0);
   slottee_atomic_store(&notify_wakes, 0);
   slottee_atomic_store(&next_ticket_index, (long)configured_windows);
+  slottee_atomic_store(&host_start_gate, 0);
   for (window = 0; window < SLOTTEE_MULTIHART_TICKET_MAX_WINDOWS; window++)
     slottee_atomic_store(&sold[window], 0);
 
@@ -202,6 +220,10 @@ eapp_entry()
         SBI_ERR_SM_ENCLAVE_SUCCESS)
       slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
   }
+
+  wait_block_once(&host_start_gate, 1, SLOTTEE_LT_WAIT_OP_GE);
+  slottee_atomic_store(&host_start_gate, 1);
+  notify_value(&host_start_gate);
 
   slottee_atomic_fetch_add(&active_workers, 1);
   slottee_atomic_fetch_add(&ready_windows, 1);

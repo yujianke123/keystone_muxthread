@@ -136,7 +136,7 @@ unsigned long sbi_sm_enter_slot(
     else if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_REVOKE_FAULT)
       slot_mode = SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT;
 
-    ret = activate_enclave_slot((enclave_id) eid, &req.cap, &resp);
+    ret = activate_enclave_slot((enclave_id) eid, &req.cap, slot_mode, &resp);
     resp.value = 0;
     if (out_val)
       *out_val = 0;

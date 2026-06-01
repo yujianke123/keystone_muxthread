@@ -30,7 +30,8 @@ set(slottee_fault_test_bins
 set(slottee_stress_test_bins
   test-lt-user-busy-revoke
   test-lt-user-first-busy-revoke
-  test-lt-user-edgecall-stress)
+  test-lt-user-edgecall-stress
+  test-lt-user-timer-preempt)
 
 set(slottee_explicit_test_bins
   test-lt-user-mint-cap
@@ -133,6 +134,10 @@ target_link_libraries(test-lt-user-first-busy-revoke ${KEYSTONE_LIB_EAPP})
 add_executable(test-lt-user-edgecall-stress
   lt-user-edgecall-stress/lt-user-edgecall-stress.c)
 target_link_libraries(test-lt-user-edgecall-stress ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-timer-preempt
+  lt-user-timer-preempt/lt-user-timer-preempt.c)
+target_link_libraries(test-lt-user-timer-preempt ${KEYSTONE_LIB_EAPP})
 
 ###############################################
 # a script for running all test enclaves
@@ -333,6 +338,10 @@ file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-edgecall-interference-stress\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-edgecall-stress eyrie-rt loader.bin --slottee-edgecall-interference-stress\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-timer-preempt\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-timer-preempt eyrie-rt loader.bin --enter-slot-timer-preempt\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-host-dos-stress\" ]; then\n")

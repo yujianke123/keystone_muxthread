@@ -55,6 +55,7 @@ struct slot_lease_t
   uintptr_t exit_reason;
   uintptr_t active_hart;
   uintptr_t thread_index;
+  uintptr_t slot_mode;
   uintptr_t revoke_pending;
   slot_lease_state state;
 };
@@ -156,7 +157,9 @@ unsigned long resume_enclave_slot(
 unsigned long reserve_enclave_slot(
     enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp);
 unsigned long activate_enclave_slot(
-    enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp);
+    enclave_id eid, const struct slot_cap_t *cap, uintptr_t slot_mode,
+    struct enter_slot_resp_t *resp);
+int enclave_slot_timer_redirectable(enclave_id eid, uintptr_t thread_index);
 unsigned long mark_revoke_enclave_slot(
     enclave_id eid, const struct mark_revoke_req_t *req, struct mark_revoke_resp_t *resp);
 unsigned long debug_enclave_slot_state(

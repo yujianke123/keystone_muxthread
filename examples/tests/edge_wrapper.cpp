@@ -17,9 +17,11 @@
 #define OCALL_GET_MULTIHART_TICKET_CONFIG 7
 #define OCALL_EDGECALL_STRESS_ECHO 8
 #define OCALL_EDGECALL_STRESS_REPORT 9
+#define OCALL_TIMER_PREEMPT_REPORT 10
 
 static struct slottee_edgecall_stress_report copied_edgecall_stress_report;
 static struct slottee_edgecall_stress_payload copied_edgecall_stress_payload;
+static struct slottee_timer_preempt_report copied_timer_preempt_report;
 static uintptr_t edgecall_stress_echo_count;
 
 void
@@ -37,6 +39,7 @@ edge_init(Keystone::Enclave* enclave) {
   register_call(OCALL_EDGECALL_STRESS_ECHO, copy_edgecall_stress_payload_wrapper);
   register_call(OCALL_EDGECALL_STRESS_REPORT,
       copy_edgecall_stress_report_wrapper);
+  register_call(OCALL_TIMER_PREEMPT_REPORT, copy_timer_preempt_report_wrapper);
 
   edge_call_init_internals(
       (uintptr_t)enclave->getSharedBuffer(), enclave->getSharedBufferSize());
@@ -61,6 +64,19 @@ get_edgecall_stress_report(struct slottee_edgecall_stress_report* report)
 {
   if (report)
     *report = copied_edgecall_stress_report;
+}
+
+void
+reset_timer_preempt_state(void)
+{
+  memset(&copied_timer_preempt_report, 0, sizeof(copied_timer_preempt_report));
+}
+
+void
+get_timer_preempt_report(struct slottee_timer_preempt_report* report)
+{
+  if (report)
+    *report = copied_timer_preempt_report;
 }
 
 void
@@ -216,6 +232,28 @@ copy_edgecall_stress_report_wrapper(void* buffer) {
   }
 
   copy_edgecall_stress_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_timer_preempt_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_timer_preempt_report))
+    memcpy(&copied_timer_preempt_report, buffer, size);
+}
+
+void
+copy_timer_preempt_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_timer_preempt_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_timer_preempt_report((void*)call_args, args_len);
   edge_call->return_data.call_status = CALL_STATUS_OK;
 }
 

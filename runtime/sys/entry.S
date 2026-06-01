@@ -154,6 +154,17 @@ slottee_runtime_reenter:
   addi a2, sp, REGBYTES
   la t0, slottee_slot_trampoline_with_arg
   jalr t0
+
+  /*
+   * Slot reentry bypasses eyrie_boot(), so arm the S-mode timer before
+   * dropping into a user LT.  Preserve the trampoline result in the spare
+   * stack slot reserved above because init_timer may clobber caller-saved regs.
+   */
+  STORE a0, 2*REGBYTES(sp)
+  la t0, init_timer
+  jalr t0
+  LOAD a0, 2*REGBYTES(sp)
+
   LOAD a1, 0(sp)
   LOAD t4, 1*REGBYTES(sp)
   addi sp, sp, 3*REGBYTES

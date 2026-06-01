@@ -42,6 +42,7 @@ void EAPP_ENTRY
 eapp_entry()
 {
   uintptr_t slot_id;
+  long seed_generation = 0;
 
   while (1) {
     for (slot_id = 1; slot_id <= SLOTTEE_FIRST_BUSY_REVOKE_CAP_SLOTS; slot_id++) {
@@ -50,8 +51,10 @@ eapp_entry()
         EAPP_RETURN(SLOTTEE_LT_USER_ILLEGAL_MAGIC);
     }
 
+    seed_generation++;
+    seed_wait_value = seed_generation;
     slottee_lt_wait_value(
-        &seed_wait_value, 1, SLOTTEE_LT_WAIT_OP_EQ);
+        &seed_wait_value, seed_generation + 1, SLOTTEE_LT_WAIT_OP_EQ);
   }
 
   EAPP_RETURN(SLOTTEE_LT_USER_OCALL_MAGIC);

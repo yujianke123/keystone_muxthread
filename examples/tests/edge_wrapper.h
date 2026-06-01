@@ -42,6 +42,10 @@ uintptr_t get_edgecall_stress_echo_count(void);
 void copy_edgecall_stress_payload_wrapper(void* buffer);
 void reset_edgecall_stress_state(void);
 
+void copy_timer_preempt_report_wrapper(void* buffer);
+void get_timer_preempt_report(struct slottee_timer_preempt_report* report);
+void reset_timer_preempt_state(void);
+
 void get_multihart_ticket_config_wrapper(void* buffer);
 void get_multihart_ticket_config(
     struct slottee_multihart_ticket_config* config);

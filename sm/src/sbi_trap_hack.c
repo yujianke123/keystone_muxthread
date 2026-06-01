@@ -1,4 +1,5 @@
 #include "enclave.h"
+#include "cpu.h"
 #include <sbi/riscv_asm.h>
 #include <sbi/riscv_encoding.h>
 #include <sbi/sbi_console.h>
@@ -10,6 +11,26 @@
 #include <sbi/sbi_misaligned_ldst.h>
 #include <sbi/sbi_timer.h>
 #include <sbi/sbi_trap.h>
+
+static int slottee_redirect_timer_to_enclave(struct sbi_trap_regs *regs)
+{
+	ulong prev_mode = (regs->mstatus & MSTATUS_MPP) >> MSTATUS_MPP_SHIFT;
+	struct sbi_trap_info trap;
+
+	if (prev_mode != PRV_U && prev_mode != PRV_S)
+		return 0;
+	if (!enclave_slot_timer_redirectable(
+	        cpu_get_enclave_id(), cpu_get_enclave_thread_index()))
+		return 0;
+
+	sbi_timer_process();
+	trap.epc = regs->mepc;
+	trap.cause = IRQ_S_TIMER | (1UL << (__riscv_xlen - 1));
+	trap.tval = 0;
+	trap.tval2 = 0;
+	trap.tinst = 0;
+	return sbi_trap_redirect(regs, &trap) == 0;
+}
 
 static void sbi_trap_error(const char *msg, int rc,
 				      ulong mcause, ulong mtval, ulong mtval2,
@@ -97,6 +118,8 @@ void sbi_trap_handler_keystone_enclave(struct sbi_trap_regs *regs)
 		mcause &= ~(1UL << (__riscv_xlen - 1));
 		switch (mcause) {
 		case IRQ_M_TIMER: {
+      if (slottee_redirect_timer_to_enclave(regs))
+        return;
       regs->mepc -= 4;
       sbi_sm_stop_enclave(regs, STOP_TIMER_INTERRUPT);
       regs->a0 = SBI_ERR_SM_ENCLAVE_INTERRUPTED;

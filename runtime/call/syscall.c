@@ -66,11 +66,14 @@ uintptr_t dispatch_edgecall_syscall(struct edge_syscall* syscall_data_ptr, size_
     goto out;
   }
 
+  /*
+   * The stop SBI may return a non-zero continuation when the host resumes
+   * through an interrupt-aware path.  The edge-call completion status in the
+   * shared buffer is the authoritative result, so do not treat the continuation
+   * code itself as a syscall failure.
+   */
   ret = sbi_stop_enclave(STOP_EDGE_CALL_HOST);
-
-  if (ret != 0) {
-    goto out;
-  }
+  (void)ret;
 
   if(edge_call->return_data.call_status != CALL_STATUS_OK){
     goto out;
@@ -126,6 +129,10 @@ uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
    * This SBI returns only after the host resumes the enclave.  Slot-specific
    * resume paths may leave a non-zero continuation value in a0; the edge-call
    * return status below is the authoritative OCALL result.
+   */
+  /*
+   * Same as the syscall edge-call path above: treat the shared-buffer return
+   * status as authoritative and ignore the continuation code here.
    */
   (void)sbi_stop_enclave(STOP_EDGE_CALL_HOST);
 
@@ -315,7 +322,7 @@ void handle_syscall(struct encl_ctx* ctx)
     ret = slottee_lt_notify_value(ctx, arg0);
     break;
   case(RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS):
-    ret = slottee_lt_collect_stats(arg0);
+    ret = slottee_lt_collect_stats(ctx, arg0);
     break;
   case(RUNTIME_SYSCALL_SLOTTEE_SLOT_REQUEST):
     ret = slottee_slot_request(arg0);

@@ -10,6 +10,7 @@
 #include "util/regs.h"
 #include "util/string.h"
 #include "uaccess.h"
+#include <asm/csr.h>
 
 #define SLOTTEE_USER_STACK_PAGES 8
 #define SLOTTEE_USER_TLS_PAGES   1
@@ -24,6 +25,29 @@
 #define SLOTTEE_RUNTIME_STACK_WORDS \
   ((SLOTTEE_RUNTIME_STACK_PAGES * RISCV_PAGE_SIZE) / sizeof(uintptr_t))
 #define SLOTTEE_LT_SPAWN_OCALL_COPY_SLOT_CAP 5
+#define SLOTTEE_LT_FAIRNESS_GAP_LIMIT SLOTTEE_MAX_SLOTS
+
+enum slottee_user_lt_state {
+  SLOTTEE_USER_LT_EMPTY = 0,
+  SLOTTEE_USER_LT_READY = 1,
+  SLOTTEE_USER_LT_RUNNING = 2,
+  SLOTTEE_USER_LT_YIELDED = 3,
+  SLOTTEE_USER_LT_WAITING = 4,
+  SLOTTEE_USER_LT_WOKEN = 5,
+  SLOTTEE_USER_LT_EXITED = 6,
+};
+
+enum slottee_user_lt_queue_kind {
+  SLOTTEE_USER_LT_QUEUE_RUNNABLE = 1,
+  SLOTTEE_USER_LT_QUEUE_WAIT = 2,
+};
+
+struct slottee_user_lt_queue {
+  uintptr_t entries[SLOTTEE_MAX_SLOTS];
+  uintptr_t head;
+  uintptr_t tail;
+  uintptr_t count;
+};
 
 struct slottee_active_user_context {
   uintptr_t active;
@@ -62,6 +86,16 @@ struct slottee_active_user_context {
   uintptr_t wait_wakeup_count;
   uintptr_t wait_notify_miss_count;
   uintptr_t timer_wait_stop_count;
+  uintptr_t preempt_count;
+  uintptr_t preempt_yield_count;
+  uintptr_t preempt_dispatch_count;
+  uintptr_t dispatch_count;
+  uintptr_t in_runnable_queue;
+  uintptr_t in_wait_queue;
+  uintptr_t saved_ctx_valid;
+  uintptr_t fairness_ticket;
+  enum slottee_user_lt_state scheduler_state;
+  struct encl_ctx saved_ctx;
   uintptr_t user_stack_entry_ok;
   uintptr_t user_stack_exit_ok;
   uintptr_t tls_resume_ok;
@@ -90,6 +124,11 @@ static struct slottee_slot_policy_entry
     slottee_slot_policy_entries[SLOTTEE_MAX_SLOTS];
 static volatile int slottee_slot_policy_lock;
 static volatile int slottee_user_memory_lock;
+static volatile int slottee_lt_scheduler_lock;
+static struct slottee_user_lt_queue slottee_user_runnable_queue;
+static struct slottee_user_lt_queue slottee_user_wait_queue;
+static uintptr_t slottee_user_scheduler_ticket;
+static uintptr_t slottee_user_scheduler_duplicate_rejects;
 static uintptr_t slottee_global_wait_user_ptr;
 static uintptr_t slottee_global_wait_target;
 static uintptr_t slottee_global_wait_op;
@@ -125,6 +164,239 @@ slottee_user_memory_lock_release(void)
 {
   __sync_synchronize();
   __sync_lock_release(&slottee_user_memory_lock);
+}
+
+static void
+slottee_lt_scheduler_lock_acquire(void)
+{
+  while (__sync_lock_test_and_set(&slottee_lt_scheduler_lock, 1))
+    __asm__ volatile("nop");
+  __sync_synchronize();
+}
+
+static void
+slottee_lt_scheduler_lock_release(void)
+{
+  __sync_synchronize();
+  __sync_lock_release(&slottee_lt_scheduler_lock);
+}
+
+static uintptr_t*
+slottee_user_lt_queue_member(
+    struct slottee_active_user_context* user,
+    enum slottee_user_lt_queue_kind kind)
+{
+  if (!user)
+    return 0;
+  if (kind == SLOTTEE_USER_LT_QUEUE_RUNNABLE)
+    return &user->in_runnable_queue;
+  if (kind == SLOTTEE_USER_LT_QUEUE_WAIT)
+    return &user->in_wait_queue;
+  return 0;
+}
+
+static int
+slottee_user_lt_queue_enqueue(struct slottee_user_lt_queue* queue,
+    enum slottee_user_lt_queue_kind kind,
+    struct slottee_active_user_context* user)
+{
+  uintptr_t* member;
+
+  if (!queue || !user || user->slot_id == 0 ||
+      user->slot_id >= SLOTTEE_MAX_SLOTS || queue->count >= SLOTTEE_MAX_SLOTS)
+    return 0;
+
+  member = slottee_user_lt_queue_member(user, kind);
+  if (!member || *member) {
+    slottee_user_scheduler_duplicate_rejects++;
+    return 0;
+  }
+
+  queue->entries[queue->tail] = user->slot_id;
+  queue->tail = (queue->tail + 1) % SLOTTEE_MAX_SLOTS;
+  queue->count++;
+  *member = 1;
+  return 1;
+}
+
+static struct slottee_active_user_context*
+slottee_user_lt_queue_dequeue(struct slottee_user_lt_queue* queue,
+    enum slottee_user_lt_queue_kind kind)
+{
+  uintptr_t slot_id;
+  uintptr_t* member;
+  struct slottee_active_user_context* user;
+
+  if (!queue || queue->count == 0)
+    return 0;
+
+  slot_id = queue->entries[queue->head];
+  queue->head = (queue->head + 1) % SLOTTEE_MAX_SLOTS;
+  queue->count--;
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return 0;
+
+  user = &slottee_active_users[slot_id];
+  member = slottee_user_lt_queue_member(user, kind);
+  if (!member || !*member)
+    return 0;
+
+  *member = 0;
+  return user;
+}
+
+static int
+slottee_user_lt_queue_remove(struct slottee_user_lt_queue* queue,
+    enum slottee_user_lt_queue_kind kind,
+    struct slottee_active_user_context* target)
+{
+  uintptr_t pending[SLOTTEE_MAX_SLOTS];
+  uintptr_t pending_count = 0;
+  int removed = 0;
+
+  if (!queue || !target)
+    return 0;
+
+  while (queue->count) {
+    struct slottee_active_user_context* user =
+        slottee_user_lt_queue_dequeue(queue, kind);
+
+    if (!user)
+      continue;
+    if (user == target) {
+      removed = 1;
+      continue;
+    }
+    if (pending_count < SLOTTEE_MAX_SLOTS)
+      pending[pending_count++] = user->slot_id;
+  }
+
+  for (uintptr_t index = 0; index < pending_count; index++)
+    (void)slottee_user_lt_queue_enqueue(
+        queue, kind, &slottee_active_users[pending[index]]);
+
+  return removed;
+}
+
+static void
+slottee_user_lt_set_state(
+    struct slottee_active_user_context* user,
+    enum slottee_user_lt_state state)
+{
+  if (user)
+    user->scheduler_state = state;
+}
+
+static void
+slottee_user_lt_save_frame(
+    struct slottee_active_user_context* user, const struct encl_ctx* ctx)
+{
+  if (!user || !ctx)
+    return;
+
+  user->saved_ctx = *ctx;
+  user->saved_ctx_valid = 1;
+}
+
+static void
+slottee_user_lt_record_dispatch(struct slottee_active_user_context* user)
+{
+  if (!user)
+    return;
+
+  slottee_user_scheduler_ticket++;
+  user->fairness_ticket = slottee_user_scheduler_ticket;
+  user->dispatch_count++;
+}
+
+static void
+slottee_user_lt_block_on_wait(
+    struct slottee_active_user_context* user, struct encl_ctx* ctx)
+{
+  if (!user)
+    return;
+
+  slottee_lt_scheduler_lock_acquire();
+  slottee_user_lt_save_frame(user, ctx);
+  slottee_user_lt_set_state(user, SLOTTEE_USER_LT_WAITING);
+  if (!user->in_wait_queue)
+    (void)slottee_user_lt_queue_enqueue(&slottee_user_wait_queue,
+        SLOTTEE_USER_LT_QUEUE_WAIT, user);
+  slottee_lt_scheduler_lock_release();
+}
+
+static void
+slottee_user_lt_promote_waiters(uintptr_t user_ptr)
+{
+  uintptr_t pending[SLOTTEE_MAX_SLOTS];
+  uintptr_t pending_count = 0;
+
+  slottee_lt_scheduler_lock_acquire();
+  while (slottee_user_wait_queue.count) {
+    struct slottee_active_user_context* user =
+        slottee_user_lt_queue_dequeue(&slottee_user_wait_queue,
+            SLOTTEE_USER_LT_QUEUE_WAIT);
+
+    if (!user)
+      continue;
+    if (user->wait_user_ptr == user_ptr) {
+      slottee_user_lt_set_state(user, SLOTTEE_USER_LT_WOKEN);
+      (void)slottee_user_lt_queue_enqueue(&slottee_user_runnable_queue,
+          SLOTTEE_USER_LT_QUEUE_RUNNABLE, user);
+    } else if (pending_count < SLOTTEE_MAX_SLOTS) {
+      pending[pending_count++] = user->slot_id;
+    }
+  }
+
+  for (uintptr_t index = 0; index < pending_count; index++)
+    (void)slottee_user_lt_queue_enqueue(&slottee_user_wait_queue,
+        SLOTTEE_USER_LT_QUEUE_WAIT, &slottee_active_users[pending[index]]);
+  slottee_lt_scheduler_lock_release();
+}
+
+static void
+slottee_user_lt_preempt_current(
+    struct slottee_active_user_context* user, struct encl_ctx* ctx)
+{
+  struct slottee_active_user_context* dispatched = 0;
+
+  slottee_lt_scheduler_lock_acquire();
+  slottee_user_lt_save_frame(user, ctx);
+  slottee_user_lt_set_state(user, SLOTTEE_USER_LT_YIELDED);
+  user->preempt_yield_count++;
+  if (!user->in_runnable_queue)
+    (void)slottee_user_lt_queue_enqueue(&slottee_user_runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE, user);
+
+  dispatched = slottee_user_lt_queue_dequeue(&slottee_user_runnable_queue,
+      SLOTTEE_USER_LT_QUEUE_RUNNABLE);
+  if (dispatched == user && user->saved_ctx_valid) {
+    slottee_user_lt_set_state(user, SLOTTEE_USER_LT_RUNNING);
+    user->preempt_dispatch_count++;
+    slottee_user_lt_record_dispatch(user);
+  } else if (dispatched) {
+    (void)slottee_user_lt_queue_enqueue(&slottee_user_runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE, dispatched);
+  }
+  slottee_lt_scheduler_lock_release();
+}
+
+static void
+slottee_user_lt_resume_after_wait(struct slottee_active_user_context* user)
+{
+  if (!user)
+    return;
+
+  slottee_lt_scheduler_lock_acquire();
+  if (user->in_runnable_queue)
+    (void)slottee_user_lt_queue_remove(&slottee_user_runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE, user);
+  if (user->in_wait_queue)
+    (void)slottee_user_lt_queue_remove(&slottee_user_wait_queue,
+        SLOTTEE_USER_LT_QUEUE_WAIT, user);
+  slottee_user_lt_set_state(user, SLOTTEE_USER_LT_RUNNING);
+  slottee_user_lt_record_dispatch(user);
+  slottee_lt_scheduler_lock_release();
 }
 
 void
@@ -368,12 +640,27 @@ slottee_activate_user_context(uintptr_t slot_id, uintptr_t lease_id, uintptr_t m
   user->wait_wakeup_count = 0;
   user->wait_notify_miss_count = 0;
   user->timer_wait_stop_count = 0;
+  user->preempt_count = 0;
+  user->preempt_yield_count = 0;
+  user->preempt_dispatch_count = 0;
+  user->dispatch_count = 0;
+  user->in_runnable_queue = 0;
+  user->in_wait_queue = 0;
+  user->saved_ctx_valid = 0;
+  user->fairness_ticket = 0;
+  user->scheduler_state = SLOTTEE_USER_LT_READY;
+  memset(&user->saved_ctx, 0, sizeof(user->saved_ctx));
   user->user_stack_entry_ok = 0;
   user->user_stack_exit_ok = 0;
   user->tls_resume_ok = 0;
 
-  if (slottee_mode_is_user_ocall(mode))
+  if (slottee_mode_is_user_ocall(mode)) {
     slottee_prepare_user_memory(user, slot_id);
+    slottee_lt_scheduler_lock_acquire();
+    slottee_user_lt_set_state(user, SLOTTEE_USER_LT_RUNNING);
+    slottee_user_lt_record_dispatch(user);
+    slottee_lt_scheduler_lock_release();
+  }
 
   return user;
 }
@@ -444,6 +731,24 @@ slottee_active_user_record_ocall_resume(struct encl_ctx* ctx, uintptr_t value)
   user->tls_resume_ok += ctx->regs.tp == user->entry_tls_base ? 1 : 0;
 }
 
+uintptr_t
+slottee_lt_timer_preempt(struct encl_ctx* ctx)
+{
+  struct slottee_active_user_context* user = slottee_active_user_for_frame(ctx);
+
+  if (!ctx || (ctx->sstatus & SR_SPP))
+    return 0;
+
+  if (!user || !slottee_mode_is_user_ocall(user->mode))
+    return 0;
+
+  slottee_record_trap_frame(user, ctx, STOP_TIMER_INTERRUPT);
+  user->preempt_count++;
+  slottee_user_lt_preempt_current(user, ctx);
+  (void)sbi_stop_enclave(STOP_TIMER_INTERRUPT);
+  return 1;
+}
+
 static int
 slottee_active_user_ocall_exit_ok(
     const struct slottee_active_user_context* user, uintptr_t value)
@@ -492,7 +797,7 @@ slottee_active_user_exit(struct encl_ctx* ctx, uintptr_t value)
     value = SLOTTEE_LT_USER_ILLEGAL_MAGIC;
 
   if (slottee_mode_is_user_ocall(user->mode)) {
-    printf("[slottee] lt_user_exit slot=%lu value=%lu syscalls=%lu ocalls=%lu resumes=%lu exits=%lu faults=%lu sp=0x%lx tp=0x%lx stack_entry=%lu stack_exit=%lu tls_entry=%lu tls_exit=%lu tls_resume=%lu tls_mismatch=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_misses=%lu\r\n",
+    printf("[slottee] lt_user_exit slot=%lu value=%lu syscalls=%lu ocalls=%lu resumes=%lu exits=%lu faults=%lu sp=0x%lx tp=0x%lx stack_entry=%lu stack_exit=%lu tls_entry=%lu tls_exit=%lu tls_resume=%lu tls_mismatch=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu preempts=%lu notify_misses=%lu\r\n",
         user->slot_id, value, user->syscall_trap_count,
         user->ocall_trap_count, user->ocall_resume_count,
         user->exit_trap_count, user->fault_trap_count,
@@ -501,11 +806,17 @@ slottee_active_user_exit(struct encl_ctx* ctx, uintptr_t value)
         user->tls_entry_ok, user->tls_exit_ok, user->tls_resume_ok,
         user->tls_exit_mismatch, user->wait_block_count, user->wait_wakeup_count,
         user->timer_wait_stop_count,
+        user->preempt_count,
         user->wait_notify_miss_count);
   }
 
   slot_id = user->slot_id;
   lease_id = user->lease_id;
+  slottee_lt_scheduler_lock_acquire();
+  user->in_runnable_queue = 0;
+  user->in_wait_queue = 0;
+  slottee_user_lt_set_state(user, SLOTTEE_USER_LT_EXITED);
+  slottee_lt_scheduler_lock_release();
   user->active = 0;
   status = sbi_exit_slot(slot_id, lease_id, SLOTTEE_SLOT_EXIT_NORMAL, value);
 
@@ -785,6 +1096,7 @@ slottee_lt_wait_value(
     user->wait_op = op;
     user->wait_block_count++;
     user->timer_wait_stop_count++;
+    slottee_user_lt_block_on_wait(user, ctx);
   } else {
     slottee_global_wait_user_ptr = user_ptr;
     slottee_global_wait_target = target;
@@ -798,6 +1110,8 @@ slottee_lt_wait_value(
    * treats that continuation as the observable "blocked once" result.
    */
   (void)sbi_stop_enclave(STOP_TIMER_INTERRUPT);
+  if (user)
+    slottee_user_lt_resume_after_wait(user);
   return SLOTTEE_LT_WAIT_RESULT_BLOCKED;
 }
 
@@ -811,6 +1125,7 @@ slottee_lt_notify_value(struct encl_ctx* ctx, uintptr_t user_ptr)
   if (!user_ptr)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
+  slottee_user_lt_promote_waiters(user_ptr);
   for (slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
     struct slottee_active_user_context* user = &slottee_active_users[slot];
 
@@ -843,10 +1158,14 @@ slottee_lt_notify_value(struct encl_ctx* ctx, uintptr_t user_ptr)
 }
 
 uintptr_t
-slottee_lt_collect_stats(uintptr_t stats_ptr)
+slottee_lt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
 {
   struct slottee_lt_runtime_stats stats = {0};
+  struct slottee_active_user_context* current_user =
+      slottee_active_user_for_frame(ctx);
   uintptr_t slot;
+  uintptr_t current_slot = 0;
+  uintptr_t active_lt_count = 0;
 
   if (!stats_ptr)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
@@ -855,6 +1174,16 @@ slottee_lt_collect_stats(uintptr_t stats_ptr)
   stats.wait_wakeups = slottee_global_wait_wakeup_count;
   stats.notify_misses = slottee_global_notify_miss_count;
   stats.timer_wait_stops = slottee_global_wait_block_count;
+  stats.fairness_min = (uintptr_t)-1;
+
+  slottee_lt_scheduler_lock_acquire();
+  stats.runnable_queue_depth = slottee_user_runnable_queue.count;
+  stats.wait_queue_depth = slottee_user_wait_queue.count;
+  stats.scheduler_duplicate_rejects =
+      slottee_user_scheduler_duplicate_rejects;
+
+  if (current_user)
+    current_slot = current_user->slot_id;
 
   for (slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
     struct slottee_active_user_context* user = &slottee_active_users[slot];
@@ -873,10 +1202,38 @@ slottee_lt_collect_stats(uintptr_t stats_ptr)
     stats.exit_traps += user->exit_trap_count;
     stats.fault_traps += user->fault_trap_count;
     stats.timer_wait_stops += user->timer_wait_stop_count;
+    stats.preempt_count += user->preempt_count;
+    stats.preempt_yields += user->preempt_yield_count;
+    stats.preempt_dispatches += user->preempt_dispatch_count;
+    if (user->in_runnable_queue)
+      stats.scheduler_queue_leaks++;
+    if (user->in_wait_queue)
+      stats.scheduler_wait_residue++;
+    if (slottee_mode_is_user_ocall(user->mode) &&
+        slot != current_slot &&
+        user->scheduler_state != SLOTTEE_USER_LT_EXITED &&
+        user->scheduler_state != SLOTTEE_USER_LT_EMPTY)
+      stats.scheduler_unfinished += user->active ? 1 : 0;
+    if (slottee_mode_is_user_ocall(user->mode) && user->dispatch_count) {
+      active_lt_count++;
+      if (user->dispatch_count < stats.fairness_min)
+        stats.fairness_min = user->dispatch_count;
+      if (user->dispatch_count > stats.fairness_max)
+        stats.fairness_max = user->dispatch_count;
+    }
     stats.stack_entry_ok += user->user_stack_entry_ok;
     stats.stack_exit_ok += user->user_stack_exit_ok;
     stats.tls_resume_ok += user->tls_resume_ok;
   }
+  if (stats.fairness_min == (uintptr_t)-1)
+    stats.fairness_min = 0;
+  if (active_lt_count) {
+    stats.fairness_checks = 1;
+    stats.fairness_gap = stats.fairness_max - stats.fairness_min;
+    if (stats.fairness_gap > SLOTTEE_LT_FAIRNESS_GAP_LIMIT)
+      stats.fairness_violations++;
+  }
+  slottee_lt_scheduler_lock_release();
 
   if (copy_to_user((void*)stats_ptr, &stats, sizeof(stats)))
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
