@@ -29,7 +29,8 @@ set(slottee_fault_test_bins
 
 set(slottee_stress_test_bins
   test-lt-user-busy-revoke
-  test-lt-user-first-busy-revoke)
+  test-lt-user-first-busy-revoke
+  test-lt-user-edgecall-stress)
 
 set(slottee_explicit_test_bins
   test-lt-user-mint-cap
@@ -128,6 +129,10 @@ target_link_libraries(test-lt-user-busy-revoke ${KEYSTONE_LIB_EAPP})
 
 add_executable(test-lt-user-first-busy-revoke lt-user-first-busy-revoke/lt-user-first-busy-revoke.c)
 target_link_libraries(test-lt-user-first-busy-revoke ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-edgecall-stress
+  lt-user-edgecall-stress/lt-user-edgecall-stress.c)
+target_link_libraries(test-lt-user-edgecall-stress ${KEYSTONE_LIB_EAPP})
 
 ###############################################
 # a script for running all test enclaves
@@ -326,12 +331,17 @@ file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-multihart-ticket-max\"
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-multihart-ticket eyrie-rt loader.bin --slottee-multihart-ticket-max\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-edgecall-interference-stress\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-edgecall-stress eyrie-rt loader.bin --slottee-edgecall-interference-stress\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-host-dos-stress\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-multihart-ticket eyrie-rt loader.bin --slottee-host-dos-stress\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-multihart-stress\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-multihart-ticket eyrie-rt loader.bin --slottee-multihart-stress || exit $?\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-edgecall-stress eyrie-rt loader.bin --slottee-edgecall-interference-stress || exit $?\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-multihart-ticket eyrie-rt loader.bin --slottee-host-dos-stress || exit $?\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-active-revoke-timer-stress || exit $?\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-first-busy-revoke eyrie-rt loader.bin --load-only --enter-slot-active-revoke-destroy-race || exit $?\n")

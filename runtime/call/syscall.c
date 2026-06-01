@@ -31,47 +31,73 @@
 
 extern void exit_enclave(uintptr_t arg0);
 
+static volatile int slottee_edgecall_buffer_lock;
+
+static void
+slottee_edgecall_buffer_lock_acquire(void)
+{
+  while (__sync_lock_test_and_set(&slottee_edgecall_buffer_lock, 1))
+    __asm__ volatile("nop");
+  __sync_synchronize();
+}
+
+static void
+slottee_edgecall_buffer_lock_release(void)
+{
+  __sync_synchronize();
+  __sync_lock_release(&slottee_edgecall_buffer_lock);
+}
+
 uintptr_t dispatch_edgecall_syscall(struct edge_syscall* syscall_data_ptr, size_t data_len){
   int ret;
+  uintptr_t result = (uintptr_t)-1;
 
   // Syscall data should already be at the edge_call_data section
   /* For now we assume by convention that the start of the buffer is
    * the right place to put calls */
   struct edge_call* edge_call = (struct edge_call*)shared_buffer;
 
+  slottee_edgecall_buffer_lock_acquire();
+
   edge_call->call_id = EDGECALL_SYSCALL;
 
 
   if(edge_call_setup_call(edge_call, (void*)syscall_data_ptr, data_len) != 0){
-    return -1;
+    goto out;
   }
 
   ret = sbi_stop_enclave(STOP_EDGE_CALL_HOST);
 
   if (ret != 0) {
-    return -1;
+    goto out;
   }
 
   if(edge_call->return_data.call_status != CALL_STATUS_OK){
-    return -1;
+    goto out;
   }
 
   uintptr_t return_ptr;
   size_t return_len;
   if(edge_call_ret_ptr(edge_call, &return_ptr, &return_len) != 0){
-    return -1;
+    goto out;
   }
 
   if(return_len < sizeof(uintptr_t)){
-    return -1;
+    goto out;
   }
 
-  return *(uintptr_t*)return_ptr;
+  result = *(uintptr_t*)return_ptr;
+
+out:
+  slottee_edgecall_buffer_lock_release();
+  return result;
 }
 
 uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
 				   void* data, size_t data_len,
 				   void* return_buffer, size_t return_len){
+
+  uintptr_t result = 1;
 
   /* For now we assume by convention that the start of the buffer is
    * the right place to put calls */
@@ -81,17 +107,19 @@ uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
    * region, calculate the offsets to the argument data, and then
    * dispatch the ocall to host */
 
+  slottee_edgecall_buffer_lock_acquire();
+
   edge_call->call_id = call_id;
   uintptr_t buffer_data_start = edge_call_data_ptr();
 
   if(data_len > (shared_buffer_size - (buffer_data_start - shared_buffer))){
-    goto ocall_error;
+    goto out;
   }
   //TODO safety check on source
   copy_from_user((void*)buffer_data_start, (void*)data, data_len);
 
   if(edge_call_setup_call(edge_call, (void*)buffer_data_start, data_len) != 0){
-    goto ocall_error;
+    goto out;
   }
 
   /*
@@ -102,18 +130,19 @@ uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
   (void)sbi_stop_enclave(STOP_EDGE_CALL_HOST);
 
   if(edge_call->return_data.call_status != CALL_STATUS_OK){
-    goto ocall_error;
+    goto out;
   }
 
   if( return_len == 0 ){
     /* Done, no return */
-    return (uintptr_t)NULL;
+    result = (uintptr_t)NULL;
+    goto out;
   }
 
   uintptr_t return_ptr;
   size_t ret_len_untrusted;
   if(edge_call_ret_ptr(edge_call, &return_ptr, &ret_len_untrusted) != 0){
-    goto ocall_error;
+    goto out;
   }
 
   /* Done, there was a return value to copy out of shared mem */
@@ -123,11 +152,12 @@ uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
      almost certainly.*/
   copy_to_user(return_buffer, (void*)return_ptr, ret_len_untrusted > return_len ? return_len : ret_len_untrusted);
 
-  return 0;
+  result = 0;
 
- ocall_error:
+ out:
+  slottee_edgecall_buffer_lock_release();
   /* TODO In the future, this should fault */
-  return 1;
+  return result;
 }
 
 uintptr_t handle_copy_from_shared(void* dst, uintptr_t offset, size_t size){

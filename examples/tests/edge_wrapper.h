@@ -34,6 +34,14 @@ void copy_slot_cap(void* shared_buffer, size_t size);
 void copy_multihart_ticket_report_wrapper(void* buffer);
 void copy_multihart_ticket_report(void* shared_buffer, size_t size);
 
+void copy_edgecall_stress_report_wrapper(void* buffer);
+void get_edgecall_stress_report(struct slottee_edgecall_stress_report* report);
+
+uintptr_t get_edgecall_stress_echo_count(void);
+
+void copy_edgecall_stress_payload_wrapper(void* buffer);
+void reset_edgecall_stress_state(void);
+
 void get_multihart_ticket_config_wrapper(void* buffer);
 void get_multihart_ticket_config(
     struct slottee_multihart_ticket_config* config);

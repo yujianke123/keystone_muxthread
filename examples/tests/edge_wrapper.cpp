@@ -15,6 +15,12 @@
 #define OCALL_COPY_SLOT_CAP 5
 #define OCALL_REPORT_MULTIHART_TICKET 6
 #define OCALL_GET_MULTIHART_TICKET_CONFIG 7
+#define OCALL_EDGECALL_STRESS_ECHO 8
+#define OCALL_EDGECALL_STRESS_REPORT 9
+
+static struct slottee_edgecall_stress_report copied_edgecall_stress_report;
+static struct slottee_edgecall_stress_payload copied_edgecall_stress_payload;
+static uintptr_t edgecall_stress_echo_count;
 
 void
 edge_init(Keystone::Enclave* enclave) {
@@ -28,10 +34,35 @@ edge_init(Keystone::Enclave* enclave) {
       copy_multihart_ticket_report_wrapper);
   register_call(OCALL_GET_MULTIHART_TICKET_CONFIG,
       get_multihart_ticket_config_wrapper);
+  register_call(OCALL_EDGECALL_STRESS_ECHO, copy_edgecall_stress_payload_wrapper);
+  register_call(OCALL_EDGECALL_STRESS_REPORT,
+      copy_edgecall_stress_report_wrapper);
 
   edge_call_init_internals(
       (uintptr_t)enclave->getSharedBuffer(), enclave->getSharedBufferSize());
 }
+
+void
+reset_edgecall_stress_state(void)
+{
+  memset(&copied_edgecall_stress_report, 0, sizeof(copied_edgecall_stress_report));
+  memset(&copied_edgecall_stress_payload, 0, sizeof(copied_edgecall_stress_payload));
+  edgecall_stress_echo_count = 0;
+}
+
+uintptr_t
+get_edgecall_stress_echo_count(void)
+{
+  return edgecall_stress_echo_count;
+}
+
+void
+get_edgecall_stress_report(struct slottee_edgecall_stress_report* report)
+{
+  if (report)
+    *report = copied_edgecall_stress_report;
+}
+
 void
 print_buffer_wrapper(void* buffer) {
   /* For now we assume the call struct is at the front of the shared
@@ -135,6 +166,56 @@ copy_multihart_ticket_report_wrapper(void* buffer) {
   }
 
   copy_multihart_ticket_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_edgecall_stress_payload(void* buffer, size_t size) {
+  if (size == sizeof(copied_edgecall_stress_payload)) {
+    memcpy(&copied_edgecall_stress_payload, buffer, size);
+    __sync_fetch_and_add(&edgecall_stress_echo_count, 1);
+  }
+}
+
+void
+copy_edgecall_stress_payload_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_edgecall_stress_payload)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_edgecall_stress_payload((void*)call_args, args_len);
+  if (edge_call_setup_ret(edge_call, (void*)call_args, args_len)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_PTR;
+  } else {
+    edge_call->return_data.call_status = CALL_STATUS_OK;
+  }
+}
+
+static void
+copy_edgecall_stress_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_edgecall_stress_report))
+    memcpy(&copied_edgecall_stress_report, buffer, size);
+}
+
+void
+copy_edgecall_stress_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_edgecall_stress_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_edgecall_stress_report((void*)call_args, args_len);
   edge_call->return_data.call_status = CALL_STATUS_OK;
 }
 

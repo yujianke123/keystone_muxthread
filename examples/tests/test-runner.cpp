@@ -57,7 +57,9 @@ static const uintptr_t slottee_ticket_max_windows =
     SLOTTEE_MULTIHART_TICKET_MAX_WINDOWS;
 static const uintptr_t slottee_multihart_resume_limit = 512;
 static const uintptr_t slottee_multihart_wait_budget = 65536;
+static const uintptr_t slottee_edgecall_stress_rounds = 5;
 static const uintptr_t slottee_ticket_retry_limit = 128;
+static const uintptr_t slottee_edgecall_stress_resume_limit = 1024;
 static const char* slottee_null_enter_baseline_commit = "d4e1754";
 static const uintptr_t slottee_null_enter_baseline_count = 3;
 static const uintptr_t slottee_null_enter_baseline_min = 430912;
@@ -942,13 +944,14 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
           lease_id ? *lease_id : 0, status, value);
       if (resume_count)
         (*resume_count)++;
+      if (ret != Keystone::Error::Success)
+        break;
       if (ret == Keystone::Error::Success &&
           *status == SBI_ERR_SM_ENCLAVE_SUCCESS)
         break;
-      if (ret != Keystone::Error::EdgeCallHost &&
-          ret != Keystone::Error::EnclaveInterrupted)
+      if (*status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST &&
+          *status != SBI_ERR_SM_ENCLAVE_INTERRUPTED)
         break;
-      ret = Keystone::Error::Success;
       continue;
     }
 
@@ -957,15 +960,16 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
           lease_id ? *lease_id : 0, status, value);
       if (resume_count)
         (*resume_count)++;
+      if (ret != Keystone::Error::Success)
+        break;
       if (ret == Keystone::Error::Success &&
           *status == SBI_ERR_SM_ENCLAVE_SUCCESS)
         break;
-      if (ret != Keystone::Error::Success &&
-          ret != Keystone::Error::EnclaveInterrupted)
+      if (*status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST &&
+          *status != SBI_ERR_SM_ENCLAVE_INTERRUPTED)
         break;
       sched_yield();
       usleep(1000);
-      ret = Keystone::Error::Success;
       continue;
     }
 
@@ -4509,6 +4513,7 @@ struct slottee_multihart_worker_arg {
   Keystone::Enclave* enclave;
   slot_cap_t cap;
   uintptr_t slot_id;
+  uintptr_t resume_limit;
   Keystone::Error ret;
   uintptr_t status;
   uintptr_t value;
@@ -4535,10 +4540,12 @@ slottee_multihart_worker(void* opaque)
 {
   slottee_multihart_worker_arg* arg =
       (slottee_multihart_worker_arg*)opaque;
+  uintptr_t resume_limit = arg->resume_limit ?
+      arg->resume_limit : slottee_multihart_resume_limit;
 
   arg->ret = enter_slot_user_ocall_round_with_cap(*arg->enclave, arg->cap,
       &arg->status, &arg->value, &arg->lease, &arg->ocalls, &arg->resumes,
-      &arg->bound_hart, slottee_multihart_resume_limit);
+      &arg->bound_hart, resume_limit);
   return NULL;
 }
 
@@ -4579,6 +4586,60 @@ slottee_multihart_all_worker_caps_ready(uintptr_t windows)
   }
 
   return 1;
+}
+
+static int
+slottee_edgecall_ready_worker_count(void)
+{
+  int ready = 0;
+
+  for (uintptr_t slot_id = 1;
+       slot_id <= SLOTTEE_EDGECALL_STRESS_WORKERS;
+       slot_id++) {
+    uintptr_t worker_slot =
+        SLOTTEE_EDGECALL_STRESS_FIRST_WORKER_SLOT + slot_id - 1;
+
+    if (copied_slot_cap_ready_by_slot[worker_slot])
+      ready++;
+  }
+
+  return ready;
+}
+
+static int
+slottee_edgecall_all_worker_caps_ready(void)
+{
+  return slottee_edgecall_ready_worker_count() ==
+      (int)SLOTTEE_EDGECALL_STRESS_WORKERS;
+}
+
+static int
+slottee_edgecall_maybe_start_worker(Keystone::Enclave& enclave,
+    uintptr_t slot_id, pthread_t* thread,
+    slottee_multihart_worker_arg* arg, int* started)
+{
+  if (slot_id < SLOTTEE_EDGECALL_STRESS_FIRST_WORKER_SLOT ||
+      slot_id > SLOTTEE_EDGECALL_STRESS_LAST_WORKER_SLOT ||
+      started[slot_id] || !copied_slot_cap_ready_by_slot[slot_id])
+    return 0;
+
+  memset(arg, 0, sizeof(*arg));
+  arg->enclave = &enclave;
+  arg->cap = copied_slot_caps[slot_id];
+  arg->slot_id = slot_id;
+  arg->resume_limit = slottee_edgecall_stress_resume_limit;
+  arg->ret = Keystone::Error::DeviceError;
+
+  if (pthread_create(thread, NULL, slottee_multihart_worker, arg) != 0) {
+    printf("[FAIL] edgecall stress failed to create slot%lu worker\n",
+        slot_id);
+    return 1;
+  }
+
+  started[slot_id] = 1;
+  sched_yield();
+  usleep(1000);
+  return 0;
 }
 
 static int
@@ -5097,6 +5158,191 @@ run_slottee_host_dos_stress(const char* eapp_file, const char* rt_file,
 }
 
 static int
+run_slottee_edgecall_interference_case(const char* label,
+    const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  pthread_t worker_threads[SLOTTEE_MAX_SLOTS];
+  slottee_multihart_worker_arg worker_args[SLOTTEE_MAX_SLOTS];
+  int worker_started[SLOTTEE_MAX_SLOTS];
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  Keystone::Error ret;
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+  struct slottee_edgecall_stress_report report;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  reset_edgecall_stress_state();
+  memset(&report, 0, sizeof(report));
+  memset(worker_threads, 0, sizeof(worker_threads));
+  memset(worker_args, 0, sizeof(worker_args));
+  memset(worker_started, 0, sizeof(worker_started));
+  reset_copied_slot_caps();
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] edgecall stress failed to init enclave label=%s\n", label);
+    return 1;
+  }
+
+  edge_init(&enclave);
+  slottee_multihart_set_config(SLOTTEE_EDGECALL_STRESS_WORKERS + 1,
+      SLOTTEE_EDGECALL_STRESS_ITERS,
+      SLOTTEE_MULTIHART_JOIN_MODE_WAIT, slottee_multihart_wait_budget);
+  copied_slot_cap_ready = 0;
+  copied_multihart_ticket_report_ready = 0;
+  printf("edgecall_stress,label,phase,harts,worker_slots,iters,ret,status,value,ocalls,resumes,total_ocalls,worker_ocalls,main_ocalls,failures,corruption,ready,active,wait_calls,wait_blocks,notify_calls,notify_wakes,tls_entry_ok,tls_exit_ok,tls_exit_mismatch,stack_entry_ok,stack_exit_ok,ocall_traps,ocall_resumes,echo_count\n");
+  printf("edgecall_stress_host,label,slot,started,cap_ready,ret,status,value,lease,bound_hart,ocalls,resumes\n");
+  fflush(stdout);
+
+  ret = enclave.runRaw(&value);
+  bool report_ready = false;
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < slottee_edgecall_stress_resume_limit;
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      ocalls++;
+    }
+    if (slottee_edgecall_all_worker_caps_ready()) {
+      for (uintptr_t slot_id = SLOTTEE_EDGECALL_STRESS_FIRST_WORKER_SLOT;
+           slot_id <= SLOTTEE_EDGECALL_STRESS_LAST_WORKER_SLOT;
+           slot_id++) {
+        if (slottee_edgecall_maybe_start_worker(enclave, slot_id,
+                &worker_threads[slot_id], &worker_args[slot_id],
+                worker_started)) {
+          enclave.destroy();
+          return 1;
+        }
+      }
+    }
+    sched_yield();
+    usleep(1000);
+    ret = enclave.resume(&value);
+    resumes++;
+    sched_yield();
+    usleep(1000);
+
+    get_edgecall_stress_report(&report);
+    if (report.magic == SLOTTEE_EDGECALL_STRESS_MAGIC)
+      report_ready = true;
+    if (report_ready && ret == Keystone::Error::Success &&
+        value == SLOTTEE_LT_USER_OCALL_MAGIC)
+      break;
+  }
+
+  for (uintptr_t slot_id = SLOTTEE_EDGECALL_STRESS_FIRST_WORKER_SLOT;
+       slot_id <= SLOTTEE_EDGECALL_STRESS_LAST_WORKER_SLOT;
+       slot_id++) {
+    if (worker_started[slot_id] == 1 &&
+        pthread_join(worker_threads[slot_id], NULL) != 0) {
+      printf("[FAIL] edgecall stress failed to join slot%lu worker\n",
+          slot_id);
+      enclave.destroy();
+      return 1;
+    }
+    if (worker_started[slot_id] == 1)
+      worker_started[slot_id] = 2;
+  }
+
+  get_edgecall_stress_report(&report);
+  printf("edgecall_stress,%s,main,%ld,%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      label, online_harts, report.worker_slots,
+      report.per_lt_iters, (int)ret, report.magic, value, ocalls,
+      resumes, report.total_ocalls,
+      report.worker_ocalls,
+      report.main_ocalls,
+      report.failures,
+      report.context_corruption_count,
+      report.ready_workers,
+      report.active_workers,
+      report.wait_calls,
+      report.wait_blocks,
+      report.notify_calls,
+      report.notify_wakes,
+      report.tls_entry_ok,
+      report.tls_exit_ok,
+      report.tls_exit_mismatch,
+      report.stack_entry_ok,
+      report.stack_exit_ok,
+      report.ocall_traps,
+      report.ocall_resumes,
+      get_edgecall_stress_echo_count());
+  for (uintptr_t slot_id = SLOTTEE_EDGECALL_STRESS_FIRST_WORKER_SLOT;
+       slot_id <= SLOTTEE_EDGECALL_STRESS_LAST_WORKER_SLOT;
+       slot_id++) {
+    printf("edgecall_stress_host,%s,%lu,%d,%d,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
+        label, slot_id, worker_started[slot_id],
+        copied_slot_cap_ready_by_slot[slot_id],
+        (int)worker_args[slot_id].ret,
+        worker_args[slot_id].status,
+        worker_args[slot_id].value,
+        worker_args[slot_id].lease,
+        worker_args[slot_id].bound_hart,
+        worker_args[slot_id].ocalls,
+        worker_args[slot_id].resumes);
+  }
+  fflush(stdout);
+
+  if (!report_ready ||
+      report.magic != SLOTTEE_EDGECALL_STRESS_MAGIC ||
+      report.worker_slots !=
+          SLOTTEE_EDGECALL_STRESS_WORKERS ||
+      report.per_lt_iters !=
+          SLOTTEE_EDGECALL_STRESS_ITERS ||
+      report.expected_worker_ocalls !=
+          SLOTTEE_EDGECALL_STRESS_WORKERS * SLOTTEE_EDGECALL_STRESS_ITERS ||
+      report.worker_ocalls <
+          SLOTTEE_EDGECALL_STRESS_WORKERS * SLOTTEE_EDGECALL_STRESS_ITERS ||
+      report.main_ocalls !=
+          SLOTTEE_EDGECALL_STRESS_ITERS ||
+      report.failures != 0 ||
+      report.context_corruption_count != 0 ||
+      report.ready_workers !=
+          SLOTTEE_EDGECALL_STRESS_WORKERS + 1 ||
+      report.active_workers != 0 ||
+      report.tls_exit_mismatch != 0 ||
+      report.tls_entry_ok < SLOTTEE_EDGECALL_STRESS_WORKERS ||
+      report.tls_exit_ok < SLOTTEE_EDGECALL_STRESS_WORKERS ||
+      report.stack_entry_ok < SLOTTEE_EDGECALL_STRESS_WORKERS ||
+      report.stack_exit_ok < SLOTTEE_EDGECALL_STRESS_WORKERS ||
+      report.ocall_traps <
+          SLOTTEE_EDGECALL_STRESS_WORKERS + 1 ||
+      report.ocall_resumes <
+          SLOTTEE_EDGECALL_STRESS_WORKERS + 1 ||
+      get_edgecall_stress_echo_count() <
+          SLOTTEE_EDGECALL_STRESS_WORKERS * SLOTTEE_EDGECALL_STRESS_ITERS) {
+    printf("[FAIL] edgecall stress invalid report label=%s\n", label);
+    enclave.destroy();
+    return 1;
+  }
+
+  enclave.destroy();
+  return 0;
+}
+
+static int
+run_slottee_edgecall_interference_stress(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  for (uintptr_t round = 1; round <= slottee_edgecall_stress_rounds; round++) {
+    char label[48];
+
+    snprintf(label, sizeof(label), "edgecall_%lu", round);
+    if (run_slottee_edgecall_interference_case(label, eapp_file, rt_file,
+            ld_file, params))
+      return 1;
+  }
+
+  return 0;
+}
+
+static int
 run_slottee_paper_eval(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
 {
@@ -5152,6 +5398,7 @@ main(int argc, char** argv) {
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
         "[--slottee-multihart-ticket-max] "
+        "[--slottee-edgecall-interference-stress] "
         "[--slottee-host-dos-stress] "
         "[--slottee-multihart-stress] "
         "[--slottee-multihart-windows N] "
@@ -5211,6 +5458,7 @@ main(int argc, char** argv) {
   int slottee_ticket_demo = 0;
   int slottee_multihart_ticket = 0;
   int slottee_multihart_ticket_max = 0;
+  int slottee_edgecall_interference_stress = 0;
   int slottee_host_dos_stress = 0;
   int slottee_multihart_stress = 0;
 
@@ -5289,6 +5537,8 @@ main(int argc, char** argv) {
       {"slottee-multihart-ticket", no_argument, &slottee_multihart_ticket, 1},
       {"slottee-multihart-ticket-max", no_argument,
        &slottee_multihart_ticket_max, 1},
+      {"slottee-edgecall-interference-stress", no_argument,
+       &slottee_edgecall_interference_stress, 1},
       {"slottee-host-dos-stress", no_argument, &slottee_host_dos_stress, 1},
       {"slottee-multihart-stress", no_argument, &slottee_multihart_stress, 1},
       {"slottee-multihart-windows", required_argument, 0, 'W'},
@@ -5507,6 +5757,11 @@ main(int argc, char** argv) {
 
   if (slottee_multihart_ticket_max) {
     return run_slottee_multihart_ticket_max(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_edgecall_interference_stress) {
+    return run_slottee_edgecall_interference_stress(
+        eapp_file, rt_file, ld_file, params);
   }
 
   if (slottee_host_dos_stress) {
