@@ -73,6 +73,7 @@ struct slottee_multihart_ticket_report {
   uintptr_t remaining_tickets;
   uintptr_t active_workers;
   uintptr_t failures;
+  uintptr_t hart_id[SLOTTEE_MULTIHART_TICKET_MAX_WINDOWS];
   uintptr_t sold[SLOTTEE_MULTIHART_TICKET_MAX_WINDOWS];
 };
 

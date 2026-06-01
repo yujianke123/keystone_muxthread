@@ -103,6 +103,7 @@
 #define SBI_SM_LT_ECALL_PROBE    3007
 #define SBI_SM_INIT_REENTRY_TEMPLATE 3008
 #define SBI_SM_MINT_SLOT_CAP     3009
+#define SBI_SM_CURRENT_HART      3010
 #define FID_RANGE_ENCLAVE        3999
 
 /* 4000-4999 are experimental */

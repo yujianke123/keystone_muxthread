@@ -23,6 +23,8 @@ sbi_exit_slot(uintptr_t slot_id, uintptr_t lease_id, uintptr_t exit_reason, uint
 uintptr_t
 sbi_init_reentry_template();
 uintptr_t
+sbi_current_hart();
+uintptr_t
 sbi_random();
 uintptr_t
 sbi_lt_ecall_probe(uintptr_t slot_id, uintptr_t lease_id, uintptr_t request, uintptr_t* reply);

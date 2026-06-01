@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#include "sm_call.h"
+
 #define RUNTIME_SYSCALL_UNKNOWN             1000
 #define RUNTIME_SYSCALL_OCALL               1001
 #define RUNTIME_SYSCALL_SHAREDCOPY          1002
@@ -62,6 +64,7 @@ struct slottee_lt_runtime_stats {
   uintptr_t stack_entry_ok;
   uintptr_t stack_exit_ok;
   uintptr_t tls_resume_ok;
+  uintptr_t hart_id[SLOTTEE_MAX_SLOTS];
 };
 
 #endif  // __EYRIE_CALL_H__

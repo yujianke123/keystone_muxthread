@@ -77,6 +77,20 @@ sbi_init_reentry_template() {
 }
 
 uintptr_t
+sbi_current_hart() {
+  register uintptr_t a0 __asm__("a0") = 0;
+  register uintptr_t a1 __asm__("a1") = 0;
+  register uintptr_t a6 __asm__("a6") = SBI_SM_CURRENT_HART;
+  register uintptr_t a7 __asm__("a7") = SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE;
+
+  __asm__ volatile("ecall"
+                   : "+r"(a0), "+r"(a1)
+                   : "r"(a6), "r"(a7)
+                   : "memory");
+  return a1;
+}
+
+uintptr_t
 sbi_random() {
   SBI_CALL_0(SBI_EXT_EXPERIMENTAL_KEYSTONE_ENCLAVE, SBI_SM_RANDOM);
   register uintptr_t a1 __asm__("a1");

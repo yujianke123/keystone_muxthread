@@ -249,6 +249,15 @@ unsigned long sbi_sm_mint_slot_cap(
   return ret;
 }
 
+unsigned long sbi_sm_current_hart(unsigned long *out_val)
+{
+  if (!out_val)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  *out_val = csr_read(mhartid);
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
 unsigned long sbi_sm_exit_slot(
     struct sbi_trap_regs *regs, uintptr_t slot_id, uintptr_t lease_id,
     uintptr_t exit_reason, uintptr_t value)

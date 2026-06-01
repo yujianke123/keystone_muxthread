@@ -20,6 +20,8 @@ const char* longstr = "hellohellohellohellohellohellohellohellohellohello";
 static int suppress_enclave_prints;
 static uintptr_t copied_print_value;
 static int copied_print_value_ready;
+static int slottee_trace_log;
+static const uintptr_t slottee_trace_unknown = ~(uintptr_t)0;
 
 unsigned long
 print_buffer(char* str) {
@@ -56,7 +58,7 @@ static const uintptr_t slottee_ticket_windows = SLOTTEE_MULTIHART_TICKET_WINDOWS
 static const uintptr_t slottee_ticket_max_windows =
     SLOTTEE_MULTIHART_TICKET_MAX_WINDOWS;
 static const uintptr_t slottee_multihart_resume_limit = 512;
-static const uintptr_t slottee_multihart_wait_budget = 65536;
+static const uintptr_t slottee_multihart_wait_budget = 262144;
 static const uintptr_t slottee_edgecall_stress_rounds = 5;
 static const uintptr_t slottee_ticket_retry_limit = 128;
 static const uintptr_t slottee_edgecall_stress_resume_limit = 8192;
@@ -230,6 +232,77 @@ read_cycle_counter() {
   return cycles;
 }
 
+static void
+slottee_trace_emit(const char* op, uintptr_t slot_id, uintptr_t lease_id,
+    uintptr_t hart_hint, uintptr_t status, uintptr_t cycles)
+{
+  if (!slottee_trace_log)
+    return;
+
+  printf("slottee_trace,%s,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      op, slot_id, lease_id, (uintptr_t)pthread_self(), hart_hint,
+      status, cycles);
+  fflush(stdout);
+}
+
+static void
+slottee_trace_header()
+{
+  if (!slottee_trace_log)
+    return;
+
+  printf("slottee_trace,op,slot_id,lease_id,pthread_id,hart_hint,status,cycles\n");
+  fflush(stdout);
+}
+
+static Keystone::Error
+slottee_trace_destroy(Keystone::Enclave& enclave)
+{
+  uintptr_t start = read_cycle_counter();
+  Keystone::Error ret = enclave.destroy();
+  uintptr_t cycles = read_cycle_counter() - start;
+
+  slottee_trace_emit("destroy", 0, 0, slottee_trace_unknown,
+      (uintptr_t)ret, cycles);
+  return ret;
+}
+
+static Keystone::Error
+slottee_trace_enter_slot_with_request(Keystone::Enclave& enclave,
+    const enter_slot_req_t& req, enter_slot_resp_t* resp, const char* op)
+{
+  enter_slot_resp_t local_resp = {};
+  enter_slot_resp_t* out_resp = resp ? resp : &local_resp;
+  uintptr_t start = read_cycle_counter();
+  Keystone::Error ret = enclave.enterSlotWithRequest(req, out_resp);
+  uintptr_t cycles = read_cycle_counter() - start;
+  uintptr_t status = ret == Keystone::Error::Success ?
+      out_resp->status : (uintptr_t)ret;
+  uintptr_t lease_id = ret == Keystone::Error::Success ?
+      out_resp->lease_id : slottee_trace_unknown;
+  uintptr_t bound_hart = ret == Keystone::Error::Success ?
+      out_resp->bound_hart : slottee_trace_unknown;
+
+  slottee_trace_emit(op, req.cap.slot_id, lease_id, bound_hart, status, cycles);
+  return ret;
+}
+
+static int
+slottee_multihart_harts_valid(
+    const struct slottee_multihart_ticket_report* report,
+    uintptr_t windows, uintptr_t online_harts)
+{
+  if (!report || !online_harts)
+    return 0;
+
+  for (uintptr_t window = 0; window < windows; window++) {
+    if (report->hart_id[window] >= online_harts)
+      return 0;
+  }
+
+  return 1;
+}
+
 static int
 expect_enter_slot_bench_row(const char* bench, uintptr_t iter, Keystone::Error ret,
     uintptr_t status, uintptr_t value, uintptr_t expected, uintptr_t cycles) {
@@ -291,7 +364,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
 
     slot_cap_t cap = make_enter_slot_test_cap(1);
     if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -302,7 +375,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
 
     if (expect_enter_slot_bench_row("null_enter", iter, ret, status, value,
             SBI_ERR_SM_NOT_IMPLEMENTED, cycles)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
@@ -317,7 +390,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
 
     slot_cap_t cap = make_enter_slot_test_cap(1);
     if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -325,7 +398,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
         cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value);
     if (ret != Keystone::Error::Success || status != SBI_ERR_SM_NOT_IMPLEMENTED) {
       printf("[FAIL] ENTER_SLOT duplicate bench setup failed at iter %lu\n", iter);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -337,7 +410,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
 
     if (expect_enter_slot_bench_row("duplicate_reject", iter, ret, status, value,
             SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT, cycles)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
@@ -357,7 +430,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
 
     if (expect_enter_slot_bench_row("stale_epoch_reject", iter, ret, status, value,
             SBI_ERR_SM_ENCLAVE_BAD_CAP, cycles)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
@@ -373,7 +446,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
       return 1;
 
     if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -381,7 +454,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
         cap, SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value);
     if (ret != Keystone::Error::Success || status != SBI_ERR_SM_NOT_IMPLEMENTED) {
       printf("[FAIL] ENTER_SLOT revoke replay bench setup failed at iter %lu\n", iter);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -395,7 +468,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
 
     if (expect_enter_slot_bench_row("revoke_replay_reject", iter, ret, status, value,
             SBI_ERR_SM_ENCLAVE_NOT_FRESH, cycles)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
@@ -410,7 +483,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
 
     slot_cap_t cap = make_enter_slot_test_cap(1);
     if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -422,7 +495,7 @@ run_enter_slot_bench(const char* eapp_file, const char* rt_file, const char* ld_
     if (expect_enter_slot_bench_row("real_enter", iter, ret, status, value,
             SBI_ERR_SM_ENCLAVE_SUCCESS, cycles) ||
         expect_enter_slot_bench_value("real_enter", iter, value, SLOTTEE_SLOT_MAGIC)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
@@ -478,7 +551,7 @@ enter_slot_pool_worker(void* opaque) {
       break;
     }
   }
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return NULL;
 }
 
@@ -585,7 +658,7 @@ run_enter_slot_with_seeded_caps(const char* label, uintptr_t flags,
     Keystone::Error ret;
 
     if (get_copied_slot_cap(slot_id, &cap)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -599,12 +672,12 @@ run_enter_slot_with_seeded_caps(const char* label, uintptr_t flags,
         expect_enter_slot_bench_value(
             label, worker, value, expected_value) ||
         lease == 0) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   usleep(slottee_edgecall_stress_quiesce_us);
   return 0;
 }
@@ -675,7 +748,8 @@ enter_slot_request_once_with_cap(Keystone::Enclave& enclave, const slot_cap_t& c
   req.cap = cap;
   req.flags = flags;
 
-  Keystone::Error ret = enclave.enterSlotWithRequest(req, &resp);
+  Keystone::Error ret = slottee_trace_enter_slot_with_request(
+      enclave, req, &resp, "enter");
   if (status)
     *status = resp.status;
   if (value)
@@ -793,7 +867,7 @@ enter_slot_resume_once_with_cap(
   req.flags = SLOTTEE_ENTER_SLOT_FLAG_RESUME_LT_USER_OCALL;
   req.host_nonce = lease_id;
 
-  ret = enclave.enterSlotWithRequest(req, &resp);
+  ret = slottee_trace_enter_slot_with_request(enclave, req, &resp, "resume");
   if (status)
     *status = resp.status;
   if (value)
@@ -865,7 +939,7 @@ run_enter_slot_same_enclave_multislot(const char* eapp_file, const char* rt_file
           status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       expect_enter_slot_bench_value("same_enclave_real", 1, value,
           SLOTTEE_SLOT_MAGIC)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   printf("same_enclave_real,1,%lu,%lu,%lu,%lu\n",
@@ -881,7 +955,7 @@ run_enter_slot_same_enclave_multislot(const char* eapp_file, const char* rt_file
           status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       expect_enter_slot_bench_value("same_enclave_real", 2, value,
           SLOTTEE_SLOT_MAGIC)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   printf("same_enclave_real,2,%lu,%lu,%lu,%lu\n",
@@ -891,11 +965,11 @@ run_enter_slot_same_enclave_multislot(const char* eapp_file, const char* rt_file
   if (slot1_lease == 0 || slot2_lease == 0 || slot1_lease == slot2_lease) {
     printf("[FAIL] ENTER_SLOT same-enclave returned invalid lease ids (%lu, %lu)\n",
         slot1_lease, slot2_lease);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -1033,7 +1107,7 @@ enter_slot_ocall_worker(void* opaque) {
   arg->ret = enter_slot_user_ocall_round(enclave, arg->slot_id, &arg->status,
       &arg->value, &lease_id, &arg->ocall_count, &arg->resume_count);
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   pthread_mutex_unlock(&enter_slot_ocall_lock);
   return NULL;
 }
@@ -1137,7 +1211,7 @@ run_enter_slot_lt_user_ocall_same_enclave(const char* eapp_file, const char* rt_
           Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       expect_enter_slot_bench_value("same_enclave_lt_user_ocall", 1, value,
           SLOTTEE_LT_USER_OCALL_MAGIC)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   printf("same_enclave_lt_user_ocall,1,%lu,%lu,%lu,%lu,%lu\n",
@@ -1152,7 +1226,7 @@ run_enter_slot_lt_user_ocall_same_enclave(const char* eapp_file, const char* rt_
           Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       expect_enter_slot_bench_value("same_enclave_lt_user_ocall", 2, value,
           SLOTTEE_LT_USER_OCALL_MAGIC)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   printf("same_enclave_lt_user_ocall,2,%lu,%lu,%lu,%lu,%lu\n",
@@ -1162,7 +1236,7 @@ run_enter_slot_lt_user_ocall_same_enclave(const char* eapp_file, const char* rt_
   if (slot1_lease == 0 || slot2_lease == 0 || slot1_lease == slot2_lease) {
     printf("[FAIL] ENTER_SLOT same-enclave LT user ocall returned invalid lease ids (%lu, %lu)\n",
         slot1_lease, slot2_lease);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1170,11 +1244,11 @@ run_enter_slot_lt_user_ocall_same_enclave(const char* eapp_file, const char* rt_
       slot1_resumes != 1 || slot2_resumes != 1) {
     printf("[FAIL] ENTER_SLOT same-enclave LT user ocall returned unexpected ocall/resume counts (%lu/%lu, %lu/%lu)\n",
         slot1_ocalls, slot1_resumes, slot2_ocalls, slot2_resumes);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -1216,13 +1290,13 @@ run_enter_slot_watchdog_ttl(const char* eapp_file, const char* rt_file,
     if (ret != Keystone::Error::Success || get_copied_slot_cap(1, &cap)) {
       printf("[FAIL] watchdog_ttl failed to seed RT-authorized cap round %lu ret=%d value=%lu ocalls=%lu resumes=%lu\n",
           round, (int)ret, seed_value, seed_ocalls, seed_resumes);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
     if (cap.max_lease_cycles != enter_slot_watchdog_ttl) {
       printf("[FAIL] watchdog_ttl expected short cap TTL %lu got %lu round %lu\n",
           enter_slot_watchdog_ttl, cap.max_lease_cycles, round);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -1236,7 +1310,7 @@ run_enter_slot_watchdog_ttl(const char* eapp_file, const char* rt_file,
         status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || lease == 0) {
       printf("[FAIL] watchdog_ttl expected first slot entry to stop on OCALL round %lu\n",
           round);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -1244,7 +1318,7 @@ run_enter_slot_watchdog_ttl(const char* eapp_file, const char* rt_file,
         &debug_resp);
     if (slottee_watchdog_debug_row(round, "before_expiry", ret, debug_resp,
             0, 1, 0)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -1259,7 +1333,7 @@ run_enter_slot_watchdog_ttl(const char* eapp_file, const char* rt_file,
         reclaimed != 1) {
       printf("[FAIL] watchdog_ttl expected watchdog to reclaim one expired lease round %lu\n",
           round);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -1267,7 +1341,7 @@ run_enter_slot_watchdog_ttl(const char* eapp_file, const char* rt_file,
         &debug_resp);
     if (slottee_watchdog_debug_row(round, "after_expiry", ret, debug_resp,
             0, 0, 1)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -1282,11 +1356,11 @@ run_enter_slot_watchdog_ttl(const char* eapp_file, const char* rt_file,
         status != SBI_ERR_SM_ENCLAVE_NOT_FRESH) {
       printf("[FAIL] watchdog_ttl expected stale cap replay rejection after epoch advance round %lu\n",
           round);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
-    if (enclave.destroy() != Keystone::Error::Success) {
+    if (slottee_trace_destroy(enclave) != Keystone::Error::Success) {
       printf("[FAIL] watchdog_ttl failed clean destroy round %lu\n", round);
       return 1;
     }
@@ -1341,7 +1415,7 @@ run_enter_slot_lt_user_fault_cleanup_same_enclave(const char* label,
       expect_enter_slot_status("ENTER_SLOT same-enclave LT user fault slot1",
           Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       expect_enter_slot_bench_value(label, 1, value, expected_fault_value)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   printf("%s,1,%lu,%lu,%lu,%lu,%lu\n",
@@ -1356,7 +1430,7 @@ run_enter_slot_lt_user_fault_cleanup_same_enclave(const char* label,
           Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       expect_enter_slot_bench_value(label, 2, value,
           SLOTTEE_LT_USER_OCALL_MAGIC)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   printf("%s,2,%lu,%lu,%lu,%lu,%lu\n",
@@ -1366,18 +1440,18 @@ run_enter_slot_lt_user_fault_cleanup_same_enclave(const char* label,
   if (fault_lease == 0 || ocall_lease == 0 || fault_lease == ocall_lease) {
     printf("[FAIL] ENTER_SLOT %s returned invalid lease ids (%lu, %lu)\n",
         label, fault_lease, ocall_lease);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   if (fault_ocalls != 0 || ocall_ocalls != 1 || ocall_resumes != 1) {
     printf("[FAIL] ENTER_SLOT %s returned unexpected ocall/resume counts (%lu/%lu, %lu/%lu)\n",
         label, fault_ocalls, fault_resumes, ocall_ocalls, ocall_resumes);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -1434,7 +1508,7 @@ run_enter_slot_lt_user_destroy_after_reentry(const char* eapp_file,
       expect_enter_slot_bench_value("lt_user_destroy_after_reentry", 1, value,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       completed_lease == 0 || ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1448,11 +1522,11 @@ run_enter_slot_lt_user_destroy_after_reentry(const char* eapp_file,
   if (ret != Keystone::Error::Success ||
       status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || pending_lease == 0) {
     printf("[FAIL] ENTER_SLOT destroy-after-reentry did not stop at edgecall boundary\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  ret = enclave.destroy();
+  ret = slottee_trace_destroy(enclave);
   printf("lt_user_destroy_after_reentry,destroy,%d,0,0,0,0,0\n", (int)ret);
   fflush(stdout);
   if (ret != Keystone::Error::Success) {
@@ -1482,11 +1556,11 @@ run_enter_slot_lt_user_destroy_after_reentry(const char* eapp_file,
       expect_enter_slot_bench_value("lt_user_destroy_after_reentry", 2, value,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       recreated_lease == 0 || ocalls != 1 || resumes != 1) {
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
-  recreated.destroy();
+  slottee_trace_destroy(recreated);
   return 0;
 }
 
@@ -1529,14 +1603,14 @@ run_enter_slot_lt_user_revoke_after_reentry(const char* eapp_file,
       expect_enter_slot_bench_value("lt_user_revoke_after_reentry", 1, value,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       reentry_lease == 0 || ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   cap = make_enter_slot_test_cap(2);
   cap.max_lease_cycles = SLOTTEE_TEST_MAX_LEASE_CYCLES;
   if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   status = 0;
@@ -1549,7 +1623,7 @@ run_enter_slot_lt_user_revoke_after_reentry(const char* eapp_file,
   if (expect_enter_slot_status("ENTER_SLOT revoke-after-reentry reserve", ret,
           status, value, SBI_ERR_SM_NOT_IMPLEMENTED) ||
       reserved_lease == 0) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1564,14 +1638,14 @@ run_enter_slot_lt_user_revoke_after_reentry(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT revoke-after-reentry replay", ret,
           status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   cap = make_enter_slot_test_cap(2);
   cap.epoch = SLOTTEE_INITIAL_EPOCH + 1;
   if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   status = 0;
@@ -1590,11 +1664,11 @@ run_enter_slot_lt_user_revoke_after_reentry(const char* eapp_file,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       fresh_lease == 0 || fresh_lease == reserved_lease ||
       ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -1682,7 +1756,7 @@ run_enter_slot_lt_user_destroy_race(const char* eapp_file,
       pthread_create(&destroy_thread, NULL,
           enter_slot_destroy_race_destroy_worker, &arg) != 0) {
     printf("[FAIL] ENTER_SLOT destroy race failed to create workers\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -1691,7 +1765,7 @@ run_enter_slot_lt_user_destroy_race(const char* eapp_file,
   if (pthread_join(enter_thread, NULL) != 0 ||
       pthread_join(destroy_thread, NULL) != 0) {
     printf("[FAIL] ENTER_SLOT destroy race failed to join workers\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -1729,11 +1803,11 @@ run_enter_slot_lt_user_destroy_race(const char* eapp_file,
       expect_enter_slot_bench_value("lt_user_destroy_race", 1, value,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       lease == 0 || ocalls != 1 || resumes != 1) {
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
-  recreated.destroy();
+  slottee_trace_destroy(recreated);
   return 0;
 }
 
@@ -1783,14 +1857,14 @@ run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
           Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       expect_enter_slot_bench_value("double_enter_epoch_rollover", 1, value,
           SLOTTEE_LT_USER_OCALL_MAGIC)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   cap = make_enter_slot_test_cap(2);
   cap.max_lease_cycles = rollover_ttl;
   if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   ret = enter_slot_request_once_with_cap(enclave, cap,
@@ -1801,7 +1875,7 @@ run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
   if (expect_enter_slot_status("ENTER_SLOT double-enter reserve", ret,
           status, value, SBI_ERR_SM_NOT_IMPLEMENTED) ||
       reserved_lease == 0) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1812,7 +1886,7 @@ run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT double-enter duplicate", ret,
           status, value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1823,7 +1897,7 @@ run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
   if (ret != Keystone::Error::Success || status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
       epoch != SLOTTEE_INITIAL_EPOCH + 1) {
     printf("[FAIL] ENTER_SLOT double-enter epoch rollover failed to revoke busy slot\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1834,14 +1908,14 @@ run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT double-enter replay", ret,
           status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   fresh_cap = make_enter_slot_test_cap(2);
   fresh_cap.epoch = epoch;
   if (mint_enter_slot_test_cap(enclave, &fresh_cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   ocalls = 0;
@@ -1858,11 +1932,11 @@ run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       fresh_lease == 0 || fresh_lease == reserved_lease ||
       ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  if (enclave.destroy() != Keystone::Error::Success) {
+  if (slottee_trace_destroy(enclave) != Keystone::Error::Success) {
     printf("[FAIL] ENTER_SLOT double-enter failed to destroy first enclave\n");
     return 1;
   }
@@ -1880,7 +1954,7 @@ run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT double-enter recreated old epoch", ret,
           status, value, SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
@@ -1897,11 +1971,11 @@ run_enter_slot_double_enter_epoch_rollover(const char* eapp_file,
       expect_enter_slot_bench_value("double_enter_epoch_rollover", 3, value,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       recreated_lease == 0 || ocalls != 1 || resumes != 1) {
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
-  recreated.destroy();
+  slottee_trace_destroy(recreated);
   return 0;
 }
 
@@ -1947,7 +2021,7 @@ run_enter_slot_mark_revoke(const char* eapp_file,
           Keystone::Error::Success, status, value, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       expect_enter_slot_bench_value("mark_revoke", 1, value,
           SLOTTEE_LT_USER_OCALL_MAGIC)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1959,13 +2033,13 @@ run_enter_slot_mark_revoke(const char* eapp_file,
   if (ret != Keystone::Error::Success ||
       status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || lease == 0) {
     printf("[FAIL] ENTER_SLOT mark revoke did not stop at edgecall boundary\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   old_cap = make_enter_slot_test_cap(2);
   if (mint_enter_slot_test_cap(enclave, &old_cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1976,7 +2050,7 @@ run_enter_slot_mark_revoke(const char* eapp_file,
   if (ret != Keystone::Error::Success || status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
       epoch != SLOTTEE_INITIAL_EPOCH + 1) {
     printf("[FAIL] ENTER_SLOT mark revoke returned unexpected epoch/status\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1986,7 +2060,7 @@ run_enter_slot_mark_revoke(const char* eapp_file,
   fflush(stdout);
   if (resume_ret != Keystone::Error::EnclaveNotResumable) {
     printf("[FAIL] ENTER_SLOT mark revoke returned unexpected revoked slot resume status\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -1998,14 +2072,14 @@ run_enter_slot_mark_revoke(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT mark revoke old cap", ret,
           status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   fresh_cap = make_enter_slot_test_cap(2);
   fresh_cap.epoch = epoch;
   if (mint_enter_slot_test_cap(enclave, &fresh_cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   ocalls = 0;
@@ -2022,11 +2096,11 @@ run_enter_slot_mark_revoke(const char* eapp_file,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       fresh_lease == 0 || fresh_lease == lease ||
       ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -2075,7 +2149,7 @@ run_enter_slot_active_revoke_boundary(const char* eapp_file,
       expect_enter_slot_bench_value("active_revoke_boundary", 1, value,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       baseline_lease == 0 || ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -2088,7 +2162,7 @@ run_enter_slot_active_revoke_boundary(const char* eapp_file,
   if (ret != Keystone::Error::Success ||
       status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || pending_lease == 0) {
     printf("[FAIL] ENTER_SLOT active revoke boundary did not stop at edgecall\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -2100,13 +2174,13 @@ run_enter_slot_active_revoke_boundary(const char* eapp_file,
       status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
       epoch != SLOTTEE_INITIAL_EPOCH + 1) {
     printf("[FAIL] ENTER_SLOT active revoke boundary markRevoke returned unexpected projected epoch/status\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   old_cap = make_enter_slot_test_cap(2);
   if (mint_enter_slot_test_cap(enclave, &old_cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   ret = enter_slot_request_once_with_cap(enclave, old_cap,
@@ -2116,7 +2190,7 @@ run_enter_slot_active_revoke_boundary(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT active revoke pending duplicate", ret,
           status, value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -2127,7 +2201,7 @@ run_enter_slot_active_revoke_boundary(const char* eapp_file,
   fflush(stdout);
   if (resume_ret != Keystone::Error::EnclaveNotResumable) {
     printf("[FAIL] ENTER_SLOT active revoke boundary returned unexpected old resume status\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -2139,14 +2213,14 @@ run_enter_slot_active_revoke_boundary(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT active revoke old cap", ret,
           status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   fresh_cap = make_enter_slot_test_cap(2);
   fresh_cap.epoch = epoch;
   if (mint_enter_slot_test_cap(enclave, &fresh_cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   ocalls = 0;
@@ -2163,11 +2237,11 @@ run_enter_slot_active_revoke_boundary(const char* eapp_file,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       fresh_lease == 0 || fresh_lease == pending_lease ||
       ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -2389,7 +2463,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
       &seed_resumes, NULL);
   if (ret != Keystone::Error::Success ||
       get_copied_slot_cap(1, &baseline_cap)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   ret = enter_slot_user_ocall_round_with_cap(enclave, baseline_cap, &status,
@@ -2404,7 +2478,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
       expect_enter_slot_bench_value("active_revoke_timer_stress", 0,
           value, SLOTTEE_LT_USER_OCALL_MAGIC) ||
       baseline_lease == 0 || ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   last_lease = baseline_lease;
@@ -2420,7 +2494,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
     arg.enclave = &enclave;
     arg.slot_id = 2;
     if (get_copied_slot_cap(arg.slot_id, &arg.cap)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
     arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL;
@@ -2434,7 +2508,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
     if (pthread_create(&enter_thread, NULL,
             enter_slot_active_revoke_timer_enter_worker, &arg) != 0) {
       printf("[FAIL] ENTER_SLOT active revoke timer stress failed to create enter worker\n");
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       pthread_mutex_destroy(&arg.lock);
       pthread_cond_destroy(&arg.cond);
       return 1;
@@ -2444,7 +2518,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
             enter_slot_active_revoke_timer_mark_worker, &arg) != 0) {
       printf("[FAIL] ENTER_SLOT active revoke timer stress failed to create mark worker\n");
       pthread_join(enter_thread, NULL);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       pthread_mutex_destroy(&arg.lock);
       pthread_cond_destroy(&arg.cond);
       return 1;
@@ -2453,7 +2527,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
     if (pthread_join(mark_thread, NULL) != 0 ||
         pthread_join(enter_thread, NULL) != 0) {
       printf("[FAIL] ENTER_SLOT active revoke timer stress failed to join workers\n");
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       pthread_mutex_destroy(&arg.lock);
       pthread_cond_destroy(&arg.cond);
       return 1;
@@ -2480,7 +2554,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
         arg.enter_lease <= last_lease) {
       printf("[FAIL] ENTER_SLOT active revoke timer stress failed active round %lu\n",
           round);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       pthread_mutex_destroy(&arg.lock);
       pthread_cond_destroy(&arg.cond);
       return 1;
@@ -2494,7 +2568,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
     fflush(stdout);
     if (expect_enter_slot_status("ENTER_SLOT active revoke timer old cap", ret,
             status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       pthread_mutex_destroy(&arg.lock);
       pthread_cond_destroy(&arg.cond);
       return 1;
@@ -2504,7 +2578,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
         &seed_resumes, NULL);
     if (ret != Keystone::Error::Success ||
         get_copied_slot_cap(arg.slot_id, &fresh_cap)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       pthread_mutex_destroy(&arg.lock);
       pthread_cond_destroy(&arg.cond);
       return 1;
@@ -2528,7 +2602,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
         ocalls != 1 || resumes < 1) {
       printf("[FAIL] ENTER_SLOT active revoke timer stress new epoch failed round %lu\n",
           round);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       pthread_mutex_destroy(&arg.lock);
       pthread_cond_destroy(&arg.cond);
       return 1;
@@ -2540,7 +2614,7 @@ run_enter_slot_active_revoke_timer_stress(const char* eapp_file,
     pthread_cond_destroy(&arg.cond);
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -2575,7 +2649,7 @@ run_enter_slot_first_active_revoke_template(const char* eapp_file,
   arg.slot_id = 2;
   arg.cap = make_enter_slot_test_cap(arg.slot_id);
   if (mint_enter_slot_test_cap(enclave, &arg.cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL;
@@ -2591,7 +2665,7 @@ run_enter_slot_first_active_revoke_template(const char* eapp_file,
 
   if (enter_slot_active_revoke_timer_run_workers(
           "ENTER_SLOT first active revoke template", &arg)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2617,7 +2691,7 @@ run_enter_slot_first_active_revoke_template(const char* eapp_file,
       arg.enter_status != SBI_ERR_SM_ENCLAVE_INTERRUPTED ||
       arg.enter_lease == 0) {
     printf("[FAIL] ENTER_SLOT first active revoke template failed active round\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2627,7 +2701,7 @@ run_enter_slot_first_active_revoke_template(const char* eapp_file,
       &debug_resp);
   if (expect_slottee_debug_row("first_active_revoke_template",
           "debug_after_interrupt", ret, debug_resp, 1, arg.mark_epoch, 0, 0)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2640,7 +2714,7 @@ run_enter_slot_first_active_revoke_template(const char* eapp_file,
   fflush(stdout);
   if (resume_ret != Keystone::Error::EnclaveNotResumable) {
     printf("[FAIL] ENTER_SLOT first active revoke template returned unexpected old resume status\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2654,7 +2728,7 @@ run_enter_slot_first_active_revoke_template(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT first active revoke template old cap",
           ret, status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2663,7 +2737,7 @@ run_enter_slot_first_active_revoke_template(const char* eapp_file,
   fresh_cap = make_enter_slot_test_cap(arg.slot_id);
   fresh_cap.epoch = arg.mark_epoch;
   if (mint_enter_slot_test_cap(enclave, &fresh_cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2679,7 +2753,7 @@ run_enter_slot_first_active_revoke_template(const char* eapp_file,
       expect_enter_slot_bench_value("first_active_revoke_template", 2, value,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       fresh_lease <= arg.enter_lease || ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2689,13 +2763,13 @@ run_enter_slot_first_active_revoke_template(const char* eapp_file,
       &debug_resp);
   if (expect_slottee_debug_row("first_active_revoke_template",
           "debug_after_new_epoch", ret, debug_resp, 1, fresh_cap.epoch, 0, 0)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   pthread_mutex_destroy(&arg.lock);
   pthread_cond_destroy(&arg.cond);
   return 0;
@@ -2730,7 +2804,7 @@ run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
   arg.slot_id = 2;
   arg.cap = make_enter_slot_test_cap(arg.slot_id);
   if (mint_enter_slot_test_cap(enclave, &arg.cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL;
@@ -2746,7 +2820,7 @@ run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
 
   if (enter_slot_active_revoke_timer_run_workers(
           "ENTER_SLOT first active revoke diagnostic", &arg)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2772,7 +2846,7 @@ run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
       arg.enter_status != SBI_ERR_SM_ENCLAVE_INTERRUPTED ||
       arg.enter_lease == 0) {
     printf("[FAIL] ENTER_SLOT first active revoke diagnostic failed active round\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2782,7 +2856,7 @@ run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
       &debug_resp);
   if (expect_slottee_debug_row("first_active_revoke_diagnostic",
           "debug_before_clear", ret, debug_resp, 1, arg.mark_epoch, 0, 0)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2792,7 +2866,7 @@ run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
       &debug_resp);
   if (expect_slottee_debug_row("first_active_revoke_diagnostic",
           "debug_after_clear", ret, debug_resp, 0, arg.mark_epoch, 0, 0)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2805,7 +2879,7 @@ run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
   fflush(stdout);
   if (resume_ret != Keystone::Error::EnclaveNotResumable) {
     printf("[FAIL] ENTER_SLOT first active revoke diagnostic returned unexpected old resume status\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2819,7 +2893,7 @@ run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT first active revoke diagnostic old cap",
           ret, status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2828,7 +2902,7 @@ run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
   fresh_cap = make_enter_slot_test_cap(arg.slot_id);
   fresh_cap.epoch = arg.mark_epoch;
   if (mint_enter_slot_test_cap(enclave, &fresh_cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2842,13 +2916,13 @@ run_enter_slot_first_active_revoke_diagnostic(const char* eapp_file,
   if (expect_enter_slot_status(
           "ENTER_SLOT first active revoke diagnostic new epoch without template",
           ret, status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   pthread_mutex_destroy(&arg.lock);
   pthread_cond_destroy(&arg.cond);
   return 0;
@@ -2880,7 +2954,7 @@ run_enter_slot_active_revoke_destroy_race(const char* eapp_file,
   if (seed_rt_authorized_caps(enclave, 3, &seed_value, &seed_ocalls,
           &seed_resumes, NULL) != Keystone::Error::Success ||
       get_copied_slot_cap(arg.slot_id, &arg.cap)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL;
@@ -2897,7 +2971,7 @@ run_enter_slot_active_revoke_destroy_race(const char* eapp_file,
 
   if (enter_slot_active_revoke_timer_run_workers(
           "ENTER_SLOT active revoke destroy race", &arg)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -2929,13 +3003,13 @@ run_enter_slot_active_revoke_destroy_race(const char* eapp_file,
       arg.enter_status != SBI_ERR_SM_ENCLAVE_INTERRUPTED ||
       arg.enter_lease == 0) {
     printf("[FAIL] ENTER_SLOT active revoke destroy race returned unexpected active result\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
   }
 
-  final_destroy_ret = enclave.destroy();
+  final_destroy_ret = slottee_trace_destroy(enclave);
   printf("active_revoke_destroy_race,final_destroy,%d,0,0,0,%lu,0,0\n",
       (int)final_destroy_ret, arg.mark_epoch);
   fflush(stdout);
@@ -2986,13 +3060,13 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
   if (seed_rt_authorized_caps(enclave, 3, &seed_value, &seed_ocalls,
           &seed_resumes, NULL) != Keystone::Error::Success ||
       get_copied_slot_cap(arg.slot_id, &arg.cap)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   arg.enter_flags = SLOTTEE_ENTER_SLOT_FLAG_REAL_LT_USER_OCALL;
   arg.run_second_slot_after_mark = 1;
   if (get_copied_slot_cap(3, &arg.second_cap)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   arg.enter_ret = Keystone::Error::DeviceError;
@@ -3009,7 +3083,7 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
 
   if (enter_slot_active_revoke_timer_run_workers(
           "ENTER_SLOT active revoke multislot stress", &arg)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -3061,7 +3135,7 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
       arg.enter_status != SBI_ERR_SM_ENCLAVE_INTERRUPTED ||
       arg.enter_lease == 0) {
     printf("[FAIL] ENTER_SLOT active revoke multislot stress returned unexpected active result\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -3071,7 +3145,7 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
       &debug_resp);
   if (expect_slottee_debug_row("active_revoke_multislot_stress",
           "debug_after_interleave", ret, debug_resp, 1, arg.mark_epoch, 0, 0)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -3085,7 +3159,7 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT active revoke multislot old cap",
           ret, status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -3095,7 +3169,7 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
       &seed_resumes, NULL);
   if (ret != Keystone::Error::Success ||
       get_copied_slot_cap(arg.slot_id, &fresh_cap)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
@@ -3113,13 +3187,13 @@ run_enter_slot_active_revoke_multislot_stress(const char* eapp_file,
       (second_old_epoch_ok && fresh_lease <= arg.second_lease) ||
       fresh_lease <= arg.enter_lease ||
       ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     pthread_mutex_destroy(&arg.lock);
     pthread_cond_destroy(&arg.cond);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   pthread_mutex_destroy(&arg.lock);
   pthread_cond_destroy(&arg.cond);
   return 0;
@@ -3156,7 +3230,7 @@ run_enter_slot_rt_revoke_fault(const char* eapp_file,
 
   old_cap = make_enter_slot_test_cap(1);
   if (mint_enter_slot_test_cap(enclave, &old_cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3172,7 +3246,7 @@ run_enter_slot_rt_revoke_fault(const char* eapp_file,
       expect_enter_slot_bench_value("rt_revoke_fault", 1, value,
           SLOTTEE_LT_USER_PAGE_FAULT_MAGIC) ||
       fault_lease == 0) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3184,14 +3258,14 @@ run_enter_slot_rt_revoke_fault(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT RT revoke fault old cap", ret,
           status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   fresh_cap = make_enter_slot_test_cap(1);
   fresh_cap.epoch = SLOTTEE_INITIAL_EPOCH + 1;
   if (mint_enter_slot_test_cap(enclave, &fresh_cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   ret = enter_slot_user_ocall_round_with_cap_and_flags(enclave, fresh_cap,
@@ -3207,11 +3281,11 @@ run_enter_slot_rt_revoke_fault(const char* eapp_file,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       fresh_lease == 0 || fresh_lease == fault_lease ||
       ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -3255,7 +3329,7 @@ run_enter_slot_revoke_stress(const char* eapp_file,
     cap.epoch = epoch;
     cap.max_lease_cycles = long_ttl;
     if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -3269,7 +3343,7 @@ run_enter_slot_revoke_stress(const char* eapp_file,
         reserved_lease <= last_lease) {
       printf("[FAIL] ENTER_SLOT revoke stress reserve lease did not grow (%lu <= %lu)\n",
           reserved_lease, last_lease);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -3280,7 +3354,7 @@ run_enter_slot_revoke_stress(const char* eapp_file,
     fflush(stdout);
     if (expect_enter_slot_status("ENTER_SLOT revoke stress duplicate", ret,
             status, value, SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -3292,7 +3366,7 @@ run_enter_slot_revoke_stress(const char* eapp_file,
         status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
         epoch != SLOTTEE_INITIAL_EPOCH + round) {
       printf("[FAIL] ENTER_SLOT revoke stress markRevoke returned unexpected epoch/status\n");
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -3303,14 +3377,14 @@ run_enter_slot_revoke_stress(const char* eapp_file,
     fflush(stdout);
     if (expect_enter_slot_status("ENTER_SLOT revoke stress old cap", ret,
             status, value, SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
     fresh_cap = make_enter_slot_test_cap(2);
     fresh_cap.epoch = epoch;
     if (mint_enter_slot_test_cap(enclave, &fresh_cap) != Keystone::Error::Success) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
     ret = enter_slot_user_ocall_round_with_cap(enclave, fresh_cap,
@@ -3326,7 +3400,7 @@ run_enter_slot_revoke_stress(const char* eapp_file,
         fresh_lease <= reserved_lease ||
         ocalls != 1 || resumes != 1) {
       printf("[FAIL] ENTER_SLOT revoke stress new epoch failed round %lu\n", round);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -3334,7 +3408,7 @@ run_enter_slot_revoke_stress(const char* eapp_file,
     stale_after_recreate_cap = fresh_cap;
   }
 
-  if (enclave.destroy() != Keystone::Error::Success) {
+  if (slottee_trace_destroy(enclave) != Keystone::Error::Success) {
     printf("[FAIL] ENTER_SLOT revoke stress failed to destroy stressed enclave\n");
     return 1;
   }
@@ -3352,7 +3426,7 @@ run_enter_slot_revoke_stress(const char* eapp_file,
   fflush(stdout);
   if (expect_enter_slot_status("ENTER_SLOT revoke stress recreated old epoch", ret,
           status, value, SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
@@ -3369,11 +3443,11 @@ run_enter_slot_revoke_stress(const char* eapp_file,
       expect_enter_slot_bench_value("revoke_stress", 0, value,
           SLOTTEE_LT_USER_OCALL_MAGIC) ||
       last_lease == 0 || ocalls != 1 || resumes != 1) {
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
-  recreated.destroy();
+  slottee_trace_destroy(recreated);
   return 0;
 }
 
@@ -3433,7 +3507,7 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
           debug_resp.epoch, debug_resp.cap_key_ready, 0, 0,
           SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       debug_resp.cap_key_ready != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3442,14 +3516,14 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
   if (ret != Keystone::Error::Success ||
       get_copied_slot_cap(1, &cap) ||
       get_copied_slot_cap(2, &slot2_cap)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
   if (expect_cap_mac_forge_row("rt_seed", Keystone::Error::Success,
           SBI_ERR_SM_ENCLAVE_SUCCESS, value, 0, debug_resp.epoch,
           debug_resp.cap_key_ready, seed_ocalls, seed_resumes,
           SBI_ERR_SM_ENCLAVE_SUCCESS)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3462,7 +3536,7 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
           SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       value != SLOTTEE_LT_USER_OCALL_MAGIC || lease == 0 ||
       ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3475,7 +3549,7 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
   if (expect_cap_mac_forge_row("tamper_slot", ret, status, value, lease,
           debug_resp.epoch, debug_resp.cap_key_ready, 0, 0,
           SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3486,7 +3560,7 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
   if (expect_cap_mac_forge_row("tamper_rights", ret, status, value, lease,
           debug_resp.epoch, debug_resp.cap_key_ready, 0, 0,
           SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3497,7 +3571,7 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
   if (expect_cap_mac_forge_row("tamper_ttl", ret, status, value, lease,
           debug_resp.epoch, debug_resp.cap_key_ready, 0, 0,
           SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3509,14 +3583,14 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
   if (expect_cap_mac_forge_row("forge_mac", ret, status, value, lease,
           debug_resp.epoch, debug_resp.cap_key_ready, 0, 0,
           SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   if (cross_enclave.init(eapp_file, rt_file, ld_file, params) !=
       Keystone::Error::Success) {
     printf("[FAIL] ENTER_SLOT cap MAC forge failed to init cross enclave\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3524,17 +3598,17 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
       SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &lease);
   if (expect_cap_mac_forge_row("cross_enclave", ret, status, value, lease,
           SLOTTEE_INITIAL_EPOCH, 1, 0, 0, SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
-    cross_enclave.destroy();
-    enclave.destroy();
+    slottee_trace_destroy(cross_enclave);
+    slottee_trace_destroy(enclave);
     return 1;
   }
-  cross_enclave.destroy();
+  slottee_trace_destroy(cross_enclave);
 
 #ifdef SLOTTEE_DEBUG_MINT_ENABLE
   cap = make_enter_slot_test_cap(2);
   cap.max_lease_cycles = SLOTTEE_TEST_MAX_LEASE_CYCLES;
   if (mint_enter_slot_test_cap(enclave, &cap) != Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3544,7 +3618,7 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
           debug_resp.epoch, debug_resp.cap_key_ready, 0, 0,
           SBI_ERR_SM_NOT_IMPLEMENTED) ||
       lease == 0) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3556,7 +3630,7 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
   if (expect_cap_mac_forge_row("old_cap_replay", ret, status, value, lease,
           SLOTTEE_INITIAL_EPOCH + 1, debug_resp.cap_key_ready, 0, 0,
           SBI_ERR_SM_ENCLAVE_NOT_FRESH)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 #else
@@ -3564,12 +3638,12 @@ run_enter_slot_cap_mac_forge(const char* eapp_file,
           Keystone::Error::Success, SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED, 0, 0,
           debug_resp.epoch, debug_resp.cap_key_ready, 0, 0,
           SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 #endif
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -3622,7 +3696,7 @@ run_enter_slot_cap_generation_replay(const char* eapp_file,
 
   if (mint_enter_slot_test_cap_with_resp(enclave, &old_cap, &old_mint) !=
       Keystone::Error::Success) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3632,11 +3706,11 @@ run_enter_slot_cap_generation_replay(const char* eapp_file,
           SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       old_cap.epoch != SLOTTEE_INITIAL_EPOCH ||
       old_mint.cap_key_generation == 0) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  if (enclave.destroy() != Keystone::Error::Success) {
+  if (slottee_trace_destroy(enclave) != Keystone::Error::Success) {
     printf("[FAIL] ENTER_SLOT cap generation replay failed to destroy first enclave\n");
     return 1;
   }
@@ -3651,7 +3725,7 @@ run_enter_slot_cap_generation_replay(const char* eapp_file,
 
   if (mint_enter_slot_test_cap_with_resp(recreated, &new_cap, &new_mint) !=
       Keystone::Error::Success) {
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
@@ -3663,7 +3737,7 @@ run_enter_slot_cap_generation_replay(const char* eapp_file,
       new_cap.epoch != SLOTTEE_INITIAL_EPOCH ||
       old_mint.cap_key_generation == new_mint.cap_key_generation) {
     printf("[FAIL] cap_generation_replay did not exercise same eid/new generation\n");
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
@@ -3673,7 +3747,7 @@ run_enter_slot_cap_generation_replay(const char* eapp_file,
           value, lease, old_cap.eid, new_cap.eid, old_cap.epoch, new_cap.epoch,
           old_mint.cap_key_generation, new_mint.cap_key_generation, 0, 0,
           SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
@@ -3685,11 +3759,11 @@ run_enter_slot_cap_generation_replay(const char* eapp_file,
           resumes, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       value != SLOTTEE_LT_USER_OCALL_MAGIC ||
       lease == 0 || ocalls != 1 || resumes != 1) {
-    recreated.destroy();
+    slottee_trace_destroy(recreated);
     return 1;
   }
 
-  recreated.destroy();
+  slottee_trace_destroy(recreated);
   return 0;
 }
 
@@ -3791,7 +3865,7 @@ run_enter_slot_rt_authorized_mint(const char* eapp_file,
       cap.rights != SLOTTEE_CAP_RIGHT_ENTER ||
       cap.max_lease_cycles != SLOTTEE_DEFAULT_MAX_LEASE_CYCLES ||
       !slot_cap_mac_nonzero(cap)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3802,7 +3876,7 @@ run_enter_slot_rt_authorized_mint(const char* eapp_file,
           cap, lease, ocalls, resumes, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       value != SLOTTEE_LT_USER_OCALL_MAGIC || lease == 0 ||
       ocalls != 1 || resumes != 1) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -3812,11 +3886,11 @@ run_enter_slot_rt_authorized_mint(const char* eapp_file,
       SLOTTEE_ENTER_SLOT_FLAG_NONE, &status, &value, &lease);
   if (expect_rt_authorized_mint_row("tamper_rt_cap", ret, status, value,
           tampered, lease, 0, 0, SBI_ERR_SM_ENCLAVE_BAD_CAP)) {
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -3854,11 +3928,11 @@ run_enter_slot_policy(const char* eapp_file, const char* rt_file,
       copied_print_value != policy_report_ok) {
     printf("[FAIL] slottee policy returned unexpected result report=%lu ready=%d ocalls=%lu resumes=%lu\n",
         copied_print_value, copied_print_value_ready, ocalls, resumes);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -3895,7 +3969,7 @@ run_slottee_debug_mint_gate(const char* eapp_file,
       (int)ret, resp.status, resp.cap_key_ready, resp.cap.cap_mac[0]);
   fflush(stdout);
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
 
   if (ret != Keystone::Error::Success)
     return 1;
@@ -4102,7 +4176,7 @@ init_eval_enclave_with_caps(Keystone::Enclave& enclave, const char* eapp_file,
   if (ret != Keystone::Error::Success) {
     printf("[FAIL] slottee_eval failed to seed RT-authorized caps ret=%d value=%lu ocalls=%lu resumes=%lu\n",
         (int)ret, value, ocalls, resumes);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -4135,7 +4209,7 @@ run_slottee_eval_null_enter(const char* eapp_file,
             params, 1, &seed_cycles))
       return 1;
     if (get_copied_slot_cap(1, &cap)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -4153,11 +4227,11 @@ run_slottee_eval_null_enter(const char* eapp_file,
     if (ret != Keystone::Error::Success || status != SBI_ERR_SM_NOT_IMPLEMENTED) {
       printf("[FAIL] slottee_eval null_enter iter %lu ret=%d status=%lu\n",
           iter, (int)ret, status);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
   }
 
   double baseline_avg = slottee_null_enter_baseline_avg();
@@ -4218,7 +4292,7 @@ run_slottee_eval_ocall_roundtrip(const char* eapp_file,
         &seed_ocalls, &seed_resumes, &seed_cycles);
     if (ret != Keystone::Error::Success || get_copied_slot_cap(1, &cap)) {
       printf("[FAIL] slottee_eval ocall failed to seed cap ret=%d\n", (int)ret);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -4243,11 +4317,11 @@ run_slottee_eval_ocall_roundtrip(const char* eapp_file,
         value != SLOTTEE_LT_USER_OCALL_MAGIC || lease == 0) {
       printf("[FAIL] slottee_eval ocall roundtrip iter %lu ret=%d status=%lu value=%lu lease=%lu\n",
           iter, (int)ret, status, value, lease);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
   }
 
   printf("slottee_eval_ocall_roundtrip_summary,count,mint_avg,reenter_avg,total_min,total_avg,total_max,total_cycles\n");
@@ -4285,7 +4359,7 @@ run_slottee_eval_revoke_latency(const char* eapp_file,
             params, 2, &seed_cycles))
       return 1;
     if (get_copied_slot_cap(2, &cap)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -4297,7 +4371,7 @@ run_slottee_eval_revoke_latency(const char* eapp_file,
         status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST || lease == 0) {
       printf("[FAIL] slottee_eval revoke setup iter %lu ret=%d status=%lu lease=%lu\n",
           iter, (int)enter_ret, status, lease);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -4325,11 +4399,11 @@ run_slottee_eval_revoke_latency(const char* eapp_file,
         resume_ret != Keystone::Error::EnclaveNotResumable) {
       printf("[FAIL] slottee_eval revoke latency iter %lu mark_ret=%d status=%lu epoch=%lu resume_ret=%d\n",
           iter, (int)mark_ret, status, epoch, (int)resume_ret);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
   }
 
   printf("slottee_eval_revoke_latency_summary,count,mark_avg,cleanup_avg,total_min,total_avg,total_max,total_cycles\n");
@@ -4449,7 +4523,7 @@ run_slottee_ticket_demo_case(const char* mode, uintptr_t workers,
   for (uintptr_t worker = 0; worker < workers; worker++) {
     slot_cap_t cap = {};
     if (get_copied_slot_cap(worker + 1, &cap)) {
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -4465,7 +4539,7 @@ run_slottee_ticket_demo_case(const char* mode, uintptr_t workers,
     if (pthread_create(&threads[worker], NULL, slottee_ticket_worker,
             &args[worker]) != 0) {
       printf("[FAIL] slottee ticket demo failed to create worker %lu\n", worker);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
@@ -4473,7 +4547,7 @@ run_slottee_ticket_demo_case(const char* mode, uintptr_t workers,
   for (uintptr_t worker = 0; worker < workers; worker++) {
     if (pthread_join(threads[worker], NULL) != 0) {
       printf("[FAIL] slottee ticket demo failed to join worker %lu\n", worker);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
@@ -4499,7 +4573,7 @@ run_slottee_ticket_demo_case(const char* mode, uintptr_t workers,
       throughput, total_retries, total_failures);
   fflush(stdout);
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   pthread_mutex_destroy(&ticket_lock);
   pthread_mutex_destroy(&ioctl_lock);
 
@@ -4764,7 +4838,7 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
         if (slottee_multihart_maybe_start_worker(enclave, slot_id,
                 &worker_threads[slot_id], &worker_args[slot_id],
                 worker_started, windows)) {
-          enclave.destroy();
+          slottee_trace_destroy(enclave);
           return 1;
         }
       }
@@ -4776,7 +4850,7 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
         if (pthread_join(worker_threads[slot_id], NULL) != 0) {
           printf("[FAIL] slottee multihart failed to join slot%lu worker\n",
               slot_id);
-          enclave.destroy();
+          slottee_trace_destroy(enclave);
           return 1;
         }
         worker_started[slot_id] = 2;
@@ -4841,7 +4915,7 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
           worker_args[slot_id].resumes);
     }
     fflush(stdout);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -4849,14 +4923,14 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
     if (worker_started[slot_id] == 0) {
       printf("[FAIL] slottee multihart slot%lu worker was not started\n",
           slot_id);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
     if (worker_started[slot_id] == 1 &&
         pthread_join(worker_threads[slot_id], NULL) != 0) {
       printf("[FAIL] slottee multihart failed to join slot%lu worker\n",
           slot_id);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
     total_worker_ocalls += worker_args[slot_id].ocalls;
@@ -4874,7 +4948,7 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
         worker_args[slot_id].lease == 0) {
       printf("[FAIL] slottee multihart slot%lu worker returned unexpected result\n",
           slot_id);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
@@ -4885,14 +4959,15 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       copied_multihart_ticket_report.total_tickets != total_tickets ||
       copied_multihart_ticket_report.max_windows != slottee_ticket_max_windows) {
     printf("[FAIL] slottee multihart ticket report missing or invalid\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
   printf("slottee_multihart_ticket,label,window,slot,hart,sold,retries,failures\n");
   for (uintptr_t window = 0; window < windows; window++) {
     printf("slottee_multihart_ticket,%s,%lu,%lu,%lu,%lu,0,%lu\n",
-        label, window + 1, window + 1, window,
+        label, window + 1, window + 1,
+        copied_multihart_ticket_report.hart_id[window],
         copied_multihart_ticket_report.sold[window],
         copied_multihart_ticket_report.failures);
   }
@@ -4934,9 +5009,11 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
           copied_multihart_ticket_report.fairness_budget &&
       copied_multihart_ticket_report.fairness_policy_ok &&
       copied_multihart_ticket_report.dominant_window >= 1 &&
-      copied_multihart_ticket_report.dominant_window <= windows;
+      copied_multihart_ticket_report.dominant_window <= windows &&
+      slottee_multihart_harts_valid(&copied_multihart_ticket_report,
+          windows, (uintptr_t)online_harts);
 
-  printf("[slottee] multihart_join label=%s windows=%lu max_windows=%lu total_tickets=%lu active_workers=%lu ready_windows=%lu remaining=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_misses=%lu notify_calls=%lu notify_wakes=%lu user_entries=%lu user_exits=%lu syscalls=%lu ocalls=%lu ocall_resumes=%lu exits=%lu stack_entry_ok=%lu stack_exit_ok=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_resume_ok=%lu tls_exit_mismatch=%lu nonzero_windows=%lu min_sold=%lu max_sold=%lu fairness_gap=%lu fairness_budget=%lu fairness_policy=%lu fairness_policy_ok=%lu dominant_window=%lu ok=%d main_ocalls=%lu main_resumes=%lu worker_ocalls=%lu worker_resumes=%lu\n",
+  printf("[slottee] multihart_join label=%s windows=%lu max_windows=%lu total_tickets=%lu active_workers=%lu ready_windows=%lu remaining=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_misses=%lu notify_calls=%lu notify_wakes=%lu user_entries=%lu user_exits=%lu syscalls=%lu ocalls=%lu ocall_resumes=%lu exits=%lu stack_entry_ok=%lu stack_exit_ok=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_resume_ok=%lu tls_exit_mismatch=%lu nonzero_windows=%lu min_sold=%lu max_sold=%lu fairness_gap=%lu fairness_budget=%lu fairness_policy=%lu fairness_policy_ok=%lu dominant_window=%lu hart0=%lu ok=%d main_ocalls=%lu main_resumes=%lu worker_ocalls=%lu worker_resumes=%lu\n",
       label,
       copied_multihart_ticket_report.configured_windows,
       copied_multihart_ticket_report.max_windows,
@@ -4971,6 +5048,7 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       copied_multihart_ticket_report.fairness_policy,
       copied_multihart_ticket_report.fairness_policy_ok,
       copied_multihart_ticket_report.dominant_window,
+      copied_multihart_ticket_report.hart_id[0],
       multihart_ok,
       ocalls, resumes, total_worker_ocalls, total_worker_resumes);
   fflush(stdout);
@@ -5008,9 +5086,11 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
           copied_multihart_ticket_report.fairness_budget ||
       !copied_multihart_ticket_report.fairness_policy_ok ||
       copied_multihart_ticket_report.dominant_window == 0 ||
-      copied_multihart_ticket_report.dominant_window > windows) {
+      copied_multihart_ticket_report.dominant_window > windows ||
+      !slottee_multihart_harts_valid(&copied_multihart_ticket_report,
+          windows, (uintptr_t)online_harts)) {
     printf("[FAIL] slottee multihart ticket totals invalid\n");
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -5018,12 +5098,12 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
     if (copied_multihart_ticket_report.sold[window] == 0) {
       printf("[FAIL] slottee multihart window %lu sold zero tickets\n",
           window + 1);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -5128,7 +5208,7 @@ run_slottee_host_dos_case(const char* label, uintptr_t started_workers,
   if (!caps_ready && !slottee_multihart_all_worker_caps_ready(slottee_ticket_windows)) {
     printf("[FAIL] %s failed to reach caps-ready state value=%lu ocalls=%lu resumes=%lu ret=%d\n",
         label, value, ocalls, resumes, (int)ret);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
@@ -5137,7 +5217,7 @@ run_slottee_host_dos_case(const char* label, uintptr_t started_workers,
 
     if (get_copied_slot_cap(slot_id, &worker_args[worker].cap)) {
       printf("[FAIL] %s missing copied cap for slot%lu\n", label, slot_id);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
 
@@ -5155,7 +5235,7 @@ run_slottee_host_dos_case(const char* label, uintptr_t started_workers,
             &worker_args[worker]) != 0) {
       printf("[FAIL] %s failed to create worker thread for slot%lu\n",
           label, slot_id);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
   }
@@ -5176,7 +5256,7 @@ run_slottee_host_dos_case(const char* label, uintptr_t started_workers,
     fflush(stdout);
   }
 
-  destroy_ret = enclave.destroy();
+  destroy_ret = slottee_trace_destroy(enclave);
   printf("host_dos,%s,destroy,%d,%lu,%lu,%lu,%lu,%lu,%lu\n",
       label, (int)destroy_ret, value, ocalls, resumes,
       slottee_ticket_windows, started_workers, online_harts);
@@ -5197,7 +5277,7 @@ run_slottee_host_dos_case(const char* label, uintptr_t started_workers,
   }
 
   edge_init(&probe);
-  if (probe.destroy() != Keystone::Error::Success) {
+  if (slottee_trace_destroy(probe) != Keystone::Error::Success) {
     printf("[FAIL] %s probe destroy failed\n", label);
     return 1;
   }
@@ -5292,7 +5372,7 @@ run_slottee_edgecall_interference_case(const char* label,
         if (slottee_edgecall_maybe_start_worker(enclave, slot_id,
                 &worker_threads[slot_id], &worker_args[slot_id],
                 worker_started)) {
-          enclave.destroy();
+          slottee_trace_destroy(enclave);
           return 1;
         }
       }
@@ -5319,7 +5399,7 @@ run_slottee_edgecall_interference_case(const char* label,
         pthread_join(worker_threads[slot_id], NULL) != 0) {
       printf("[FAIL] edgecall stress failed to join slot%lu worker\n",
           slot_id);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
     if (worker_started[slot_id] == 1)
@@ -5394,11 +5474,11 @@ run_slottee_edgecall_interference_case(const char* label,
       get_edgecall_stress_echo_count() <
           SLOTTEE_EDGECALL_STRESS_WORKERS * SLOTTEE_EDGECALL_STRESS_ITERS) {
     printf("[FAIL] edgecall stress invalid report label=%s\n", label);
-    enclave.destroy();
+    slottee_trace_destroy(enclave);
     return 1;
   }
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
   return 0;
 }
 
@@ -5476,7 +5556,7 @@ run_slottee_timer_preempt_test(const char* eapp_file,
         if (slottee_timer_preempt_maybe_start_worker(enclave, slot_id,
                 &worker_threads[slot_id], &worker_args[slot_id],
                 worker_started)) {
-          enclave.destroy();
+          slottee_trace_destroy(enclave);
           return 1;
         }
       }
@@ -5490,7 +5570,7 @@ run_slottee_timer_preempt_test(const char* eapp_file,
       if (pthread_join(worker_threads[slot_id], NULL) != 0) {
         printf("[FAIL] timer preempt failed to join slot%lu worker\n",
             slot_id);
-        enclave.destroy();
+        slottee_trace_destroy(enclave);
         return 1;
       }
       worker_started[slot_id] = 2;
@@ -5515,7 +5595,7 @@ run_slottee_timer_preempt_test(const char* eapp_file,
         pthread_join(worker_threads[slot_id], NULL) != 0) {
       printf("[FAIL] timer preempt failed to join slot%lu worker\n",
           slot_id);
-      enclave.destroy();
+      slottee_trace_destroy(enclave);
       return 1;
     }
     if (worker_started[slot_id] == 1)
@@ -5598,7 +5678,7 @@ run_slottee_timer_preempt_test(const char* eapp_file,
       worker_resumes > 0 &&
       workers_ok;
 
-  enclave.destroy();
+  slottee_trace_destroy(enclave);
 
   if (!ok) {
     printf("[FAIL] timer preempt invalid report or worker state\n");
@@ -5800,6 +5880,7 @@ main(int argc, char** argv) {
       {"enter-slot-policy", no_argument, &enter_slot_policy, 1},
       {"enter-slot-watchdog-ttl", no_argument, &enter_slot_watchdog_ttl, 1},
       {"enter-slot-timer-preempt", no_argument, &enter_slot_timer_preempt, 1},
+      {"slottee-trace-log", no_argument, &slottee_trace_log, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
       {"slottee-ticket-demo", no_argument, &slottee_ticket_demo, 1},
@@ -5849,6 +5930,7 @@ main(int argc, char** argv) {
         break;
     }
   }
+  slottee_trace_header();
 
   Keystone::Params params;
   unsigned long cycles1, cycles2, cycles3, cycles4;
@@ -6303,7 +6385,7 @@ main(int argc, char** argv) {
       return 1;
     }
 
-    if (enclave.destroy() != Keystone::Error::Success) {
+    if (slottee_trace_destroy(enclave) != Keystone::Error::Success) {
       printf("[FAIL] failed to destroy first enclave\n");
       return 1;
     }

@@ -274,6 +274,8 @@ eapp_entry()
   final_report.max_sold = 0;
   final_report.dominant_window = 0;
   for (window = 0; window < SLOTTEE_MULTIHART_TICKET_MAX_WINDOWS; window++) {
+    final_report.hart_id[window] =
+        window + 1 < SLOTTEE_MAX_SLOTS ? rt_stats.hart_id[window + 1] : 0;
     final_report.sold[window] = (uintptr_t)slottee_atomic_load(&sold[window]);
     if (window < configured_windows) {
       final_report.total_sold += final_report.sold[window];

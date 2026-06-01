@@ -134,6 +134,15 @@ _start:
 
 .global slottee_runtime_reenter
 slottee_runtime_reenter:
+  /*
+   * Mask S-mode interrupts before computing or touching the slot-indexed stack.
+   * SM may resume this path with a pending timer and stale sscratch from the
+   * previous U-mode run; taking a trap before this point can mis-save the frame
+   * on the user LT stack.
+   */
+  li t0, 0x2
+  csrrc x0, sstatus, t0
+
   /* Use a slot-indexed RT stack before touching memory on multihart reentry. */
   andi t0, t6, 0xff
   la t1, slottee_runtime_stacks
@@ -146,6 +155,12 @@ slottee_runtime_reenter:
 1:
   la sp, kernel_stack_end
 2:
+  /*
+   * Reentry helpers run in S-mode, so keep sscratch zero until the final
+   * user-stack swap.  The trap handler uses sscratch == 0 to distinguish
+   * S-mode traps from U-mode traps and then saves on the current runtime stack.
+   */
+  csrw sscratch, x0
   mv a0, t6
   addi sp, sp, -(3*REGBYTES)
   STORE zero, 0(sp)
@@ -171,10 +186,18 @@ slottee_runtime_reenter:
   beqz a0, 1f
   mv sp, a0
 
-  /* Mirror the first-boot drop from runtime S-mode into the eapp. */
+  /*
+   * Mirror the first-boot drop from runtime S-mode into the eapp: enter the
+   * final swap with sp on the runtime stack and sscratch on the user LT stack.
+   * After csrrw, U-mode runs on the user stack and future traps save frames on
+   * supervisor runtime stack memory.
+   */
   beqz t4, 3f
   csrw sscratch, t4
 3:
+  /* Re-check after C helpers: keep the sscratch staging window non-preemptible. */
+  li t0, 0x2
+  csrrc x0, sstatus, t0
   li t0, 0x100
   csrrc x0, sstatus, t0
   csrrw sp, sscratch, sp

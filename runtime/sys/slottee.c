@@ -94,6 +94,7 @@ struct slottee_active_user_context {
   uintptr_t in_wait_queue;
   uintptr_t saved_ctx_valid;
   uintptr_t fairness_ticket;
+  uintptr_t hart_id;
   enum slottee_user_lt_state scheduler_state;
   struct encl_ctx saved_ctx;
   uintptr_t user_stack_entry_ok;
@@ -615,6 +616,7 @@ slottee_activate_user_context(uintptr_t slot_id, uintptr_t lease_id, uintptr_t m
   user->lease_id = lease_id;
   user->mode = mode;
   user->enter_count++;
+  user->hart_id = sbi_current_hart();
   user->last_trap_syscall = 0;
   user->last_trap_scause = 0;
   user->last_trap_sepc = 0;
@@ -689,7 +691,6 @@ slottee_active_user_prepare_user_entry(
           SLOTTEE_USER_STACK_SIZE);
 
   __asm__ volatile("csrw sepc, %0" :: "r"(entry));
-  __asm__ volatile("csrw sscratch, %0" :: "r"(user->user_stack_top));
   __asm__ volatile("mv tp, %0" :: "r"(user->user_tls_base) : "memory");
 
   return slottee_runtime_stack_top(user->slot_id);
@@ -1224,6 +1225,7 @@ slottee_lt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
     stats.stack_entry_ok += user->user_stack_entry_ok;
     stats.stack_exit_ok += user->user_stack_exit_ok;
     stats.tls_resume_ok += user->tls_resume_ok;
+    stats.hart_id[slot] = user->hart_id;
   }
   if (stats.fairness_min == (uintptr_t)-1)
     stats.fairness_min = 0;

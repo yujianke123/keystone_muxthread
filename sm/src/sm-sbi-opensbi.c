@@ -91,6 +91,9 @@ static int sbi_ecall_keystone_enclave_handler(unsigned long extid, unsigned long
     case SBI_SM_MINT_SLOT_CAP:
       retval = sbi_sm_mint_slot_cap(out_val, regs->a0, regs->a1);
       break;
+    case SBI_SM_CURRENT_HART:
+      retval = sbi_sm_current_hart(out_val);
+      break;
     case SBI_SM_CALL_PLUGIN:
       retval = sbi_sm_call_plugin(regs->a0, regs->a1, regs->a2, regs->a3);
       break;
