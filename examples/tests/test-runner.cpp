@@ -4870,7 +4870,7 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
   if (ret != Keystone::Error::Success ||
       value != SLOTTEE_LT_USER_OCALL_MAGIC) {
     if (copied_multihart_ticket_report_ready) {
-      printf("[FAIL] slottee multihart report on main failure: windows=%lu total=%lu sold=%lu remaining=%lu active=%lu ready=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_calls=%lu notify_wakes=%lu user_entries=%lu user_exits=%lu syscalls=%lu ocalls=%lu ocall_resumes=%lu exits=%lu stack_entry_ok=%lu stack_exit_ok=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_resume_ok=%lu tls_mismatch=%lu nonzero_windows=%lu fairness_gap=%lu fairness_budget=%lu fairness_policy_ok=%lu failures=%lu\n",
+      printf("[FAIL] slottee multihart report on main failure: windows=%lu total=%lu sold=%lu remaining=%lu active=%lu ready=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_calls=%lu notify_wakes=%lu runnable_q=%lu wait_q=%lu dup=%lu qleak=%lu wait_residue=%lu unfinished=%lu user_entries=%lu user_exits=%lu syscalls=%lu ocalls=%lu ocall_resumes=%lu exits=%lu stack_entry_ok=%lu stack_exit_ok=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_resume_ok=%lu tls_mismatch=%lu nonzero_windows=%lu fairness_gap=%lu fairness_budget=%lu fairness_policy_ok=%lu failures=%lu\n",
           copied_multihart_ticket_report.configured_windows,
           copied_multihart_ticket_report.total_tickets,
           copied_multihart_ticket_report.total_sold,
@@ -4883,6 +4883,12 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
           copied_multihart_ticket_report.timer_wait_stops,
           copied_multihart_ticket_report.notify_calls,
           copied_multihart_ticket_report.notify_wakes,
+          copied_multihart_ticket_report.runnable_queue_depth,
+          copied_multihart_ticket_report.wait_queue_depth,
+          copied_multihart_ticket_report.scheduler_duplicate_rejects,
+          copied_multihart_ticket_report.scheduler_queue_leaks,
+          copied_multihart_ticket_report.scheduler_wait_residue,
+          copied_multihart_ticket_report.scheduler_unfinished,
           copied_multihart_ticket_report.user_context_entries,
           copied_multihart_ticket_report.user_context_exits,
           copied_multihart_ticket_report.syscall_traps,
@@ -4988,6 +4994,12 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       copied_multihart_ticket_report.wait_wakeups > 0 &&
       copied_multihart_ticket_report.notify_calls > 0 &&
       copied_multihart_ticket_report.notify_wakes > 0 &&
+      copied_multihart_ticket_report.runnable_queue_depth == 0 &&
+      copied_multihart_ticket_report.wait_queue_depth == 0 &&
+      copied_multihart_ticket_report.scheduler_duplicate_rejects == 0 &&
+      copied_multihart_ticket_report.scheduler_queue_leaks == 0 &&
+      copied_multihart_ticket_report.scheduler_wait_residue == 0 &&
+      copied_multihart_ticket_report.scheduler_unfinished == 0 &&
       copied_multihart_ticket_report.user_context_entries >= windows - 1 &&
       copied_multihart_ticket_report.user_context_exits >= windows - 1 &&
       copied_multihart_ticket_report.syscall_traps >= windows - 1 &&
@@ -5013,7 +5025,7 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       slottee_multihart_harts_valid(&copied_multihart_ticket_report,
           windows, (uintptr_t)online_harts);
 
-  printf("[slottee] multihart_join label=%s windows=%lu max_windows=%lu total_tickets=%lu active_workers=%lu ready_windows=%lu remaining=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_misses=%lu notify_calls=%lu notify_wakes=%lu user_entries=%lu user_exits=%lu syscalls=%lu ocalls=%lu ocall_resumes=%lu exits=%lu stack_entry_ok=%lu stack_exit_ok=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_resume_ok=%lu tls_exit_mismatch=%lu nonzero_windows=%lu min_sold=%lu max_sold=%lu fairness_gap=%lu fairness_budget=%lu fairness_policy=%lu fairness_policy_ok=%lu dominant_window=%lu hart0=%lu ok=%d main_ocalls=%lu main_resumes=%lu worker_ocalls=%lu worker_resumes=%lu\n",
+  printf("[slottee] multihart_join label=%s windows=%lu max_windows=%lu total_tickets=%lu active_workers=%lu ready_windows=%lu remaining=%lu wait_calls=%lu wait_blocks=%lu wait_wakeups=%lu timer_stops=%lu notify_misses=%lu notify_calls=%lu notify_wakes=%lu runnable_q=%lu wait_q=%lu dup=%lu qleak=%lu wait_residue=%lu unfinished=%lu user_entries=%lu user_exits=%lu syscalls=%lu ocalls=%lu ocall_resumes=%lu exits=%lu stack_entry_ok=%lu stack_exit_ok=%lu tls_entry_ok=%lu tls_exit_ok=%lu tls_resume_ok=%lu tls_exit_mismatch=%lu nonzero_windows=%lu min_sold=%lu max_sold=%lu fairness_gap=%lu fairness_budget=%lu fairness_policy=%lu fairness_policy_ok=%lu dominant_window=%lu hart0=%lu ok=%d main_ocalls=%lu main_resumes=%lu worker_ocalls=%lu worker_resumes=%lu\n",
       label,
       copied_multihart_ticket_report.configured_windows,
       copied_multihart_ticket_report.max_windows,
@@ -5028,6 +5040,12 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       copied_multihart_ticket_report.wait_notify_misses,
       copied_multihart_ticket_report.notify_calls,
       copied_multihart_ticket_report.notify_wakes,
+      copied_multihart_ticket_report.runnable_queue_depth,
+      copied_multihart_ticket_report.wait_queue_depth,
+      copied_multihart_ticket_report.scheduler_duplicate_rejects,
+      copied_multihart_ticket_report.scheduler_queue_leaks,
+      copied_multihart_ticket_report.scheduler_wait_residue,
+      copied_multihart_ticket_report.scheduler_unfinished,
       copied_multihart_ticket_report.user_context_entries,
       copied_multihart_ticket_report.user_context_exits,
       copied_multihart_ticket_report.syscall_traps,
@@ -5065,6 +5083,12 @@ run_slottee_multihart_ticket_case(const char* label, uintptr_t windows,
       copied_multihart_ticket_report.wait_wakeups == 0 ||
       copied_multihart_ticket_report.notify_calls == 0 ||
       copied_multihart_ticket_report.notify_wakes == 0 ||
+      copied_multihart_ticket_report.runnable_queue_depth != 0 ||
+      copied_multihart_ticket_report.wait_queue_depth != 0 ||
+      copied_multihart_ticket_report.scheduler_duplicate_rejects != 0 ||
+      copied_multihart_ticket_report.scheduler_queue_leaks != 0 ||
+      copied_multihart_ticket_report.scheduler_wait_residue != 0 ||
+      copied_multihart_ticket_report.scheduler_unfinished != 0 ||
       copied_multihart_ticket_report.user_context_entries < windows - 1 ||
       copied_multihart_ticket_report.user_context_exits < windows - 1 ||
       copied_multihart_ticket_report.syscall_traps < windows - 1 ||

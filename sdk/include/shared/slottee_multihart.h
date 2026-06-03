@@ -45,6 +45,12 @@ struct slottee_multihart_ticket_report {
   uintptr_t wait_blocks;
   uintptr_t wait_wakeups;
   uintptr_t wait_notify_misses;
+  uintptr_t runnable_queue_depth;
+  uintptr_t wait_queue_depth;
+  uintptr_t scheduler_duplicate_rejects;
+  uintptr_t scheduler_queue_leaks;
+  uintptr_t scheduler_wait_residue;
+  uintptr_t scheduler_unfinished;
   uintptr_t notify_calls;
   uintptr_t notify_wakes;
   uintptr_t tls_entry_ok;

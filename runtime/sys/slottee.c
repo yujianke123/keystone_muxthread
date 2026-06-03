@@ -288,6 +288,33 @@ slottee_user_lt_set_state(
     user->scheduler_state = state;
 }
 
+static int
+slottee_wait_condition_ready(uintptr_t user_ptr, uintptr_t target, uintptr_t op)
+{
+  long value = 0;
+
+  if (!user_ptr || copy_from_user(&value, (void*)user_ptr, sizeof(value)))
+    return -1;
+
+  if (op == SLOTTEE_LT_WAIT_OP_EQ)
+    return value == (long)target;
+  if (op == SLOTTEE_LT_WAIT_OP_GE)
+    return value >= (long)target;
+
+  return -1;
+}
+
+static void
+slottee_user_lt_clear_wait(struct slottee_active_user_context* user)
+{
+  if (!user)
+    return;
+
+  user->wait_user_ptr = 0;
+  user->wait_target = 0;
+  user->wait_op = 0;
+}
+
 static void
 slottee_user_lt_save_frame(
     struct slottee_active_user_context* user, const struct encl_ctx* ctx)
@@ -310,27 +337,56 @@ slottee_user_lt_record_dispatch(struct slottee_active_user_context* user)
   user->dispatch_count++;
 }
 
-static void
-slottee_user_lt_block_on_wait(
-    struct slottee_active_user_context* user, struct encl_ctx* ctx)
+static uintptr_t
+slottee_lt_register_wait(struct slottee_active_user_context* user,
+    struct encl_ctx* ctx, uintptr_t user_ptr, uintptr_t target, uintptr_t op)
 {
-  if (!user)
-    return;
+  int ready;
 
   slottee_lt_scheduler_lock_acquire();
+  ready = slottee_wait_condition_ready(user_ptr, target, op);
+  if (ready < 0) {
+    slottee_lt_scheduler_lock_release();
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  }
+  if (ready > 0) {
+    slottee_lt_scheduler_lock_release();
+    return SLOTTEE_LT_WAIT_RESULT_READY;
+  }
+
+  if (!user) {
+    slottee_global_wait_user_ptr = user_ptr;
+    slottee_global_wait_target = target;
+    slottee_global_wait_op = op;
+    slottee_global_wait_block_count++;
+    slottee_lt_scheduler_lock_release();
+    return SLOTTEE_LT_WAIT_RESULT_BLOCKED;
+  }
+
+  user->wait_user_ptr = user_ptr;
+  user->wait_target = target;
+  user->wait_op = op;
   slottee_user_lt_save_frame(user, ctx);
   slottee_user_lt_set_state(user, SLOTTEE_USER_LT_WAITING);
-  if (!user->in_wait_queue)
-    (void)slottee_user_lt_queue_enqueue(&slottee_user_wait_queue,
-        SLOTTEE_USER_LT_QUEUE_WAIT, user);
+  if (!slottee_user_lt_queue_enqueue(&slottee_user_wait_queue,
+          SLOTTEE_USER_LT_QUEUE_WAIT, user)) {
+    slottee_user_lt_clear_wait(user);
+    slottee_user_lt_set_state(user, SLOTTEE_USER_LT_RUNNING);
+    slottee_lt_scheduler_lock_release();
+    return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
+  }
+  user->wait_block_count++;
+  user->timer_wait_stop_count++;
   slottee_lt_scheduler_lock_release();
+  return SLOTTEE_LT_WAIT_RESULT_BLOCKED;
 }
 
-static void
+static uintptr_t
 slottee_user_lt_promote_waiters(uintptr_t user_ptr)
 {
   uintptr_t pending[SLOTTEE_MAX_SLOTS];
   uintptr_t pending_count = 0;
+  uintptr_t wakes = 0;
 
   slottee_lt_scheduler_lock_acquire();
   while (slottee_user_wait_queue.count) {
@@ -340,10 +396,18 @@ slottee_user_lt_promote_waiters(uintptr_t user_ptr)
 
     if (!user)
       continue;
-    if (user->wait_user_ptr == user_ptr) {
-      slottee_user_lt_set_state(user, SLOTTEE_USER_LT_WOKEN);
-      (void)slottee_user_lt_queue_enqueue(&slottee_user_runnable_queue,
-          SLOTTEE_USER_LT_QUEUE_RUNNABLE, user);
+    if (user->wait_user_ptr == user_ptr &&
+        slottee_wait_condition_ready(user->wait_user_ptr,
+            user->wait_target, user->wait_op) > 0) {
+      if (slottee_user_lt_queue_enqueue(&slottee_user_runnable_queue,
+              SLOTTEE_USER_LT_QUEUE_RUNNABLE, user)) {
+        slottee_user_lt_set_state(user, SLOTTEE_USER_LT_WOKEN);
+        user->wait_wakeup_count++;
+        slottee_user_lt_clear_wait(user);
+        wakes++;
+      } else if (pending_count < SLOTTEE_MAX_SLOTS) {
+        pending[pending_count++] = user->slot_id;
+      }
     } else if (pending_count < SLOTTEE_MAX_SLOTS) {
       pending[pending_count++] = user->slot_id;
     }
@@ -353,6 +417,28 @@ slottee_user_lt_promote_waiters(uintptr_t user_ptr)
     (void)slottee_user_lt_queue_enqueue(&slottee_user_wait_queue,
         SLOTTEE_USER_LT_QUEUE_WAIT, &slottee_active_users[pending[index]]);
   slottee_lt_scheduler_lock_release();
+
+  return wakes;
+}
+
+static uintptr_t
+slottee_global_wait_promote(uintptr_t user_ptr)
+{
+  uintptr_t wakes = 0;
+
+  slottee_lt_scheduler_lock_acquire();
+  if (slottee_global_wait_user_ptr == user_ptr &&
+      slottee_wait_condition_ready(slottee_global_wait_user_ptr,
+          slottee_global_wait_target, slottee_global_wait_op) > 0) {
+    slottee_global_wait_wakeup_count++;
+    slottee_global_wait_user_ptr = 0;
+    slottee_global_wait_target = 0;
+    slottee_global_wait_op = 0;
+    wakes++;
+  }
+  slottee_lt_scheduler_lock_release();
+
+  return wakes;
 }
 
 static void
@@ -395,8 +481,27 @@ slottee_user_lt_resume_after_wait(struct slottee_active_user_context* user)
   if (user->in_wait_queue)
     (void)slottee_user_lt_queue_remove(&slottee_user_wait_queue,
         SLOTTEE_USER_LT_QUEUE_WAIT, user);
+  slottee_user_lt_clear_wait(user);
   slottee_user_lt_set_state(user, SLOTTEE_USER_LT_RUNNING);
   slottee_user_lt_record_dispatch(user);
+  slottee_lt_scheduler_lock_release();
+}
+
+static void
+slottee_user_lt_cleanup_queues(struct slottee_active_user_context* user)
+{
+  if (!user)
+    return;
+
+  slottee_lt_scheduler_lock_acquire();
+  if (user->in_runnable_queue)
+    (void)slottee_user_lt_queue_remove(&slottee_user_runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE, user);
+  if (user->in_wait_queue)
+    (void)slottee_user_lt_queue_remove(&slottee_user_wait_queue,
+        SLOTTEE_USER_LT_QUEUE_WAIT, user);
+  slottee_user_lt_clear_wait(user);
+  slottee_user_lt_set_state(user, SLOTTEE_USER_LT_EXITED);
   slottee_lt_scheduler_lock_release();
 }
 
@@ -813,11 +918,7 @@ slottee_active_user_exit(struct encl_ctx* ctx, uintptr_t value)
 
   slot_id = user->slot_id;
   lease_id = user->lease_id;
-  slottee_lt_scheduler_lock_acquire();
-  user->in_runnable_queue = 0;
-  user->in_wait_queue = 0;
-  slottee_user_lt_set_state(user, SLOTTEE_USER_LT_EXITED);
-  slottee_lt_scheduler_lock_release();
+  slottee_user_lt_cleanup_queues(user);
   user->active = 0;
   status = sbi_exit_slot(slot_id, lease_id, SLOTTEE_SLOT_EXIT_NORMAL, value);
 
@@ -850,6 +951,7 @@ slottee_active_user_fault_exit(struct encl_ctx* ctx, uintptr_t value)
   lease_id = user->lease_id;
   exit_reason = user->revoke_on_fault ?
       SLOTTEE_SLOT_EXIT_REVOKE : SLOTTEE_SLOT_EXIT_NORMAL;
+  slottee_user_lt_cleanup_queues(user);
   user->active = 0;
   status = sbi_exit_slot(slot_id, lease_id, exit_reason, value);
 
@@ -1074,36 +1176,18 @@ slottee_lt_wait_value(
     struct encl_ctx* ctx, uintptr_t user_ptr, uintptr_t target, uintptr_t op)
 {
   struct slottee_active_user_context* user;
-  long value = 0;
-  int ready = 0;
+  uintptr_t wait_result;
 
-  if (!user_ptr || copy_from_user(&value, (void*)user_ptr, sizeof(value)))
+  if (!user_ptr)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
-  if (op == SLOTTEE_LT_WAIT_OP_EQ)
-    ready = value == (long)target;
-  else if (op == SLOTTEE_LT_WAIT_OP_GE)
-    ready = value >= (long)target;
-  else
+  if (op != SLOTTEE_LT_WAIT_OP_EQ && op != SLOTTEE_LT_WAIT_OP_GE)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
-
-  if (ready)
-    return SLOTTEE_LT_WAIT_RESULT_READY;
 
   user = slottee_active_user_for_frame(ctx);
-  if (user) {
-    user->wait_user_ptr = user_ptr;
-    user->wait_target = target;
-    user->wait_op = op;
-    user->wait_block_count++;
-    user->timer_wait_stop_count++;
-    slottee_user_lt_block_on_wait(user, ctx);
-  } else {
-    slottee_global_wait_user_ptr = user_ptr;
-    slottee_global_wait_target = target;
-    slottee_global_wait_op = op;
-    slottee_global_wait_block_count++;
-  }
+  wait_result = slottee_lt_register_wait(user, ctx, user_ptr, target, op);
+  if (wait_result != SLOTTEE_LT_WAIT_RESULT_BLOCKED)
+    return wait_result;
 
   /*
    * The stop SBI returns to this instruction only after the host resumes the
@@ -1119,32 +1203,14 @@ slottee_lt_wait_value(
 uintptr_t
 slottee_lt_notify_value(struct encl_ctx* ctx, uintptr_t user_ptr)
 {
-  uintptr_t slot;
   uintptr_t wakes = 0;
   struct slottee_active_user_context* notifier;
 
   if (!user_ptr)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
-  slottee_user_lt_promote_waiters(user_ptr);
-  for (slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
-    struct slottee_active_user_context* user = &slottee_active_users[slot];
-
-    if (!user->wait_user_ptr)
-      continue;
-    if (user->wait_user_ptr != user_ptr)
-      continue;
-
-    user->wait_wakeup_count++;
-    user->wait_user_ptr = 0;
-    wakes++;
-  }
-
-  if (slottee_global_wait_user_ptr == user_ptr) {
-    slottee_global_wait_wakeup_count++;
-    slottee_global_wait_user_ptr = 0;
-    wakes++;
-  }
+  wakes += slottee_user_lt_promote_waiters(user_ptr);
+  wakes += slottee_global_wait_promote(user_ptr);
 
   if (wakes)
     return SLOTTEE_LT_NOTIFY_RESULT_WOKE;

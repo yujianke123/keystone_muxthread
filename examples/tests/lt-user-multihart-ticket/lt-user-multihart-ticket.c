@@ -140,6 +140,31 @@ wait_block_once(const long* ptr, long target, uintptr_t op)
     slottee_atomic_fetch_add(&failures, 1);
 }
 
+static int
+collect_drained_runtime_stats(struct slottee_lt_runtime_stats* rt_stats)
+{
+  uintptr_t attempts = configured_wait_budget ? configured_wait_budget : 1;
+
+  if (!rt_stats)
+    return -1;
+
+  for (uintptr_t attempt = 0; attempt < attempts; attempt++) {
+    if (slottee_lt_collect_stats(rt_stats) != SBI_ERR_SM_ENCLAVE_SUCCESS)
+      return -1;
+    if (rt_stats->user_context_exits >= configured_windows - 1 &&
+        rt_stats->runnable_queue_depth == 0 &&
+        rt_stats->wait_queue_depth == 0 &&
+        rt_stats->scheduler_queue_leaks == 0 &&
+        rt_stats->scheduler_wait_residue == 0 &&
+        rt_stats->scheduler_unfinished == 0)
+      return 0;
+    for (volatile uintptr_t spin = 0; spin < 1024; spin++)
+      ;
+  }
+
+  return 0;
+}
+
 static void
 ticket_window(uintptr_t window)
 {
@@ -240,7 +265,7 @@ eapp_entry()
 
   struct slottee_lt_runtime_stats rt_stats;
   memset(&rt_stats, 0, sizeof(rt_stats));
-  if (slottee_lt_collect_stats(&rt_stats) != SBI_ERR_SM_ENCLAVE_SUCCESS)
+  if (collect_drained_runtime_stats(&rt_stats) != 0)
     slottee_atomic_fetch_add(&failures, 1);
 
   final_report.magic = SLOTTEE_MULTIHART_TICKET_MAGIC;
@@ -252,6 +277,13 @@ eapp_entry()
   final_report.wait_blocks = (uintptr_t)slottee_atomic_load(&wait_blocks);
   final_report.wait_wakeups = rt_stats.wait_wakeups;
   final_report.wait_notify_misses = rt_stats.notify_misses;
+  final_report.runnable_queue_depth = rt_stats.runnable_queue_depth;
+  final_report.wait_queue_depth = rt_stats.wait_queue_depth;
+  final_report.scheduler_duplicate_rejects =
+      rt_stats.scheduler_duplicate_rejects;
+  final_report.scheduler_queue_leaks = rt_stats.scheduler_queue_leaks;
+  final_report.scheduler_wait_residue = rt_stats.scheduler_wait_residue;
+  final_report.scheduler_unfinished = rt_stats.scheduler_unfinished;
   final_report.notify_calls = (uintptr_t)slottee_atomic_load(&notify_calls);
   final_report.notify_wakes = (uintptr_t)slottee_atomic_load(&notify_wakes);
   final_report.tls_entry_ok = rt_stats.tls_entry_ok;
@@ -320,6 +352,12 @@ eapp_entry()
       final_report.timer_wait_stops == 0 ||
       final_report.stack_entry_ok < configured_windows - 1 ||
       final_report.stack_exit_ok < configured_windows - 1 ||
+      final_report.runnable_queue_depth != 0 ||
+      final_report.wait_queue_depth != 0 ||
+      final_report.scheduler_duplicate_rejects != 0 ||
+      final_report.scheduler_queue_leaks != 0 ||
+      final_report.scheduler_wait_residue != 0 ||
+      final_report.scheduler_unfinished != 0 ||
       !final_report.fairness_policy_ok ||
       (configured_join_mode == SLOTTEE_MULTIHART_JOIN_MODE_WAIT &&
        (final_report.wait_calls == 0 || final_report.wait_blocks == 0 ||
