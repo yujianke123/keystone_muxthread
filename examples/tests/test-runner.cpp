@@ -5712,6 +5712,164 @@ run_slottee_timer_preempt_test(const char* eapp_file,
   return 0;
 }
 
+/*
+ * OS-level preemptive timer scheduler test.  The host enters ONE LT_USER_OCALL
+ * slot (the scheduler thread); the Eyrie RT then time-slices N busy-loop workers
+ * entirely in-enclave.  Verdict requires: every worker preempted at least once
+ * (min_preempts > 0), zero host-mediated yields during the run (host_yields == 0),
+ * deterministic worker checksums matching a host recomputation, and clean queues.
+ */
+static int
+run_slottee_preempt_sched_test(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  pthread_t sched_thread;
+  slottee_multihart_worker_arg sched_arg;
+  int sched_started = 0;
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  uintptr_t interrupts = 0;
+  Keystone::Error ret;
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+  struct slottee_preempt_sched_report report;
+  bool report_ready = false;
+  const uintptr_t sched_slot = SLOTTEE_PREEMPT_SCHED_SCHEDULER_SLOT;
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  reset_preempt_sched_state();
+  reset_copied_slot_caps();
+  memset(&report, 0, sizeof(report));
+  memset(&sched_arg, 0, sizeof(sched_arg));
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] preempt sched failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  printf("preempt_sched,phase,harts,ret,value,ocalls,resumes,interrupts,completed,switches,ticks,host_yields,exit_switches,runnable_q,qleak,wait_residue,unfinished,dup,fair_min,fair_max,fair_gap,fair_bad,min_preempts,failures\n");
+  fflush(stdout);
+
+  ret = enclave.runRaw(&value);
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < slottee_edgecall_stress_resume_limit * 8;
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      ocalls++;
+    } else if (ret == Keystone::Error::EnclaveInterrupted) {
+      interrupts++;
+    }
+
+    if (!sched_started && copied_slot_cap_ready_by_slot[sched_slot]) {
+      memset(&sched_arg, 0, sizeof(sched_arg));
+      sched_arg.enclave = &enclave;
+      sched_arg.cap = copied_slot_caps[sched_slot];
+      sched_arg.slot_id = sched_slot;
+      sched_arg.resume_limit = enter_slot_resume_limit;
+      sched_arg.ret = Keystone::Error::DeviceError;
+      if (pthread_create(&sched_thread, NULL, slottee_multihart_worker,
+              &sched_arg) != 0) {
+        printf("[FAIL] preempt sched failed to create scheduler thread\n");
+        slottee_trace_destroy(enclave);
+        return 1;
+      }
+      sched_started = 1;
+    }
+
+    sched_yield();
+    usleep(1000);
+    ret = enclave.resume(&value);
+    resumes++;
+
+    get_preempt_sched_report(&report);
+    if (report.magic == SLOTTEE_PREEMPT_SCHED_MAGIC)
+      report_ready = true;
+    if (report_ready && ret == Keystone::Error::Success &&
+        value == SLOTTEE_LT_USER_OCALL_MAGIC)
+      break;
+  }
+
+  if (sched_started && pthread_join(sched_thread, NULL) != 0) {
+    printf("[FAIL] preempt sched failed to join scheduler thread\n");
+    slottee_trace_destroy(enclave);
+    return 1;
+  }
+
+  get_preempt_sched_report(&report);
+  if (report.magic == SLOTTEE_PREEMPT_SCHED_MAGIC)
+    report_ready = true;
+
+  printf("preempt_sched,main,%ld,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",
+      online_harts, (int)ret, value, ocalls, resumes, interrupts,
+      report.completed_workers, report.preempt_switches, report.preempt_ticks,
+      report.host_yields, report.exit_switches, report.runnable_queue_depth,
+      report.scheduler_queue_leaks, report.scheduler_wait_residue,
+      report.scheduler_unfinished, report.scheduler_duplicate_rejects,
+      report.fairness_min, report.fairness_max, report.fairness_gap,
+      report.fairness_violations, report.min_preempts, report.failures);
+  for (uintptr_t i = 0; i < SLOTTEE_PREEMPT_SCHED_WORKERS; i++) {
+    printf("preempt_sched_worker,%lu,dispatch=%lu,preempts=%lu,checksum=0x%lx\n",
+        i, report.per_worker_dispatch[i], report.per_worker_preempts[i],
+        report.worker_checksums[i]);
+  }
+  fflush(stdout);
+
+  bool checksums_ok = true;
+  for (uintptr_t i = 0; i < SLOTTEE_PREEMPT_SCHED_WORKERS; i++) {
+    volatile uintptr_t acc = SLOTTEE_PREEMPT_SCHED_MAGIC ^ ((uintptr_t)i << 8);
+    for (uintptr_t iter = 0; iter < SLOTTEE_PREEMPT_SCHED_ITERS; iter++) {
+      acc += (iter ^ i) + 1;
+      acc ^= (acc << 7) ^ (acc >> 3);
+    }
+    if (report.worker_checksums[i] != acc)
+      checksums_ok = false;
+  }
+
+  bool ok =
+      ret == Keystone::Error::Success &&
+      value == SLOTTEE_LT_USER_OCALL_MAGIC &&
+      report_ready &&
+      report.magic == SLOTTEE_PREEMPT_SCHED_MAGIC &&
+      report.worker_count == SLOTTEE_PREEMPT_SCHED_WORKERS &&
+      report.completed_workers == SLOTTEE_PREEMPT_SCHED_WORKERS &&
+      report.host_yields == 0 &&
+      report.preempt_switches > 0 &&
+      report.min_preempts > 0 &&
+      report.runnable_queue_depth == 0 &&
+      report.scheduler_queue_leaks == 0 &&
+      report.scheduler_wait_residue == 0 &&
+      report.scheduler_unfinished == 0 &&
+      report.scheduler_duplicate_rejects == 0 &&
+      report.fairness_violations == 0 &&
+      report.failures == 0 &&
+      checksums_ok &&
+      sched_arg.ret == Keystone::Error::Success &&
+      sched_arg.value == SLOTTEE_LT_USER_OCALL_MAGIC;
+
+  slottee_trace_destroy(enclave);
+
+  if (!ok) {
+    printf("[FAIL] preempt sched invalid report or scheduler state (sched_ret=%d sched_status=%lu sched_value=%lu checksums_ok=%d)\n",
+        (int)sched_arg.ret, sched_arg.status, sched_arg.value,
+        (int)checksums_ok);
+    return 1;
+  }
+
+  printf("[slottee] preempt_sched workers=%lu completed=%lu switches=%lu ticks=%lu host_yields=%lu exit_switches=%lu min_preempts=%lu fair_gap=%lu runnable_q=%lu qleak=%lu unfinished=%lu interrupts_seen=%lu ok=1\n",
+      report.worker_count, report.completed_workers, report.preempt_switches,
+      report.preempt_ticks, report.host_yields, report.exit_switches,
+      report.min_preempts, report.fairness_gap, report.runnable_queue_depth,
+      report.scheduler_queue_leaks, report.scheduler_unfinished, interrupts);
+  return 0;
+}
+
 static int
 run_slottee_paper_eval(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
@@ -5765,6 +5923,7 @@ main(int argc, char** argv) {
         "[--enter-slot-policy] "
         "[--enter-slot-watchdog-ttl] "
         "[--enter-slot-timer-preempt] "
+        "[--enter-slot-preempt-sched] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
@@ -5825,6 +5984,7 @@ main(int argc, char** argv) {
   int enter_slot_policy = 0;
   int enter_slot_watchdog_ttl = 0;
   int enter_slot_timer_preempt = 0;
+  int enter_slot_preempt_sched = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
@@ -5904,6 +6064,7 @@ main(int argc, char** argv) {
       {"enter-slot-policy", no_argument, &enter_slot_policy, 1},
       {"enter-slot-watchdog-ttl", no_argument, &enter_slot_watchdog_ttl, 1},
       {"enter-slot-timer-preempt", no_argument, &enter_slot_timer_preempt, 1},
+      {"enter-slot-preempt-sched", no_argument, &enter_slot_preempt_sched, 1},
       {"slottee-trace-log", no_argument, &slottee_trace_log, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
@@ -6111,6 +6272,10 @@ main(int argc, char** argv) {
 
   if (enter_slot_timer_preempt) {
     return run_slottee_timer_preempt_test(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_preempt_sched) {
+    return run_slottee_preempt_sched_test(eapp_file, rt_file, ld_file, params);
   }
 
   if (slottee_debug_mint_gate) {

@@ -69,3 +69,13 @@ int
 slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats) {
   return SYSCALL_1(RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS, stats);
 }
+
+int
+slottee_preempt_run(const struct slottee_preempt_spec* specs, uintptr_t count) {
+  return SYSCALL_2(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_RUN, specs, count);
+}
+
+int
+slottee_preempt_collect_stats(struct slottee_preempt_sched_stats* stats) {
+  return SYSCALL_1(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_STATS, stats);
+}

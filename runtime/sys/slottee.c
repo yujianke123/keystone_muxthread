@@ -89,6 +89,7 @@ struct slottee_active_user_context {
   uintptr_t preempt_count;
   uintptr_t preempt_yield_count;
   uintptr_t preempt_dispatch_count;
+  uintptr_t preempt_worker;
   uintptr_t dispatch_count;
   uintptr_t in_runnable_queue;
   uintptr_t in_wait_queue;
@@ -136,6 +137,24 @@ static uintptr_t slottee_global_wait_op;
 static uintptr_t slottee_global_wait_block_count;
 static uintptr_t slottee_global_wait_wakeup_count;
 static uintptr_t slottee_global_notify_miss_count;
+
+/*
+ * OS-level preemptive timer scheduler state (--enter-slot-preempt-sched).
+ * One host-entered LT_USER_OCALL slot acts as the scheduler thread; it bootstraps
+ * a set of co-resident in-runtime worker LTs that the timer ISR round-robins by
+ * rewriting the trap frame, entirely inside the enclave (no host-mediated resume).
+ */
+static volatile int slottee_preempt_sched_active;
+static uintptr_t slottee_preempt_worker_count;
+static uintptr_t slottee_preempt_completed;
+static uintptr_t slottee_preempt_switches;
+static uintptr_t slottee_preempt_ticks;
+static uintptr_t slottee_preempt_host_yields;
+static uintptr_t slottee_preempt_exit_switches;
+static uintptr_t slottee_preempt_current_slot;
+static uintptr_t slottee_preempt_worker_slots[SLOTTEE_MAX_SLOTS];
+static struct encl_ctx slottee_preempt_scheduler_ctx;
+static int slottee_preempt_scheduler_ctx_valid;
 
 static void
 slottee_slot_policy_lock_acquire(void)
@@ -750,6 +769,7 @@ slottee_activate_user_context(uintptr_t slot_id, uintptr_t lease_id, uintptr_t m
   user->preempt_count = 0;
   user->preempt_yield_count = 0;
   user->preempt_dispatch_count = 0;
+  user->preempt_worker = 0;
   user->dispatch_count = 0;
   user->in_runnable_queue = 0;
   user->in_wait_queue = 0;
@@ -837,6 +857,178 @@ slottee_active_user_record_ocall_resume(struct encl_ctx* ctx, uintptr_t value)
   user->tls_resume_ok += ctx->regs.tp == user->entry_tls_base ? 1 : 0;
 }
 
+/*
+ * Bootstrap one in-runtime preemptive worker LT.  The worker is never entered by
+ * the host: it lives entirely as an Eyrie-RT logical thread multiplexed on the
+ * scheduler slot's SM thread.  Its initial register frame is cloned from the
+ * scheduler's live frame (so it inherits the eapp gp and ambient supervisor
+ * state) and then re-pointed at the worker entry: pc=fn, sp=own stack top,
+ * tp=own TLS, a0=arg.  Each subsequent timer switch restores this saved_ctx.
+ */
+static void
+slottee_preempt_init_worker(struct slottee_active_user_context* user,
+    uintptr_t slot_id, uintptr_t lease_id, uintptr_t fn, uintptr_t arg,
+    const struct encl_ctx* tmpl)
+{
+  user->active = 1;
+  user->slot_id = slot_id;
+  user->lease_id = lease_id;
+  user->mode = SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL;
+  user->enter_count++;
+  user->hart_id = sbi_current_hart();
+  user->preempt_worker = 1;
+  user->last_trap_syscall = 0;
+  user->last_trap_scause = 0;
+  user->last_trap_sepc = 0;
+  user->last_trap_stval = 0;
+  user->last_trap_user_sp = 0;
+  user->last_trap_user_tp = 0;
+  user->syscall_trap_count = 0;
+  user->ocall_trap_count = 0;
+  user->ocall_resume_count = 0;
+  user->exit_trap_count = 0;
+  user->fault_trap_count = 0;
+  user->revoke_on_fault = 0;
+  user->lt_entry_active = 1;
+  user->tls_exit_ok = 0;
+  user->tls_exit_mismatch = 0;
+  user->wait_user_ptr = 0;
+  user->wait_target = 0;
+  user->wait_op = 0;
+  user->wait_block_count = 0;
+  user->wait_wakeup_count = 0;
+  user->wait_notify_miss_count = 0;
+  user->timer_wait_stop_count = 0;
+  user->preempt_count = 0;
+  user->preempt_yield_count = 0;
+  user->preempt_dispatch_count = 0;
+  user->dispatch_count = 0;
+  user->in_runnable_queue = 0;
+  user->in_wait_queue = 0;
+  user->fairness_ticket = 0;
+  user->scheduler_state = SLOTTEE_USER_LT_READY;
+  user->user_stack_exit_ok = 0;
+  user->tls_resume_ok = 0;
+
+  slottee_prepare_user_memory(user, slot_id);
+
+  user->entry_tls_base = user->user_tls_base;
+  user->tls_entry_ok = slottee_user_addr_in_range(user->entry_tls_base,
+      user->user_tls_base, user->user_tls_size);
+  user->user_stack_entry_ok = user->user_alloc_ok;
+
+  user->saved_ctx = *tmpl;
+  user->saved_ctx.regs.sepc = fn;
+  user->saved_ctx.regs.sp = user->user_stack_top;
+  user->saved_ctx.regs.tp = user->user_tls_base;
+  user->saved_ctx.regs.a0 = arg;
+  user->saved_ctx.regs.ra = 0;
+  user->saved_ctx_valid = user->user_alloc_ok;
+}
+
+static struct slottee_active_user_context*
+slottee_preempt_pick_next(void)
+{
+  return slottee_user_lt_queue_dequeue(&slottee_user_runnable_queue,
+      SLOTTEE_USER_LT_QUEUE_RUNNABLE);
+}
+
+/*
+ * Timer-driven context switch for the OS-level preemptive scheduler.  Called
+ * from the redirected S-mode timer ISR with the preempted worker's full frame in
+ * *ctx.  Saving *ctx into the current worker and copying the next runnable
+ * worker's saved_ctx back into *ctx makes return_to_encl sret into a *different*
+ * LT — a real preemptive context switch with no host-mediated resume.
+ */
+static uintptr_t
+slottee_preempt_timer_switch(struct slottee_active_user_context* cur,
+    struct encl_ctx* ctx)
+{
+  struct slottee_active_user_context* next;
+
+  slottee_lt_scheduler_lock_acquire();
+  slottee_preempt_ticks++;
+
+  slottee_user_lt_save_frame(cur, ctx);
+  cur->scheduler_state = SLOTTEE_USER_LT_YIELDED;
+  if (!cur->in_runnable_queue)
+    (void)slottee_user_lt_queue_enqueue(&slottee_user_runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE, cur);
+
+  next = slottee_preempt_pick_next();
+  if (next && next != cur && next->saved_ctx_valid) {
+    cur->preempt_count++;
+    cur->preempt_yield_count++;
+    next->scheduler_state = SLOTTEE_USER_LT_RUNNING;
+    next->preempt_dispatch_count++;
+    slottee_user_lt_record_dispatch(next);
+    slottee_preempt_current_slot = next->slot_id;
+    slottee_preempt_switches++;
+    *ctx = next->saved_ctx;
+  } else if (next) {
+    /* Only one runnable worker remains: keep it on-core, no real swap. */
+    next->scheduler_state = SLOTTEE_USER_LT_RUNNING;
+    slottee_preempt_current_slot = next->slot_id;
+  }
+  slottee_lt_scheduler_lock_release();
+  return 1;
+}
+
+/*
+ * Preempt-aware worker exit.  Instead of tearing down the enclave run, retire the
+ * exiting worker and switch into the next runnable worker; when none remain,
+ * restore the saved scheduler-thread frame so PREEMPT_RUN returns in-place.
+ */
+static int
+slottee_preempt_worker_exit(struct slottee_active_user_context* user,
+    struct encl_ctx* ctx, uintptr_t value)
+{
+  struct slottee_active_user_context* next;
+
+  slottee_lt_scheduler_lock_acquire();
+
+  slottee_record_trap_frame(user, ctx, RUNTIME_SYSCALL_EXIT);
+  user->exit_trap_count++;
+  user->user_stack_exit_ok = slottee_user_addr_in_range(user->last_trap_user_sp,
+      user->user_stack_base, SLOTTEE_USER_STACK_SIZE);
+  user->tls_exit_ok = user->last_trap_user_tp == user->entry_tls_base;
+  user->tls_exit_mismatch += user->tls_exit_ok ? 0 : 1;
+  user->scheduler_state = SLOTTEE_USER_LT_EXITED;
+  user->preempt_worker = 0;
+  if (user->in_runnable_queue)
+    (void)slottee_user_lt_queue_remove(&slottee_user_runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE, user);
+  user->active = 0;
+  user->saved_ctx_valid = 0;
+  slottee_preempt_completed++;
+  (void)value;
+
+  next = slottee_preempt_pick_next();
+  if (next && next->saved_ctx_valid) {
+    slottee_preempt_exit_switches++;
+    next->scheduler_state = SLOTTEE_USER_LT_RUNNING;
+    next->preempt_dispatch_count++;
+    slottee_user_lt_record_dispatch(next);
+    slottee_preempt_current_slot = next->slot_id;
+    *ctx = next->saved_ctx;
+    slottee_lt_scheduler_lock_release();
+    return 1;
+  }
+
+  slottee_preempt_sched_active = 0;
+  slottee_preempt_current_slot = 0;
+  if (slottee_preempt_scheduler_ctx_valid) {
+    *ctx = slottee_preempt_scheduler_ctx;
+    ctx->regs.a0 = slottee_preempt_completed;
+    slottee_preempt_scheduler_ctx_valid = 0;
+  }
+  slottee_lt_scheduler_lock_release();
+  printf("[slottee] preempt_all_done completed=%lu switches=%lu exit_switches=%lu ticks=%lu\r\n",
+      slottee_preempt_completed, slottee_preempt_switches,
+      slottee_preempt_exit_switches, slottee_preempt_ticks);
+  return 1;
+}
+
 uintptr_t
 slottee_lt_timer_preempt(struct encl_ctx* ctx)
 {
@@ -844,6 +1036,16 @@ slottee_lt_timer_preempt(struct encl_ctx* ctx)
 
   if (!ctx || (ctx->sstatus & SR_SPP))
     return 0;
+
+  /*
+   * OS-level preemptive path: when the in-runtime scheduler is active and the
+   * preempted frame belongs to one of its workers, switch LTs inside the enclave
+   * instead of stopping out to the host.
+   */
+  if (slottee_preempt_sched_active && user && user->preempt_worker) {
+    slottee_record_trap_frame(user, ctx, STOP_TIMER_INTERRUPT);
+    return slottee_preempt_timer_switch(user, ctx);
+  }
 
   if (!user || !slottee_mode_is_user_ocall(user->mode))
     return 0;
@@ -892,6 +1094,10 @@ slottee_active_user_exit(struct encl_ctx* ctx, uintptr_t value)
       (user->mode != SLOTTEE_SLOT_TOKEN_MODE_LT_USER &&
        !slottee_mode_is_user_ocall(user->mode)))
     return 0;
+
+  /* In-runtime preemptive worker exit retires the LT and switches in place. */
+  if (slottee_preempt_sched_active && user->preempt_worker)
+    return slottee_preempt_worker_exit(user, ctx, value);
 
   slottee_record_trap_frame(user, ctx, RUNTIME_SYSCALL_EXIT);
   user->exit_trap_count++;
@@ -1302,6 +1508,178 @@ slottee_lt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
       stats.fairness_violations++;
   }
   slottee_lt_scheduler_lock_release();
+
+  if (copy_to_user((void*)stats_ptr, &stats, sizeof(stats)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+/*
+ * Entry point for the OS-level preemptive timer scheduler.  Issued by an eapp
+ * thread already running inside a timer-redirectable LT_USER_OCALL slot (the
+ * "scheduler thread").  Bootstraps `count` co-resident worker LTs and switches
+ * the trap frame into the first one; the syscall handler must NOT clobber a0 on
+ * success (it returns without writing the result).  Control returns here only
+ * after every worker has exited, via slottee_preempt_worker_exit restoring the
+ * saved scheduler frame with a0 = completed worker count.
+ */
+uintptr_t
+slottee_preempt_run(struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count)
+{
+  struct slottee_preempt_spec specs[SLOTTEE_MAX_SLOTS];
+  struct slottee_active_user_context* sched = slottee_active_user_for_frame(ctx);
+  struct slottee_active_user_context* first;
+  uintptr_t assigned = 0;
+  uintptr_t i;
+
+  if (!sched || !slottee_mode_is_user_ocall(sched->mode) ||
+      slottee_preempt_sched_active)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  if (count == 0 || count >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  if (!specs_ptr ||
+      copy_from_user(specs, (void*)specs_ptr, count * sizeof(specs[0])))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  for (i = 0; i < count; i++) {
+    if (!slottee_user_entry_addr_ok(specs[i].fn))
+      return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  }
+
+  slottee_lt_scheduler_lock_acquire();
+
+  slottee_preempt_worker_count = 0;
+  slottee_preempt_completed = 0;
+  slottee_preempt_switches = 0;
+  slottee_preempt_ticks = 0;
+  slottee_preempt_host_yields = 0;
+  slottee_preempt_exit_switches = 0;
+  slottee_preempt_current_slot = 0;
+
+  /*
+   * The scheduler thread may have taken a stray host-mediated timer preempt in
+   * the tiny window before this call, leaving itself (or stale dispatch state)
+   * on the runnable queue.  Drain the queue and clear the scheduler's membership
+   * so only freshly bootstrapped workers are runnable, and reset the duplicate
+   * counter so the report reflects this run only.
+   */
+  while (slottee_user_runnable_queue.count)
+    (void)slottee_user_lt_queue_dequeue(&slottee_user_runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE);
+  if (sched->in_wait_queue)
+    (void)slottee_user_lt_queue_remove(&slottee_user_wait_queue,
+        SLOTTEE_USER_LT_QUEUE_WAIT, sched);
+  sched->scheduler_state = SLOTTEE_USER_LT_RUNNING;
+  slottee_user_scheduler_duplicate_rejects = 0;
+
+  for (uintptr_t slot = 1; slot < SLOTTEE_MAX_SLOTS && assigned < count; slot++) {
+    if (slot == sched->slot_id)
+      continue;
+    slottee_preempt_worker_slots[assigned++] = slot;
+  }
+  if (assigned != count) {
+    slottee_lt_scheduler_lock_release();
+    return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
+  }
+
+  /* ctx already points past the PREEMPT_RUN ecall (handle_syscall did sepc+=4);
+   * save it so the scheduler thread resumes right after the call. */
+  slottee_preempt_scheduler_ctx = *ctx;
+  slottee_preempt_scheduler_ctx_valid = 1;
+
+  for (i = 0; i < count; i++) {
+    struct slottee_active_user_context* user =
+        &slottee_active_users[slottee_preempt_worker_slots[i]];
+
+    slottee_preempt_init_worker(user, slottee_preempt_worker_slots[i],
+        sched->lease_id, specs[i].fn, specs[i].arg, ctx);
+    if (!user->user_alloc_ok) {
+      slottee_preempt_scheduler_ctx_valid = 0;
+      slottee_lt_scheduler_lock_release();
+      return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
+    }
+    (void)slottee_user_lt_queue_enqueue(&slottee_user_runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE, user);
+  }
+
+  slottee_preempt_worker_count = count;
+
+  first = slottee_preempt_pick_next();
+  if (!first) {
+    slottee_preempt_scheduler_ctx_valid = 0;
+    slottee_lt_scheduler_lock_release();
+    return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
+  }
+  first->scheduler_state = SLOTTEE_USER_LT_RUNNING;
+  first->preempt_dispatch_count++;
+  slottee_user_lt_record_dispatch(first);
+  slottee_preempt_current_slot = first->slot_id;
+  slottee_preempt_sched_active = 1;
+  *ctx = first->saved_ctx;
+
+  slottee_lt_scheduler_lock_release();
+  printf("[slottee] preempt_run start sched=%lu count=%lu first=%lu fn=0x%lx sp=0x%lx\r\n",
+      sched->slot_id, count, first->slot_id, first->saved_ctx.regs.sepc,
+      first->saved_ctx.regs.sp);
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+uintptr_t
+slottee_preempt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
+{
+  struct slottee_preempt_sched_stats stats;
+  uintptr_t i;
+
+  (void)ctx;
+  if (!stats_ptr)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  memset(&stats, 0, sizeof(stats));
+  slottee_lt_scheduler_lock_acquire();
+  stats.worker_count = slottee_preempt_worker_count;
+  stats.completed = slottee_preempt_completed;
+  stats.preempt_switches = slottee_preempt_switches;
+  stats.preempt_ticks = slottee_preempt_ticks;
+  stats.host_yields = slottee_preempt_host_yields;
+  stats.exit_switches = slottee_preempt_exit_switches;
+  stats.runnable_queue_depth = slottee_user_runnable_queue.count;
+  stats.scheduler_wait_residue = slottee_user_wait_queue.count;
+  stats.scheduler_duplicate_rejects = slottee_user_scheduler_duplicate_rejects;
+  stats.active = slottee_preempt_sched_active;
+  stats.fairness_min = (uintptr_t)-1;
+  stats.fairness_max = 0;
+
+  for (i = 0; i < slottee_preempt_worker_count && i < SLOTTEE_MAX_SLOTS; i++) {
+    uintptr_t slot = slottee_preempt_worker_slots[i];
+    struct slottee_active_user_context* user = &slottee_active_users[slot];
+    uintptr_t dispatched = user->dispatch_count;
+
+    stats.per_worker_slot[i] = slot;
+    stats.per_worker_dispatch[i] = dispatched;
+    stats.per_worker_preempts[i] = user->preempt_count;
+    if (user->in_runnable_queue || user->in_wait_queue)
+      stats.scheduler_queue_leaks++;
+    if (user->scheduler_state != SLOTTEE_USER_LT_EXITED)
+      stats.scheduler_unfinished++;
+    if (dispatched < stats.fairness_min)
+      stats.fairness_min = dispatched;
+    if (dispatched > stats.fairness_max)
+      stats.fairness_max = dispatched;
+  }
+  if (stats.fairness_min == (uintptr_t)-1)
+    stats.fairness_min = 0;
+  stats.fairness_gap = stats.fairness_max - stats.fairness_min;
+  if (stats.fairness_gap > SLOTTEE_LT_FAIRNESS_GAP_LIMIT)
+    stats.fairness_violations++;
+  slottee_lt_scheduler_lock_release();
+
+  printf("[slottee] preempt_stats wc=%lu done=%lu sw=%lu host_yield=%lu d=%lu/%lu/%lu p=%lu/%lu/%lu unfin=%lu qleak=%lu active=%lu\r\n",
+      stats.worker_count, stats.completed, stats.preempt_switches,
+      stats.host_yields,
+      stats.per_worker_dispatch[0], stats.per_worker_dispatch[1],
+      stats.per_worker_dispatch[2], stats.per_worker_preempts[0],
+      stats.per_worker_preempts[1], stats.per_worker_preempts[2],
+      stats.scheduler_unfinished, stats.scheduler_queue_leaks, stats.active);
 
   if (copy_to_user((void*)stats_ptr, &stats, sizeof(stats)))
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;

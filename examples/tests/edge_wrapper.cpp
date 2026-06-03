@@ -18,10 +18,12 @@
 #define OCALL_EDGECALL_STRESS_ECHO 8
 #define OCALL_EDGECALL_STRESS_REPORT 9
 #define OCALL_TIMER_PREEMPT_REPORT 10
+#define OCALL_PREEMPT_SCHED_REPORT 11
 
 static struct slottee_edgecall_stress_report copied_edgecall_stress_report;
 static struct slottee_edgecall_stress_payload copied_edgecall_stress_payload;
 static struct slottee_timer_preempt_report copied_timer_preempt_report;
+static struct slottee_preempt_sched_report copied_preempt_sched_report;
 static uintptr_t edgecall_stress_echo_count;
 
 void
@@ -40,6 +42,7 @@ edge_init(Keystone::Enclave* enclave) {
   register_call(OCALL_EDGECALL_STRESS_REPORT,
       copy_edgecall_stress_report_wrapper);
   register_call(OCALL_TIMER_PREEMPT_REPORT, copy_timer_preempt_report_wrapper);
+  register_call(OCALL_PREEMPT_SCHED_REPORT, copy_preempt_sched_report_wrapper);
 
   edge_call_init_internals(
       (uintptr_t)enclave->getSharedBuffer(), enclave->getSharedBufferSize());
@@ -77,6 +80,19 @@ get_timer_preempt_report(struct slottee_timer_preempt_report* report)
 {
   if (report)
     *report = copied_timer_preempt_report;
+}
+
+void
+reset_preempt_sched_state(void)
+{
+  memset(&copied_preempt_sched_report, 0, sizeof(copied_preempt_sched_report));
+}
+
+void
+get_preempt_sched_report(struct slottee_preempt_sched_report* report)
+{
+  if (report)
+    *report = copied_preempt_sched_report;
 }
 
 void
@@ -254,6 +270,28 @@ copy_timer_preempt_report_wrapper(void* buffer) {
   }
 
   copy_timer_preempt_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_preempt_sched_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_preempt_sched_report))
+    memcpy(&copied_preempt_sched_report, buffer, size);
+}
+
+void
+copy_preempt_sched_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_preempt_sched_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_preempt_sched_report((void*)call_args, args_len);
   edge_call->return_data.call_status = CALL_STATUS_OK;
 }
 

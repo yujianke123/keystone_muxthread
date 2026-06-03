@@ -17,6 +17,8 @@
 #define RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS 1009
 #define RUNTIME_SYSCALL_SLOTTEE_SLOT_REQUEST 1010
 #define RUNTIME_SYSCALL_SLOTTEE_SLOT_RELEASE 1011
+#define RUNTIME_SYSCALL_SLOTTEE_PREEMPT_RUN  1012
+#define RUNTIME_SYSCALL_SLOTTEE_PREEMPT_STATS 1013
 #define RUNTIME_SYSCALL_EXIT                1101
 
 #define SLOTTEE_LT_WAIT_OP_EQ          0
@@ -65,6 +67,44 @@ struct slottee_lt_runtime_stats {
   uintptr_t stack_exit_ok;
   uintptr_t tls_resume_ok;
   uintptr_t hart_id[SLOTTEE_MAX_SLOTS];
+};
+
+/*
+ * One in-runtime preemptive worker specification handed from the eapp scheduler
+ * thread to the Eyrie RT preempt scheduler: a U-mode entry function pointer plus
+ * its argument.  All workers belong to the same eapp (share .data/gp).
+ */
+struct slottee_preempt_spec {
+  uintptr_t fn;
+  uintptr_t arg;
+};
+
+/*
+ * Snapshot of the Eyrie RT OS-level preemptive timer scheduler after a
+ * PREEMPT_RUN completes.  preempt_switches counts timer-driven in-runtime
+ * context swaps that changed the running LT; host_yields counts stop_enclave
+ * calls made during the run (must stay 0 to prove zero host mediation).
+ */
+struct slottee_preempt_sched_stats {
+  uintptr_t worker_count;
+  uintptr_t completed;
+  uintptr_t preempt_switches;
+  uintptr_t preempt_ticks;
+  uintptr_t host_yields;
+  uintptr_t exit_switches;
+  uintptr_t runnable_queue_depth;
+  uintptr_t scheduler_queue_leaks;
+  uintptr_t scheduler_wait_residue;
+  uintptr_t scheduler_unfinished;
+  uintptr_t scheduler_duplicate_rejects;
+  uintptr_t fairness_min;
+  uintptr_t fairness_max;
+  uintptr_t fairness_gap;
+  uintptr_t fairness_violations;
+  uintptr_t active;
+  uintptr_t per_worker_slot[SLOTTEE_MAX_SLOTS];
+  uintptr_t per_worker_dispatch[SLOTTEE_MAX_SLOTS];
+  uintptr_t per_worker_preempts[SLOTTEE_MAX_SLOTS];
 };
 
 #endif  // __EYRIE_CALL_H__

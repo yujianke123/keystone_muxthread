@@ -26,6 +26,13 @@
   (SLOTTEE_TIMER_PREEMPT_FIRST_WORKER_SLOT + \
    SLOTTEE_TIMER_PREEMPT_WORKERS - 1)
 #define SLOTTEE_TIMER_PREEMPT_ITERS          8000000UL
+#define SLOTTEE_PREEMPT_SCHED_MAGIC          0x51513b3b
+#define SLOTTEE_PREEMPT_SCHED_SCHEDULER_SLOT 2
+#define SLOTTEE_PREEMPT_SCHED_WORKERS        3
+#define SLOTTEE_PREEMPT_SCHED_FIRST_WORKER_SLOT 3
+#define SLOTTEE_PREEMPT_SCHED_LAST_WORKER_SLOT \
+  (SLOTTEE_PREEMPT_SCHED_FIRST_WORKER_SLOT + SLOTTEE_PREEMPT_SCHED_WORKERS - 1)
+#define SLOTTEE_PREEMPT_SCHED_ITERS          3000000UL
 
 struct slottee_multihart_ticket_config {
   uintptr_t magic;
@@ -152,6 +159,36 @@ struct slottee_timer_preempt_report {
   uintptr_t tls_exit_ok;
   uintptr_t tls_exit_mismatch;
   uintptr_t worker_checksums[SLOTTEE_TIMER_PREEMPT_WORKERS];
+};
+
+/*
+ * Report for the OS-level preemptive timer scheduler (--enter-slot-preempt-sched).
+ * The eapp scheduler thread assembles it from RT scheduler stats plus the shared
+ * worker checksums and OCALLs it to the host for verdict.
+ */
+struct slottee_preempt_sched_report {
+  uintptr_t magic;
+  uintptr_t worker_count;
+  uintptr_t iterations_per_worker;
+  uintptr_t completed_workers;
+  uintptr_t preempt_switches;
+  uintptr_t preempt_ticks;
+  uintptr_t host_yields;
+  uintptr_t exit_switches;
+  uintptr_t runnable_queue_depth;
+  uintptr_t scheduler_queue_leaks;
+  uintptr_t scheduler_wait_residue;
+  uintptr_t scheduler_unfinished;
+  uintptr_t scheduler_duplicate_rejects;
+  uintptr_t fairness_min;
+  uintptr_t fairness_max;
+  uintptr_t fairness_gap;
+  uintptr_t fairness_violations;
+  uintptr_t min_preempts;
+  uintptr_t failures;
+  uintptr_t per_worker_dispatch[SLOTTEE_PREEMPT_SCHED_WORKERS];
+  uintptr_t per_worker_preempts[SLOTTEE_PREEMPT_SCHED_WORKERS];
+  uintptr_t worker_checksums[SLOTTEE_PREEMPT_SCHED_WORKERS];
 };
 
 #endif

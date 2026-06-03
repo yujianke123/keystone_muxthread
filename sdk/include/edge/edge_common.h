@@ -14,9 +14,14 @@ typedef size_t edge_data_offset;
 
 typedef void (*edgecallwrapper)(void*);
 
-#define MAX_EDGE_CALL 10
+#define MAX_EDGE_CALL 16
 
-extern edgecallwrapper edge_call_table[MAX_EDGE_CALL];
+/*
+ * Table is indexed by call_id in [0, MAX_EDGE_CALL]; size must be
+ * MAX_EDGE_CALL + 1 so call_id == MAX_EDGE_CALL is in bounds (the dispatch and
+ * register paths gate on `call_id > MAX_EDGE_CALL`).
+ */
+extern edgecallwrapper edge_call_table[MAX_EDGE_CALL + 1];
 
 /* Call status indicates if the wrapper code, pointers, offsets, etc went OK
  * It has no bearing on data contained in the returns. */

@@ -264,7 +264,7 @@ void handle_syscall(struct encl_ctx* ctx)
   switch (n) {
   case(RUNTIME_SYSCALL_EXIT):
     if (slottee_active_user_exit(ctx, arg0))
-      break;
+      return; /* preempt worker exit already rewrote ctx; do not clobber a0 */
     sbi_exit_enclave(arg0);
     break;
   case(RUNTIME_SYSCALL_OCALL):
@@ -329,6 +329,14 @@ void handle_syscall(struct encl_ctx* ctx)
     break;
   case(RUNTIME_SYSCALL_SLOTTEE_SLOT_RELEASE):
     ret = slottee_slot_release(arg0);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_RUN):
+    ret = slottee_preempt_run(ctx, arg0, arg1);
+    if (ret == SBI_ERR_SM_ENCLAVE_SUCCESS)
+      return; /* switched into a worker LT; preserve its frame and a0 */
+    break;    /* setup failed; report ret in a0 to the scheduler thread */
+  case(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_STATS):
+    ret = slottee_preempt_collect_stats(ctx, arg0);
     break;
 
 
