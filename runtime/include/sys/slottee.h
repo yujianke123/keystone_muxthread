@@ -21,7 +21,8 @@ uintptr_t slottee_lt_notify_value(struct encl_ctx* ctx, uintptr_t user_ptr);
 uintptr_t slottee_lt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr);
 uintptr_t slottee_lt_timer_preempt(struct encl_ctx* ctx);
 uintptr_t slottee_preempt_run(
-    struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count);
+    struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count,
+    uintptr_t switch_budget);
 uintptr_t slottee_preempt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr);
 void slottee_active_user_record_syscall(struct encl_ctx* ctx, uintptr_t syscall_id);
 void slottee_active_user_record_ocall(struct encl_ctx* ctx);

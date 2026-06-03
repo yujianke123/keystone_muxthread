@@ -50,6 +50,11 @@ void copy_preempt_sched_report_wrapper(void* buffer);
 void get_preempt_sched_report(struct slottee_preempt_sched_report* report);
 void reset_preempt_sched_state(void);
 
+void copy_preempt_multihart_report_wrapper(void* buffer);
+void get_preempt_multihart_report(uintptr_t group_id,
+    struct slottee_preempt_multihart_report* report);
+void reset_preempt_multihart_state(void);
+
 void get_multihart_ticket_config_wrapper(void* buffer);
 void get_multihart_ticket_config(
     struct slottee_multihart_ticket_config* config);

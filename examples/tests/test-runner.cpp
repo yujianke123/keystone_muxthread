@@ -5870,6 +5870,180 @@ run_slottee_preempt_sched_test(const char* eapp_file,
   return 0;
 }
 
+/*
+ * 第42阶段: cross-hart parallel preemptive scheduling + host-cooperation valve.
+ * The host enters GROUPS scheduler slots on GROUPS pthreads (one per hart); each
+ * group runs an independent in-runtime preemptive scheduler over its own disjoint
+ * workers with switch_budget>0.  Verdict: per group completed=W, min_preempts>0,
+ * host_yields>0 (valve fired) and bounded, queues clean, deterministic checksums
+ * match a host recompute; and the two groups ran on DISTINCT harts.
+ */
+static int
+run_slottee_preempt_multihart_test(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  Keystone::Enclave enclave;
+  pthread_t sched_threads[SLOTTEE_PREEMPT_MULTIHART_GROUPS];
+  slottee_multihart_worker_arg sched_args[SLOTTEE_PREEMPT_MULTIHART_GROUPS];
+  int sched_started[SLOTTEE_PREEMPT_MULTIHART_GROUPS];
+  uintptr_t sched_slot[SLOTTEE_PREEMPT_MULTIHART_GROUPS];
+  struct slottee_preempt_multihart_report reports[SLOTTEE_PREEMPT_MULTIHART_GROUPS];
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  uintptr_t interrupts = 0;
+  Keystone::Error ret;
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  reset_preempt_multihart_state();
+  reset_copied_slot_caps();
+  memset(sched_threads, 0, sizeof(sched_threads));
+  memset(sched_args, 0, sizeof(sched_args));
+  memset(sched_started, 0, sizeof(sched_started));
+  memset(reports, 0, sizeof(reports));
+  for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_MULTIHART_GROUPS; g++)
+    sched_slot[g] = SLOTTEE_PREEMPT_MULTIHART_SCHED_SLOT(g);
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] preempt multihart failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  printf("preempt_multihart,phase,harts,ret,value,ocalls,resumes,interrupts\n");
+  fflush(stdout);
+
+  ret = enclave.runRaw(&value);
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < slottee_edgecall_stress_resume_limit * 16;
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      ocalls++;
+    } else if (ret == Keystone::Error::EnclaveInterrupted) {
+      interrupts++;
+    }
+
+    for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_MULTIHART_GROUPS; g++) {
+      if (!sched_started[g] && copied_slot_cap_ready_by_slot[sched_slot[g]]) {
+        memset(&sched_args[g], 0, sizeof(sched_args[g]));
+        sched_args[g].enclave = &enclave;
+        sched_args[g].cap = copied_slot_caps[sched_slot[g]];
+        sched_args[g].slot_id = sched_slot[g];
+        sched_args[g].resume_limit = slottee_edgecall_stress_resume_limit * 8;
+        sched_args[g].ret = Keystone::Error::DeviceError;
+        if (pthread_create(&sched_threads[g], NULL, slottee_multihart_worker,
+                &sched_args[g]) != 0) {
+          printf("[FAIL] preempt multihart failed to create group%lu thread\n", g);
+          slottee_trace_destroy(enclave);
+          return 1;
+        }
+        sched_started[g] = 1;
+        sched_yield();
+        usleep(1000);
+      }
+    }
+
+    sched_yield();
+    usleep(1000);
+    ret = enclave.resume(&value);
+    resumes++;
+
+    if (ret == Keystone::Error::Success && value == SLOTTEE_LT_USER_OCALL_MAGIC)
+      break;
+  }
+
+  for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_MULTIHART_GROUPS; g++) {
+    if (sched_started[g] && pthread_join(sched_threads[g], NULL) != 0) {
+      printf("[FAIL] preempt multihart failed to join group%lu thread\n", g);
+      slottee_trace_destroy(enclave);
+      return 1;
+    }
+    get_preempt_multihart_report(g, &reports[g]);
+  }
+
+  printf("preempt_multihart,main,%ld,%d,%lu,%lu,%lu,%lu\n",
+      online_harts, (int)ret, value, ocalls, resumes, interrupts);
+  fflush(stdout);
+
+  bool ok = ret == Keystone::Error::Success &&
+      value == SLOTTEE_LT_USER_OCALL_MAGIC;
+  bool checksums_ok = true;
+
+  for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_MULTIHART_GROUPS; g++) {
+    struct slottee_preempt_multihart_report* r = &reports[g];
+
+    printf("preempt_multihart,group,%lu,sched_slot=%lu,bound_hart=%lu,completed=%lu,switches=%lu,host_yields=%lu,min_preempts=%lu,exit_sw=%lu,runnable_q=%lu,qleak=%lu,unfinished=%lu,dup=%lu,fair_gap=%lu,failures=%lu\n",
+        g, r->scheduler_slot, sched_args[g].bound_hart, r->completed_workers,
+        r->preempt_switches, r->host_yields, r->min_preempts, r->exit_switches,
+        r->runnable_queue_depth, r->scheduler_queue_leaks,
+        r->scheduler_unfinished, r->scheduler_duplicate_rejects,
+        r->fairness_gap, r->failures);
+
+    for (uintptr_t w = 0; w < SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP; w++) {
+      uintptr_t flat = g * SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP + w;
+      volatile uintptr_t acc = SLOTTEE_PREEMPT_MULTIHART_MAGIC ^ ((uintptr_t)flat << 8);
+
+      for (uintptr_t iter = 0; iter < SLOTTEE_PREEMPT_MULTIHART_ITERS; iter++) {
+        acc += (iter ^ flat) + 1;
+        acc ^= (acc << 7) ^ (acc >> 3);
+      }
+      printf("preempt_multihart,worker,%lu,%lu,slot=%lu,dispatch=%lu,preempts=%lu,checksum=0x%lx,expect=0x%lx\n",
+          g, w, r->per_worker_slot[w], r->per_worker_dispatch[w],
+          r->per_worker_preempts[w], r->worker_checksums[w], (uintptr_t)acc);
+      if (r->worker_checksums[w] != (uintptr_t)acc)
+        checksums_ok = false;
+    }
+
+    ok = ok &&
+        r->magic == SLOTTEE_PREEMPT_MULTIHART_MAGIC &&
+        r->group_id == g &&
+        r->completed_workers == SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP &&
+        r->host_yields > 0 &&
+        r->preempt_switches > 0 &&
+        r->min_preempts > 0 &&
+        r->runnable_queue_depth == 0 &&
+        r->scheduler_queue_leaks == 0 &&
+        r->scheduler_unfinished == 0 &&
+        r->scheduler_duplicate_rejects == 0 &&
+        r->fairness_violations == 0 &&
+        r->failures == 0 &&
+        sched_args[g].ret == Keystone::Error::Success &&
+        sched_args[g].value == SLOTTEE_LT_USER_OCALL_MAGIC;
+  }
+
+  /* Cross-hart evidence: the two scheduler groups bound to DISTINCT harts. */
+  bool cross_hart_ok = true;
+  if (online_harts >= 2) {
+    if (sched_args[0].bound_hart == sched_args[1].bound_hart)
+      cross_hart_ok = false;
+    for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_MULTIHART_GROUPS; g++)
+      if (sched_args[g].bound_hart >= (uintptr_t)online_harts)
+        cross_hart_ok = false;
+  }
+  ok = ok && checksums_ok && cross_hart_ok;
+
+  slottee_trace_destroy(enclave);
+
+  if (!ok) {
+    printf("[FAIL] preempt multihart invalid (checksums_ok=%d cross_hart_ok=%d harts=%ld)\n",
+        (int)checksums_ok, (int)cross_hart_ok, online_harts);
+    return 1;
+  }
+
+  printf("[slottee] preempt_multihart groups=%lu workers_per_group=%lu cross_hart=%d hart0=%lu hart1=%lu interrupts_seen=%lu ok=1\n",
+      (uintptr_t)SLOTTEE_PREEMPT_MULTIHART_GROUPS,
+      (uintptr_t)SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP,
+      (int)cross_hart_ok, sched_args[0].bound_hart, sched_args[1].bound_hart,
+      interrupts);
+  return 0;
+}
+
 static int
 run_slottee_paper_eval(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
@@ -5924,6 +6098,7 @@ main(int argc, char** argv) {
         "[--enter-slot-watchdog-ttl] "
         "[--enter-slot-timer-preempt] "
         "[--enter-slot-preempt-sched] "
+        "[--enter-slot-preempt-multihart] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
@@ -5985,6 +6160,7 @@ main(int argc, char** argv) {
   int enter_slot_watchdog_ttl = 0;
   int enter_slot_timer_preempt = 0;
   int enter_slot_preempt_sched = 0;
+  int enter_slot_preempt_multihart = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
@@ -6065,6 +6241,8 @@ main(int argc, char** argv) {
       {"enter-slot-watchdog-ttl", no_argument, &enter_slot_watchdog_ttl, 1},
       {"enter-slot-timer-preempt", no_argument, &enter_slot_timer_preempt, 1},
       {"enter-slot-preempt-sched", no_argument, &enter_slot_preempt_sched, 1},
+      {"enter-slot-preempt-multihart", no_argument,
+          &enter_slot_preempt_multihart, 1},
       {"slottee-trace-log", no_argument, &slottee_trace_log, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
@@ -6276,6 +6454,11 @@ main(int argc, char** argv) {
 
   if (enter_slot_preempt_sched) {
     return run_slottee_preempt_sched_test(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (enter_slot_preempt_multihart) {
+    return run_slottee_preempt_multihart_test(
+        eapp_file, rt_file, ld_file, params);
   }
 
   if (slottee_debug_mint_gate) {

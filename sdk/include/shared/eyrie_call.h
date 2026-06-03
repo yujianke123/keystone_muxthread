@@ -77,6 +77,7 @@ struct slottee_lt_runtime_stats {
 struct slottee_preempt_spec {
   uintptr_t fn;
   uintptr_t arg;
+  uintptr_t slot;  /* explicit worker slot id; cross-hart groups must be disjoint */
 };
 
 /*

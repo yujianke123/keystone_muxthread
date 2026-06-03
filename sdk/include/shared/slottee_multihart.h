@@ -34,6 +34,18 @@
   (SLOTTEE_PREEMPT_SCHED_FIRST_WORKER_SLOT + SLOTTEE_PREEMPT_SCHED_WORKERS - 1)
 #define SLOTTEE_PREEMPT_SCHED_ITERS          3000000UL
 
+/* 第42阶段：跨 hart 并行抢占式调度（两级：in-runtime 抢占 + host 协作安全阀）。
+ * 2 个 scheduler 组各在自己 hart 上调度自己的 worker 子集；槽位 disjoint：
+ * group g: scheduler slot = 1 + g*3, worker slots = {2+g*3 .. } —— 即
+ * group0 sched=1 workers=2,3；group1 sched=4 workers=5,6。 */
+#define SLOTTEE_PREEMPT_MULTIHART_MAGIC      0x51513c3c
+#define SLOTTEE_PREEMPT_MULTIHART_GROUPS     2
+#define SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP 2
+#define SLOTTEE_PREEMPT_MULTIHART_SCHED_SLOT(g)     (1 + (g) * 3)
+#define SLOTTEE_PREEMPT_MULTIHART_WORKER_SLOT(g, w) (2 + (g) * 3 + (w))
+#define SLOTTEE_PREEMPT_MULTIHART_ITERS      1500000UL
+#define SLOTTEE_PREEMPT_MULTIHART_BUDGET     4
+
 struct slottee_multihart_ticket_config {
   uintptr_t magic;
   uintptr_t windows;
@@ -189,6 +201,33 @@ struct slottee_preempt_sched_report {
   uintptr_t per_worker_dispatch[SLOTTEE_PREEMPT_SCHED_WORKERS];
   uintptr_t per_worker_preempts[SLOTTEE_PREEMPT_SCHED_WORKERS];
   uintptr_t worker_checksums[SLOTTEE_PREEMPT_SCHED_WORKERS];
+};
+
+/* 第42阶段 per-group 报告：每个 scheduler 组 OCALL 一份（带 group_id）。
+ * 跨 hart 证据由 host 侧比较两组 scheduler pthread 的 bound_hart 给出。 */
+struct slottee_preempt_multihart_report {
+  uintptr_t magic;
+  uintptr_t group_id;
+  uintptr_t scheduler_slot;
+  uintptr_t worker_count;
+  uintptr_t completed_workers;
+  uintptr_t preempt_switches;
+  uintptr_t preempt_ticks;
+  uintptr_t host_yields;
+  uintptr_t exit_switches;
+  uintptr_t runnable_queue_depth;
+  uintptr_t scheduler_queue_leaks;
+  uintptr_t scheduler_wait_residue;
+  uintptr_t scheduler_unfinished;
+  uintptr_t scheduler_duplicate_rejects;
+  uintptr_t min_preempts;
+  uintptr_t fairness_gap;
+  uintptr_t fairness_violations;
+  uintptr_t failures;
+  uintptr_t per_worker_slot[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];
+  uintptr_t per_worker_dispatch[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];
+  uintptr_t per_worker_preempts[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];
+  uintptr_t worker_checksums[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];
 };
 
 #endif

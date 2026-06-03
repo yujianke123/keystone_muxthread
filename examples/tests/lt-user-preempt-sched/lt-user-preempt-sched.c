@@ -93,11 +93,14 @@ preempt_sched_entry(void* opaque)
   for (uintptr_t i = 0; i < SLOTTEE_PREEMPT_SCHED_WORKERS; i++) {
     specs[i].fn = (uintptr_t)&preempt_worker;
     specs[i].arg = i;
+    specs[i].slot = SLOTTEE_PREEMPT_SCHED_FIRST_WORKER_SLOT + i;
   }
 
   /* Blocks here (in the eapp's view): the RT switches away to the workers and
-   * only returns once every worker has exited, with a0 = completed count. */
-  completed = (uintptr_t)slottee_preempt_run(specs, SLOTTEE_PREEMPT_SCHED_WORKERS);
+   * only returns once every worker has exited, with a0 = completed count.
+   * switch_budget=0 keeps the Phase-41 behavior (pure in-runtime, host_yields=0). */
+  completed = (uintptr_t)slottee_preempt_run(specs,
+      SLOTTEE_PREEMPT_SCHED_WORKERS, 0);
 
   memset(&stats, 0, sizeof(stats));
   slottee_preempt_collect_stats(&stats);

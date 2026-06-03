@@ -331,7 +331,7 @@ void handle_syscall(struct encl_ctx* ctx)
     ret = slottee_slot_release(arg0);
     break;
   case(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_RUN):
-    ret = slottee_preempt_run(ctx, arg0, arg1);
+    ret = slottee_preempt_run(ctx, arg0, arg1, arg2);
     if (ret == SBI_ERR_SM_ENCLAVE_SUCCESS)
       return; /* switched into a worker LT; preserve its frame and a0 */
     break;    /* setup failed; report ret in a0 to the scheduler thread */

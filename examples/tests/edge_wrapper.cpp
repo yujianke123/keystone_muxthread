@@ -19,11 +19,14 @@
 #define OCALL_EDGECALL_STRESS_REPORT 9
 #define OCALL_TIMER_PREEMPT_REPORT 10
 #define OCALL_PREEMPT_SCHED_REPORT 11
+#define OCALL_PREEMPT_MULTIHART_REPORT 12
 
 static struct slottee_edgecall_stress_report copied_edgecall_stress_report;
 static struct slottee_edgecall_stress_payload copied_edgecall_stress_payload;
 static struct slottee_timer_preempt_report copied_timer_preempt_report;
 static struct slottee_preempt_sched_report copied_preempt_sched_report;
+static struct slottee_preempt_multihart_report
+    copied_preempt_multihart_reports[SLOTTEE_PREEMPT_MULTIHART_GROUPS];
 static uintptr_t edgecall_stress_echo_count;
 
 void
@@ -43,6 +46,8 @@ edge_init(Keystone::Enclave* enclave) {
       copy_edgecall_stress_report_wrapper);
   register_call(OCALL_TIMER_PREEMPT_REPORT, copy_timer_preempt_report_wrapper);
   register_call(OCALL_PREEMPT_SCHED_REPORT, copy_preempt_sched_report_wrapper);
+  register_call(OCALL_PREEMPT_MULTIHART_REPORT,
+      copy_preempt_multihart_report_wrapper);
 
   edge_call_init_internals(
       (uintptr_t)enclave->getSharedBuffer(), enclave->getSharedBufferSize());
@@ -93,6 +98,21 @@ get_preempt_sched_report(struct slottee_preempt_sched_report* report)
 {
   if (report)
     *report = copied_preempt_sched_report;
+}
+
+void
+reset_preempt_multihart_state(void)
+{
+  memset(copied_preempt_multihart_reports, 0,
+      sizeof(copied_preempt_multihart_reports));
+}
+
+void
+get_preempt_multihart_report(uintptr_t group_id,
+    struct slottee_preempt_multihart_report* report)
+{
+  if (report && group_id < SLOTTEE_PREEMPT_MULTIHART_GROUPS)
+    *report = copied_preempt_multihart_reports[group_id];
 }
 
 void
@@ -292,6 +312,32 @@ copy_preempt_sched_report_wrapper(void* buffer) {
   }
 
   copy_preempt_sched_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_preempt_multihart_report(void* buffer, size_t size) {
+  if (size != sizeof(struct slottee_preempt_multihart_report))
+    return;
+  struct slottee_preempt_multihart_report* r =
+      (struct slottee_preempt_multihart_report*)buffer;
+  if (r->group_id < SLOTTEE_PREEMPT_MULTIHART_GROUPS)
+    memcpy(&copied_preempt_multihart_reports[r->group_id], buffer, size);
+}
+
+void
+copy_preempt_multihart_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_preempt_multihart_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_preempt_multihart_report((void*)call_args, args_len);
   edge_call->return_data.call_status = CALL_STATUS_OK;
 }
 
