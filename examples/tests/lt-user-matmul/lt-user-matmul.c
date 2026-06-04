@@ -119,8 +119,20 @@ static void
 matmul_worker(void* opaque)
 {
   long g = (long)(uintptr_t)opaque;
-  long n = cfg_n;
-  long gc = cfg_groups;
+  long n;
+  long gc;
+
+  /*
+   * Acquire fence: this worker LT runs on a DIFFERENT hart than thread0, which
+   * filled A/B/Bt then spawned us.  Under QEMU MTTCG (weak memory) thread0's fill
+   * stores are not guaranteed visible here without a fence — a stale read makes
+   * matmul_rows compute from zero/old A/Bt and silently corrupt this band's C
+   * (root cause of the sporadic large-N multi-thread csum failure).  Pair with
+   * thread0's release fence after matmul_fill().
+   */
+  __sync_synchronize();
+  n = cfg_n;
+  gc = cfg_groups;
   long rows = n / gc;
   long r0 = g * rows;
   long r1 = (g == gc - 1) ? n : (r0 + rows);   /* 末组兜底（n 均能整除 gc，此处稳妥） */
@@ -144,6 +156,11 @@ matmul_sched_entry(void* opaque)
   struct slottee_preempt_spec spec;
   uintptr_t completed;
 
+  /* Acquire fence: this scheduler LT runs on a different hart than thread0 and
+   * reads cfg_groups (set by thread0) to size the worker slot.  Pairs with
+   * thread0's release fence after matmul_fill(); a stale cfg_groups would build a
+   * wrong worker slot. */
+  __sync_synchronize();
   spec.fn = (uintptr_t)&matmul_worker;
   spec.arg = (uintptr_t)g;
   spec.slot = SLOTTEE_MATMUL_FIRST_WORKER_SLOT + cfg_groups + g;  /* worker slot 不与 sched slot 冲突 */
@@ -179,6 +196,15 @@ eapp_entry()
   cfg_groups = cfg.groups;
 
   matmul_fill(cfg_n);
+  /*
+   * Release fence: publish cfg_n/cfg_groups + the freshly-filled A/B/Bt to shared
+   * enclave memory BEFORE any worker LT (spawned below, running on other harts)
+   * can read them.  Pairs with the acquire fence at matmul_worker entry.  Without
+   * this, QEMU MTTCG weak memory let a worker read stale A/Bt → wrong C (sporadic
+   * large-N multi-thread csum failure).  The Keystone baseline (groups==0) runs on
+   * thread0 itself so it is unaffected either way.
+   */
+  __sync_synchronize();
 
   memset(&report, 0, sizeof(report));
   report.magic = SLOTTEE_MATMUL_MAGIC;
