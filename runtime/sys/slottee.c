@@ -174,6 +174,8 @@ struct slottee_preempt_group {
   uintptr_t enable_steal;      /* PREEMPT_RUN flag: allow this hart to steal others' runnable workers */
   uintptr_t steals;            /* workers this group migrated in via stealing (passive + proactive) */
   uintptr_t rebalances;        /* proactive periodic-rebalance pulls (subset of steals) */
+  uintptr_t last_steal_victim_slot;   /* scheduler slot of the most recent steal victim */
+  uintptr_t last_steal_victim_count;  /* that victim's runnable count when chosen (best-victim evidence) */
   uintptr_t worker_slots[SLOTTEE_MAX_SLOTS];
   struct slottee_user_lt_queue runnable_queue;
   struct encl_ctx scheduler_ctx;
@@ -1095,6 +1097,15 @@ slottee_preempt_try_steal(struct slottee_preempt_group* thief,
     w->preempt_group = thief->scheduler_slot;   /* migrate ownership (once) */
     w->migrated = 1;
     thief->steals++;
+    /* Record the BUSIEST victim this group ever stole from (max runnable count at
+     * steal time).  A thief that is never a lend-victim is never directionally
+     * blocked, so it may steal several times as peers drain; tracking the maximum
+     * `best` (not the latest) is the stable evidence that the load-balanced
+     * selection picked the busiest eligible peer when multiple were available. */
+    if (best > thief->last_steal_victim_count) {
+      thief->last_steal_victim_count = best;
+      thief->last_steal_victim_slot = victim->scheduler_slot;
+    }
     /* Record the lend direction: victim lent to thief → forbid the reverse pull
      * (thief stealing back from victim later).  Atomic-or for cross-hart
      * visibility; the selection-loop read is a benign hint. */
@@ -1908,6 +1919,8 @@ slottee_preempt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
     stats.steals = group->steals;
     stats.steal_skips = slottee_preempt_steal_skips;
     stats.rebalances = group->rebalances;
+    stats.steal_victim_slot = group->last_steal_victim_slot;
+    stats.steal_victim_count = group->last_steal_victim_count;
     stats.runnable_queue_depth = group->runnable_queue.count;
     stats.active = group->sched_active;
 

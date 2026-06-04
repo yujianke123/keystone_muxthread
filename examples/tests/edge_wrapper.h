@@ -58,6 +58,11 @@ void reset_preempt_multihart_state(void);
 void copy_preempt_steal_final_wrapper(void* buffer);
 void get_preempt_steal_final(struct slottee_preempt_steal_final* final);
 
+void copy_preempt_bestvictim_report_wrapper(void* buffer);
+void get_preempt_bestvictim_report(uintptr_t group_id,
+    struct slottee_preempt_bestvictim_report* report);
+void reset_preempt_bestvictim_state(void);
+
 void get_multihart_ticket_config_wrapper(void* buffer);
 void get_multihart_ticket_config(
     struct slottee_multihart_ticket_config* config);

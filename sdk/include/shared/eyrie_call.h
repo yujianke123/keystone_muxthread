@@ -106,6 +106,8 @@ struct slottee_preempt_sched_stats {
   uintptr_t steals;
   uintptr_t steal_skips;
   uintptr_t rebalances;
+  uintptr_t steal_victim_slot;   /* scheduler slot of the victim this group last stole from */
+  uintptr_t steal_victim_count;  /* that victim's runnable count at steal time (best-victim evidence) */
   uintptr_t per_worker_slot[SLOTTEE_MAX_SLOTS];
   uintptr_t per_worker_dispatch[SLOTTEE_MAX_SLOTS];
   uintptr_t per_worker_preempts[SLOTTEE_MAX_SLOTS];

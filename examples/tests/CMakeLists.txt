@@ -34,7 +34,8 @@ set(slottee_stress_test_bins
   test-lt-user-timer-preempt
   test-lt-user-preempt-sched
   test-lt-user-preempt-multihart
-  test-lt-user-preempt-steal)
+  test-lt-user-preempt-steal
+  test-lt-user-preempt-bestvictim)
 
 set(slottee_explicit_test_bins
   test-lt-user-mint-cap
@@ -153,6 +154,10 @@ target_link_libraries(test-lt-user-preempt-multihart ${KEYSTONE_LIB_EAPP})
 add_executable(test-lt-user-preempt-steal
   lt-user-preempt-steal/lt-user-preempt-steal.c)
 target_link_libraries(test-lt-user-preempt-steal ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-preempt-bestvictim
+  lt-user-preempt-bestvictim/lt-user-preempt-bestvictim.c)
+target_link_libraries(test-lt-user-preempt-bestvictim ${KEYSTONE_LIB_EAPP})
 
 ###############################################
 # a script for running all test enclaves
@@ -371,6 +376,10 @@ file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-preempt-steal\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-preempt-steal eyrie-rt loader.bin --enter-slot-preempt-steal\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-preempt-bestvictim\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-preempt-bestvictim eyrie-rt loader.bin --enter-slot-preempt-bestvictim\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-host-dos-stress\" ]; then\n")

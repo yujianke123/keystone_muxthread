@@ -75,6 +75,59 @@ struct slottee_preempt_steal_final {
   uintptr_t worker_checksums[SLOTTEE_PREEMPT_STEAL_TOTAL_WORKERS];
 };
 
+/*
+ * 第47阶段：3 组 best-victim 验证（--enter-slot-preempt-bestvictim）。
+ * 单受害组（2 组）无法证明"最忙受害组选择"——本测试用 3 个 scheduler 组（各绑一 hart）
+ * 构造两个 queue 深度不同的受害组，且**只有 group0 开启窃取**（victim 组关闭，避免多个
+ * 欠载组都去抢最忙受害组、谁先抢到不确定的竞争）：
+ *   group0(thief, STEAL on) : sched=1, 2 worker {short(2), medium(3)} → short 退出后 medium
+ *                             仍在跑而 runnable 队列空 → 持续主动 rebalance；唯一窃取者
+ *   group1(victimA,STEAL off): sched=4, 2 LONG worker(slot 5,6)        → 稳定 runnable count=1
+ *   group2(victimB,STEAL off): sched=7, 3 LONG worker(slot 8,9,10)     → 稳定 runnable count=2（最忙）
+ * 只有 group0 会偷，它每次评估都同时看到 victimA(count=1) 与 victimB(count=2)，必选最忙的
+ * victimB。每组 report 里 group0 的 steal_victim_slot/steal_victim_count 即 best-victim 证据
+ * （记录该组偷过的最忙受害组）。需要 slot 直到 10，故依赖 SLOTTEE_MAX_SLOTS >= 11。
+ */
+#define SLOTTEE_PREEMPT_BV_MAGIC          0x51513f3f
+#define SLOTTEE_PREEMPT_BV_GROUPS         3
+#define SLOTTEE_PREEMPT_BV_MAX_WORKERS    3
+#define SLOTTEE_PREEMPT_BV_TOTAL_WORKERS  7            /* 2 + 2 + 3 */
+#define SLOTTEE_PREEMPT_BV_BUDGET         8
+#define SLOTTEE_PREEMPT_BV_SHORT_ITERS    200000UL
+#define SLOTTEE_PREEMPT_BV_MED_ITERS      1500000UL
+#define SLOTTEE_PREEMPT_BV_LONG_ITERS     3000000UL
+#define SLOTTEE_PREEMPT_BV_FLAG           1u           /* enable steal (= SLOTTEE_PREEMPT_FLAG_STEAL) */
+/* 不对称布局：每组 {scheduler slot, worker 数}；worker slot = sched+1+w。 */
+#define SLOTTEE_PREEMPT_BV_SCHED_G0       1
+#define SLOTTEE_PREEMPT_BV_SCHED_G1       4
+#define SLOTTEE_PREEMPT_BV_SCHED_G2       7
+#define SLOTTEE_PREEMPT_BV_WORKERS_G0     2
+#define SLOTTEE_PREEMPT_BV_WORKERS_G1     2
+#define SLOTTEE_PREEMPT_BV_WORKERS_G2     3
+/* thief(group0) 应当偷中的最忙受害组 = victimB(group2)，其 runnable count 应为 2。 */
+#define SLOTTEE_PREEMPT_BV_EXPECT_VICTIM_SLOT  SLOTTEE_PREEMPT_BV_SCHED_G2
+#define SLOTTEE_PREEMPT_BV_EXPECT_VICTIM_COUNT 2
+
+/* 每组 OCALL 一份；host 据 group0(thief) 的 steal_victim_* 断言 best-victim。 */
+struct slottee_preempt_bestvictim_report {
+  uintptr_t magic;
+  uintptr_t group_id;
+  uintptr_t scheduler_slot;
+  uintptr_t worker_count;
+  uintptr_t completed_workers;
+  uintptr_t steals;
+  uintptr_t steal_skips;
+  uintptr_t rebalances;
+  uintptr_t steal_victim_slot;
+  uintptr_t steal_victim_count;
+  uintptr_t runnable_queue_depth;
+  uintptr_t scheduler_queue_leaks;
+  uintptr_t scheduler_unfinished;
+  uintptr_t scheduler_duplicate_rejects;
+  uintptr_t fairness_violations;
+  uintptr_t failures;
+};
+
 struct slottee_multihart_ticket_config {
   uintptr_t magic;
   uintptr_t windows;

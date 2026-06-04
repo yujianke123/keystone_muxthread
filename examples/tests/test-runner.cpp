@@ -6237,6 +6237,166 @@ run_slottee_preempt_steal_test(const char* eapp_file,
   return 0;
 }
 
+/*
+ * 3-group best-victim verifier (--enter-slot-preempt-bestvictim).  Three scheduler
+ * groups, each pinned to its own hart, are sized asymmetrically so two victim groups
+ * carry DIFFERENT runnable depths: group1 (victimA) stably 1 queued, group2 (victimB)
+ * stably 2 queued.  group0 (thief) runs a single short worker, goes idle, and steals.
+ * Verdict: the thief's recorded steal victim is the BUSIEST (victimB, count==2), all 6
+ * workers complete, every group's queue-consistency is clean, and the steal crossed
+ * harts.  This is the multi-victim coverage the 2-group steal test cannot provide.
+ */
+static int
+run_slottee_preempt_bestvictim_test(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  static const uintptr_t bv_sched_slot[SLOTTEE_PREEMPT_BV_GROUPS] = {
+    SLOTTEE_PREEMPT_BV_SCHED_G0, SLOTTEE_PREEMPT_BV_SCHED_G1,
+    SLOTTEE_PREEMPT_BV_SCHED_G2,
+  };
+  Keystone::Enclave enclave;
+  pthread_t sched_threads[SLOTTEE_PREEMPT_BV_GROUPS];
+  slottee_multihart_worker_arg sched_args[SLOTTEE_PREEMPT_BV_GROUPS];
+  int sched_started[SLOTTEE_PREEMPT_BV_GROUPS];
+  struct slottee_preempt_bestvictim_report reports[SLOTTEE_PREEMPT_BV_GROUPS];
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  uintptr_t interrupts = 0;
+  Keystone::Error ret;
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+
+  params.setFreeMemSize(16 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  reset_preempt_bestvictim_state();
+  reset_copied_slot_caps();
+  memset(sched_threads, 0, sizeof(sched_threads));
+  memset(sched_args, 0, sizeof(sched_args));
+  memset(sched_started, 0, sizeof(sched_started));
+  memset(reports, 0, sizeof(reports));
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] preempt bestvictim failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  printf("preempt_bestvictim,phase,harts,ret,value,ocalls,resumes,interrupts\n");
+  fflush(stdout);
+
+  ret = enclave.runRaw(&value);
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < slottee_edgecall_stress_resume_limit * 16;
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      ocalls++;
+    } else if (ret == Keystone::Error::EnclaveInterrupted) {
+      interrupts++;
+    }
+
+    for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_BV_GROUPS; g++) {
+      if (!sched_started[g] && copied_slot_cap_ready_by_slot[bv_sched_slot[g]]) {
+        memset(&sched_args[g], 0, sizeof(sched_args[g]));
+        sched_args[g].enclave = &enclave;
+        sched_args[g].cap = copied_slot_caps[bv_sched_slot[g]];
+        sched_args[g].slot_id = bv_sched_slot[g];
+        sched_args[g].resume_limit = slottee_edgecall_stress_resume_limit * 8;
+        sched_args[g].ret = Keystone::Error::DeviceError;
+        if (pthread_create(&sched_threads[g], NULL, slottee_multihart_worker,
+                &sched_args[g]) != 0) {
+          printf("[FAIL] preempt bestvictim failed to create group%lu thread\n", g);
+          slottee_trace_destroy(enclave);
+          return 1;
+        }
+        sched_started[g] = 1;
+        sched_yield();
+        usleep(1000);
+      }
+    }
+
+    sched_yield();
+    usleep(1000);
+    ret = enclave.resume(&value);
+    resumes++;
+
+    if (ret == Keystone::Error::Success && value == SLOTTEE_LT_USER_OCALL_MAGIC)
+      break;
+  }
+
+  for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_BV_GROUPS; g++) {
+    if (sched_started[g] && pthread_join(sched_threads[g], NULL) != 0) {
+      printf("[FAIL] preempt bestvictim failed to join group%lu thread\n", g);
+      slottee_trace_destroy(enclave);
+      return 1;
+    }
+    get_preempt_bestvictim_report(g, &reports[g]);
+  }
+
+  printf("preempt_bestvictim,main,%ld,%d,%lu,%lu,%lu,%lu\n",
+      online_harts, (int)ret, value, ocalls, resumes, interrupts);
+  fflush(stdout);
+
+  bool ok = ret == Keystone::Error::Success &&
+      value == SLOTTEE_LT_USER_OCALL_MAGIC;
+  uintptr_t total_completed = 0;
+
+  for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_BV_GROUPS; g++) {
+    struct slottee_preempt_bestvictim_report* r = &reports[g];
+
+    total_completed += r->completed_workers;
+    printf("preempt_bestvictim,group,%lu,sched_slot=%lu,bound_hart=%lu,workers=%lu,completed=%lu,steals=%lu,rebalances=%lu,victim_slot=%lu,victim_count=%lu,runnable_q=%lu,qleak=%lu,unfinished=%lu,failures=%lu\n",
+        g, r->scheduler_slot, sched_args[g].bound_hart, r->worker_count,
+        r->completed_workers, r->steals, r->rebalances, r->steal_victim_slot,
+        r->steal_victim_count, r->runnable_queue_depth,
+        r->scheduler_queue_leaks, r->scheduler_unfinished, r->failures);
+
+    ok = ok &&
+        r->magic == SLOTTEE_PREEMPT_BV_MAGIC &&
+        r->group_id == g &&
+        r->runnable_queue_depth == 0 &&
+        r->scheduler_queue_leaks == 0 &&
+        r->scheduler_unfinished == 0 &&
+        r->scheduler_duplicate_rejects == 0 &&
+        r->fairness_violations == 0 &&
+        r->failures == 0 &&
+        sched_args[g].ret == Keystone::Error::Success &&
+        sched_args[g].value == SLOTTEE_LT_USER_OCALL_MAGIC;
+  }
+
+  /* best-victim verdict: the thief (group0) stole from the BUSIEST victim. */
+  struct slottee_preempt_bestvictim_report* thief = &reports[0];
+  bool bestvictim_ok =
+      thief->steals >= 1 &&
+      thief->steal_victim_slot == (uintptr_t)SLOTTEE_PREEMPT_BV_EXPECT_VICTIM_SLOT &&
+      thief->steal_victim_count == (uintptr_t)SLOTTEE_PREEMPT_BV_EXPECT_VICTIM_COUNT;
+  /* the chosen steal crossed harts (thief vs victimB pinned to different harts) */
+  bool cross_hart = sched_args[0].bound_hart != sched_args[2].bound_hart;
+  uintptr_t expect_total = (uintptr_t)SLOTTEE_PREEMPT_BV_TOTAL_WORKERS;
+
+  ok = ok && bestvictim_ok && cross_hart && total_completed == expect_total;
+
+  slottee_trace_destroy(enclave);
+
+  if (!ok) {
+    printf("[FAIL] preempt bestvictim invalid (total_completed=%lu/%lu thief_victim_slot=%lu(expect %d) thief_victim_count=%lu(expect %d) steals=%lu cross_hart=%d)\n",
+        total_completed, expect_total, thief->steal_victim_slot,
+        SLOTTEE_PREEMPT_BV_EXPECT_VICTIM_SLOT, thief->steal_victim_count,
+        SLOTTEE_PREEMPT_BV_EXPECT_VICTIM_COUNT, thief->steals, (int)cross_hart);
+    return 1;
+  }
+
+  printf("[slottee] preempt_bestvictim groups=%lu total_completed=%lu thief=hart%lu stole_from_slot=%lu(victim_count=%lu=busiest) victimA_slot=%lu victimB_slot=%lu cross_hart=%d ok=1\n",
+      (uintptr_t)SLOTTEE_PREEMPT_BV_GROUPS, total_completed,
+      sched_args[0].bound_hart, thief->steal_victim_slot, thief->steal_victim_count,
+      (uintptr_t)SLOTTEE_PREEMPT_BV_SCHED_G1, (uintptr_t)SLOTTEE_PREEMPT_BV_SCHED_G2,
+      (int)cross_hart);
+  return 0;
+}
+
 static int
 run_slottee_paper_eval(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
@@ -6293,6 +6453,7 @@ main(int argc, char** argv) {
         "[--enter-slot-preempt-sched] "
         "[--enter-slot-preempt-multihart] "
         "[--enter-slot-preempt-steal] "
+        "[--enter-slot-preempt-bestvictim] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
@@ -6356,6 +6517,7 @@ main(int argc, char** argv) {
   int enter_slot_preempt_sched = 0;
   int enter_slot_preempt_multihart = 0;
   int enter_slot_preempt_steal = 0;
+  int enter_slot_preempt_bestvictim = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
@@ -6439,6 +6601,8 @@ main(int argc, char** argv) {
       {"enter-slot-preempt-multihart", no_argument,
           &enter_slot_preempt_multihart, 1},
       {"enter-slot-preempt-steal", no_argument, &enter_slot_preempt_steal, 1},
+      {"enter-slot-preempt-bestvictim", no_argument,
+          &enter_slot_preempt_bestvictim, 1},
       {"slottee-trace-log", no_argument, &slottee_trace_log, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
@@ -6673,6 +6837,9 @@ main(int argc, char** argv) {
         eapp_file, rt_file, ld_file, params);
   }
 
+  if (enter_slot_preempt_bestvictim) {
+    return run_slottee_preempt_bestvictim_test(eapp_file, rt_file, ld_file, params);
+  }
   if (enter_slot_preempt_steal) {
     return run_slottee_preempt_steal_test(eapp_file, rt_file, ld_file, params);
   }
