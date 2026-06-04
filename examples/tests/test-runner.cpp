@@ -6397,6 +6397,183 @@ run_slottee_preempt_bestvictim_test(const char* eapp_file,
   return 0;
 }
 
+/* Host-side mirror of the eapp's deterministic transfer sequence (lt-user-ledger.c).
+ * Must stay byte-identical so the host can replay every transfer and predict the
+ * exact final balance of each account, independent of how the workers interleaved. */
+static uintptr_t
+ledger_host_src(uintptr_t flat, long j)
+{
+  (void)j;
+  return flat % SLOTTEE_LEDGER_ACCOUNTS;
+}
+
+static uintptr_t
+ledger_host_dst(uintptr_t flat, long j)
+{
+  return (uintptr_t)((flat * 3 + (uintptr_t)j * 7 + 1) % SLOTTEE_LEDGER_ACCOUNTS);
+}
+
+/*
+ * Concurrent-ledger stress (--enter-slot-ledger): a genuinely complex multithreaded
+ * program.  8 worker LTs (2 groups x 4, across 2 harts, time-sliced by the preemptive
+ * scheduler) hammer a shared 16-account ledger with SLOTTEE_LEDGER_TRANSFERS atomic
+ * transfers each.  Every transfer conserves the total; the per-worker src/dst sequence
+ * is deterministic, so the host replays all transfers to predict the EXACT final
+ * balance of every account and verifies it matches — proving the LT scheduler ran all
+ * threads to completion, cross-hart atomics stayed coherent, and wait/notify joined
+ * correctly, all independent of interleaving.
+ */
+static int
+run_slottee_ledger_test(const char* eapp_file,
+    const char* rt_file, const char* ld_file, Keystone::Params params)
+{
+  static const uintptr_t led_sched_slot[SLOTTEE_LEDGER_GROUPS] = {
+    SLOTTEE_LEDGER_SCHED_SLOT(0), SLOTTEE_LEDGER_SCHED_SLOT(1),
+  };
+  Keystone::Enclave enclave;
+  pthread_t sched_threads[SLOTTEE_LEDGER_GROUPS];
+  slottee_multihart_worker_arg sched_args[SLOTTEE_LEDGER_GROUPS];
+  int sched_started[SLOTTEE_LEDGER_GROUPS];
+  struct slottee_ledger_report report;
+  uintptr_t value = 0;
+  uintptr_t ocalls = 0;
+  uintptr_t resumes = 0;
+  uintptr_t interrupts = 0;
+  Keystone::Error ret;
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+
+  params.setFreeMemSize(16 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  reset_ledger_state();
+  reset_copied_slot_caps();
+  memset(sched_threads, 0, sizeof(sched_threads));
+  memset(sched_args, 0, sizeof(sched_args));
+  memset(sched_started, 0, sizeof(sched_started));
+  memset(&report, 0, sizeof(report));
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) !=
+      Keystone::Error::Success) {
+    printf("[FAIL] ledger failed to init enclave\n");
+    return 1;
+  }
+
+  edge_init(&enclave);
+  printf("ledger,phase,harts,ret,value,ocalls,resumes,interrupts\n");
+  fflush(stdout);
+
+  ret = enclave.runRaw(&value);
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < slottee_edgecall_stress_resume_limit * 16;
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      ocalls++;
+    } else if (ret == Keystone::Error::EnclaveInterrupted) {
+      interrupts++;
+    }
+
+    for (uintptr_t g = 0; g < SLOTTEE_LEDGER_GROUPS; g++) {
+      if (!sched_started[g] && copied_slot_cap_ready_by_slot[led_sched_slot[g]]) {
+        memset(&sched_args[g], 0, sizeof(sched_args[g]));
+        sched_args[g].enclave = &enclave;
+        sched_args[g].cap = copied_slot_caps[led_sched_slot[g]];
+        sched_args[g].slot_id = led_sched_slot[g];
+        sched_args[g].resume_limit = slottee_edgecall_stress_resume_limit * 8;
+        sched_args[g].ret = Keystone::Error::DeviceError;
+        if (pthread_create(&sched_threads[g], NULL, slottee_multihart_worker,
+                &sched_args[g]) != 0) {
+          printf("[FAIL] ledger failed to create group%lu thread\n", g);
+          slottee_trace_destroy(enclave);
+          return 1;
+        }
+        sched_started[g] = 1;
+        sched_yield();
+        usleep(1000);
+      }
+    }
+
+    sched_yield();
+    usleep(1000);
+    ret = enclave.resume(&value);
+    resumes++;
+
+    if (ret == Keystone::Error::Success && value == SLOTTEE_LT_USER_OCALL_MAGIC)
+      break;
+  }
+
+  for (uintptr_t g = 0; g < SLOTTEE_LEDGER_GROUPS; g++) {
+    if (sched_started[g] && pthread_join(sched_threads[g], NULL) != 0) {
+      printf("[FAIL] ledger failed to join group%lu thread\n", g);
+      slottee_trace_destroy(enclave);
+      return 1;
+    }
+  }
+  get_ledger_report(&report);
+
+  printf("ledger,main,%ld,%d,%lu,%lu,%lu,%lu\n",
+      online_harts, (int)ret, value, ocalls, resumes, interrupts);
+  fflush(stdout);
+
+  /* Replay every transfer to predict the exact final balances + totals. */
+  long expected[SLOTTEE_LEDGER_ACCOUNTS];
+  for (uintptr_t a = 0; a < SLOTTEE_LEDGER_ACCOUNTS; a++)
+    expected[a] = SLOTTEE_LEDGER_INIT;
+  long expected_txn = 0;
+  for (uintptr_t flat = 0; flat < SLOTTEE_LEDGER_TOTAL_WORKERS; flat++) {
+    for (long j = 0; j < SLOTTEE_LEDGER_TRANSFERS; j++) {
+      expected[ledger_host_src(flat, j)] -= 1;
+      expected[ledger_host_dst(flat, j)] += 1;
+      expected_txn++;
+    }
+  }
+  long expected_total = (long)SLOTTEE_LEDGER_ACCOUNTS * SLOTTEE_LEDGER_INIT;
+
+  bool balances_ok = true;
+  for (uintptr_t a = 0; a < SLOTTEE_LEDGER_ACCOUNTS; a++) {
+    if (report.balances[a] != expected[a])
+      balances_ok = false;
+  }
+
+  bool ok = ret == Keystone::Error::Success &&
+      value == SLOTTEE_LT_USER_OCALL_MAGIC &&
+      report.magic == SLOTTEE_LEDGER_MAGIC &&
+      report.group_failed == 0 &&
+      report.failures == 0 &&
+      report.completed_workers == (long)SLOTTEE_LEDGER_TOTAL_WORKERS &&
+      report.txn_count == expected_txn &&
+      report.total_balance == expected_total &&
+      balances_ok &&
+      report.total_switches > 0;   /* preemption actually interleaved the workers */
+
+  printf("ledger,summary,workers=%lu,transfers_each=%ld,txn_count=%ld(expect %ld),total_balance=%ld(expect %ld),completed=%ld,switches=%ld,host_yields=%ld,group_failed=%ld,balances_ok=%d\n",
+      (uintptr_t)SLOTTEE_LEDGER_TOTAL_WORKERS, (long)SLOTTEE_LEDGER_TRANSFERS,
+      report.txn_count, expected_txn, report.total_balance, expected_total,
+      report.completed_workers, report.total_switches, report.total_host_yields,
+      report.group_failed, (int)balances_ok);
+  for (uintptr_t a = 0; a < SLOTTEE_LEDGER_ACCOUNTS; a++)
+    printf("ledger,account,%lu,balance=%ld,expect=%ld\n", a, report.balances[a],
+        expected[a]);
+  fflush(stdout);
+
+  slottee_trace_destroy(enclave);
+
+  if (!ok) {
+    printf("[FAIL] ledger invalid (completed=%ld/%lu txn=%ld/%ld total=%ld/%ld balances_ok=%d switches=%ld group_failed=%ld)\n",
+        report.completed_workers, (uintptr_t)SLOTTEE_LEDGER_TOTAL_WORKERS,
+        report.txn_count, expected_txn, report.total_balance, expected_total,
+        (int)balances_ok, report.total_switches, report.group_failed);
+    return 1;
+  }
+
+  printf("[slottee] ledger workers=%lu transfers_each=%ld txn_count=%ld total_balance=%ld(conserved) balances_exact=1 switches=%ld host_yields=%ld harts=%ld ok=1\n",
+      (uintptr_t)SLOTTEE_LEDGER_TOTAL_WORKERS, (long)SLOTTEE_LEDGER_TRANSFERS,
+      report.txn_count, report.total_balance, report.total_switches,
+      report.total_host_yields, online_harts);
+  return 0;
+}
+
 static int
 run_slottee_paper_eval(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
@@ -6454,6 +6631,7 @@ main(int argc, char** argv) {
         "[--enter-slot-preempt-multihart] "
         "[--enter-slot-preempt-steal] "
         "[--enter-slot-preempt-bestvictim] "
+        "[--enter-slot-ledger] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
@@ -6518,6 +6696,7 @@ main(int argc, char** argv) {
   int enter_slot_preempt_multihart = 0;
   int enter_slot_preempt_steal = 0;
   int enter_slot_preempt_bestvictim = 0;
+  int enter_slot_ledger = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
@@ -6603,6 +6782,7 @@ main(int argc, char** argv) {
       {"enter-slot-preempt-steal", no_argument, &enter_slot_preempt_steal, 1},
       {"enter-slot-preempt-bestvictim", no_argument,
           &enter_slot_preempt_bestvictim, 1},
+      {"enter-slot-ledger", no_argument, &enter_slot_ledger, 1},
       {"slottee-trace-log", no_argument, &slottee_trace_log, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
@@ -6839,6 +7019,9 @@ main(int argc, char** argv) {
 
   if (enter_slot_preempt_bestvictim) {
     return run_slottee_preempt_bestvictim_test(eapp_file, rt_file, ld_file, params);
+  }
+  if (enter_slot_ledger) {
+    return run_slottee_ledger_test(eapp_file, rt_file, ld_file, params);
   }
   if (enter_slot_preempt_steal) {
     return run_slottee_preempt_steal_test(eapp_file, rt_file, ld_file, params);

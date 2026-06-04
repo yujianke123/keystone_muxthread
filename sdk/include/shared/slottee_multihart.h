@@ -128,6 +128,46 @@ struct slottee_preempt_bestvictim_report {
   uintptr_t failures;
 };
 
+/*
+ * 第48阶段：复杂多线程程序——并发账本（--enter-slot-ledger）。
+ * 8 个 worker LT（2 组 × 4，跨 2 hart，在抢占式调度器下时间片轮转）并发地对一个共享的
+ * 16 账户账本做大量原子转账（每个 worker 做 TRANSFERS 次 src→dst 的 -1/+1）。每笔转账
+ * 对总额是守恒的；且 src/dst 序列对每个 worker 完全确定，故最终每个账户余额与转账总数都是
+ * 交错无关、可由 host 逐笔回放精确重算的。host 校验：每账户余额精确匹配 + 总额守恒 +
+ * 原子转账计数 == 总 worker × TRANSFERS + 抢占确实发生(switches>0)。这同时压测：LT 生成、
+ * 抢占式多 hart 调度、跨 hart 共享内存原子一致性、wait/notify 汇合。
+ */
+#define SLOTTEE_LEDGER_MAGIC              0x51514040
+#define SLOTTEE_LEDGER_GROUPS            2
+#define SLOTTEE_LEDGER_WORKERS_PER_GROUP 4
+#define SLOTTEE_LEDGER_TOTAL_WORKERS \
+  (SLOTTEE_LEDGER_GROUPS * SLOTTEE_LEDGER_WORKERS_PER_GROUP)   /* 8 */
+#define SLOTTEE_LEDGER_ACCOUNTS          16
+#define SLOTTEE_LEDGER_INIT              4096L
+#define SLOTTEE_LEDGER_TRANSFERS         50000L   /* 每 worker 的转账笔数 */
+#define SLOTTEE_LEDGER_BUDGET            8        /* host 协作安全阀 */
+/* 槽位布局（GROUPS=2, WPG=4，需到 slot 10）：sched=1+g*5, worker=sched+1+w。 */
+#define SLOTTEE_LEDGER_SCHED_SLOT(g) \
+  (1 + (g) * (SLOTTEE_LEDGER_WORKERS_PER_GROUP + 1))
+#define SLOTTEE_LEDGER_WORKER_SLOT(g, w) \
+  (SLOTTEE_LEDGER_SCHED_SLOT(g) + 1 + (w))
+
+/* 主线程在所有组完成后 OCALL 一份；host 据此精确校验账本最终状态。 */
+struct slottee_ledger_report {
+  uintptr_t magic;
+  uintptr_t accounts;
+  uintptr_t workers;
+  uintptr_t transfers_per_worker;
+  long txn_count;            /* 观测到的原子转账计数 */
+  long total_balance;        /* 观测到的账户余额之和（应恒 = accounts*INIT）*/
+  long completed_workers;    /* 各组汇报的已完成 worker 数之和 */
+  long total_switches;       /* 抢占切换总数（>0 证明发生了抢占交错）*/
+  long total_host_yields;    /* host 协作安全阀触发次数 */
+  long group_failed;         /* 0 = 各组调度自检（队列一致性等）全过 */
+  long balances[SLOTTEE_LEDGER_ACCOUNTS];
+  uintptr_t failures;
+};
+
 struct slottee_multihart_ticket_config {
   uintptr_t magic;
   uintptr_t windows;

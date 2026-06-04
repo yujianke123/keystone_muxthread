@@ -63,6 +63,10 @@ void get_preempt_bestvictim_report(uintptr_t group_id,
     struct slottee_preempt_bestvictim_report* report);
 void reset_preempt_bestvictim_state(void);
 
+void copy_ledger_report_wrapper(void* buffer);
+void get_ledger_report(struct slottee_ledger_report* report);
+void reset_ledger_state(void);
+
 void get_multihart_ticket_config_wrapper(void* buffer);
 void get_multihart_ticket_config(
     struct slottee_multihart_ticket_config* config);
