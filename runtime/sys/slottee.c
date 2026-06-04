@@ -183,6 +183,15 @@ static struct slottee_preempt_group slottee_preempt_groups[SLOTTEE_MAX_SLOTS];
 static uintptr_t slottee_preempt_steal_count;   /* global, atomic: total cross-hart migrations */
 static uintptr_t slottee_preempt_steal_skips;   /* global, atomic: re-steals prevented (already-migrated) */
 static uintptr_t slottee_preempt_rebalance_count; /* global, atomic: proactive periodic-rebalance pulls */
+/*
+ * Directional anti-thrash: edge[t] has bit v set once group t has stolen a worker
+ * from group v.  Thereafter the REVERSE pull (v stealing from t) is forbidden, so
+ * a lender that momentarily looks idle right after lending cannot reciprocally
+ * steal back from its borrower.  With single-worker surplus this is what collapses
+ * the 3-way migration rotation down to the one useful migration (BSS-zero per
+ * enclave; one steal direction is fixed per group-pair for the run).
+ */
+static uintptr_t slottee_preempt_steal_edge[SLOTTEE_MAX_SLOTS];
 
 #define SLOTTEE_PREEMPT_FLAG_STEAL 1u
 /* Proactive periodic rebalance: on every REBALANCE_PERIOD-th timer tick a hart
@@ -1045,6 +1054,15 @@ slottee_preempt_try_steal(struct slottee_preempt_group* thief,
 
     if (g == thief || !g->sched_active)
       continue;
+    /*
+     * Directional anti-thrash: skip any peer this thief has already LENT to
+     * (edge[thief] has the peer's bit) — pulling from our own borrower is the
+     * reverse direction that causes the lend-then-steal-back rotation.  Leaves
+     * stealing from genuinely busier, never-borrowed-from peers untouched.
+     */
+    if (slottee_preempt_steal_edge[thief->scheduler_slot] &
+        ((uintptr_t)1 << g->scheduler_slot))
+      continue;
     if (g->runnable_queue.count > best) {
       best = g->runnable_queue.count;
       victim = g;
@@ -1077,6 +1095,12 @@ slottee_preempt_try_steal(struct slottee_preempt_group* thief,
     w->preempt_group = thief->scheduler_slot;   /* migrate ownership (once) */
     w->migrated = 1;
     thief->steals++;
+    /* Record the lend direction: victim lent to thief → forbid the reverse pull
+     * (thief stealing back from victim later).  Atomic-or for cross-hart
+     * visibility; the selection-loop read is a benign hint. */
+    (void)__sync_fetch_and_or(
+        &slottee_preempt_steal_edge[victim->scheduler_slot],
+        (uintptr_t)1 << thief->scheduler_slot);
     (void)__sync_fetch_and_add(&slottee_preempt_steal_count, 1);
     printf("[slottee] preempt_steal thief=%lu victim=%lu victim_count=%lu worker=%lu\r\n",
         thief->scheduler_slot, victim->scheduler_slot, best, w->slot_id);
