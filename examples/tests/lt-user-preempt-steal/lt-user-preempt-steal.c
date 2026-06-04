@@ -7,23 +7,26 @@
 #include <string.h>
 
 /*
- * 第42阶段：跨 hart 并行抢占式调度 + host 协作安全阀（--enter-slot-preempt-multihart）。
+ * 第43阶段：跨 hart 工作窃取/迁移（--enter-slot-preempt-steal）。
  *
- * eapp_entry(thread0) spawns GROUPS 个 scheduler LT，每个跑在自己 hart 的
- * timer-redirectable LT_USER_OCALL slot 上；每个 scheduler 用 slottee_preempt_run
- * 在 enclave 内时间片轮转自己的 disjoint worker 子集（in-runtime 抢占），并以
- * switch_budget=K 触发周期性 host 让出（安全阀）。worker 是无 syscall 的确定性
- * busy loop —— 唯一被切走的途径是 timer。
+ * 复用 multihart 的 2 组 × 2 worker 槽布局，但负载不对称：group0 的 worker 很短、
+ * group1 的 worker 很长。group0 的 hart 很快跑完自己的短 worker，其 runnable 队列
+ * 变空后会从 group1 偷一个排队中的长 worker 迁到本 hart 跑（PREEMPT_RUN flags 启用
+ * 窃取）。于是两个长 worker 能在两个 hart 上并行收尾。
+ *
+ * 复用 OCALL_PREEMPT_MULTIHART_REPORT(12) 与 multihart report 结构（带 steals）；
+ * host 端按 STEAL_MAGIC 区分，并验证 总 completed==总 worker 数、总 steals>0、
+ * 每个 worker 的确定性 checksum 与 host 重算一致（按其所属组的 iters）。
  */
 
 #define OCALL_PREEMPT_MULTIHART_REPORT 12
 
-#define PREEMPT_MULTIHART_TOTAL_WORKERS \
+#define PREEMPT_STEAL_TOTAL_WORKERS \
   (SLOTTEE_PREEMPT_MULTIHART_GROUPS * SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP)
 
 static long group_done;
 static long group_failed;
-static uintptr_t worker_checksums[PREEMPT_MULTIHART_TOTAL_WORKERS];
+static uintptr_t worker_checksums[PREEMPT_STEAL_TOTAL_WORKERS];
 
 static uintptr_t
 slottee_read_tp(void)
@@ -45,15 +48,22 @@ slottee_return_with_tp(uintptr_t tp, unsigned long value)
   EAPP_RETURN(value);
 }
 
-/* Deterministic per-worker work keyed only by the flat worker index, so the host
- * can recompute the expected checksum and confirm full execution despite both
- * timer preemption and the periodic host yields. */
 static uintptr_t
-preempt_worker_checksum(uintptr_t flat_index)
+preempt_steal_iters(uintptr_t flat_index)
 {
-  volatile uintptr_t acc = SLOTTEE_PREEMPT_MULTIHART_MAGIC ^ (flat_index << 8);
+  uintptr_t group = flat_index / SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP;
 
-  for (uintptr_t iter = 0; iter < SLOTTEE_PREEMPT_MULTIHART_ITERS; iter++) {
+  return group == 0 ? SLOTTEE_PREEMPT_STEAL_SHORT_ITERS
+                    : SLOTTEE_PREEMPT_STEAL_LONG_ITERS;
+}
+
+static uintptr_t
+preempt_steal_checksum(uintptr_t flat_index)
+{
+  volatile uintptr_t acc = SLOTTEE_PREEMPT_STEAL_MAGIC ^ (flat_index << 8);
+  uintptr_t iters = preempt_steal_iters(flat_index);
+
+  for (uintptr_t iter = 0; iter < iters; iter++) {
     acc += (iter ^ flat_index) + 1;
     acc ^= (acc << 7) ^ (acc >> 3);
   }
@@ -66,14 +76,14 @@ preempt_worker(void* opaque)
 {
   uintptr_t flat = (uintptr_t)opaque;
 
-  if (flat < PREEMPT_MULTIHART_TOTAL_WORKERS)
-    worker_checksums[flat] = preempt_worker_checksum(flat);
+  if (flat < PREEMPT_STEAL_TOTAL_WORKERS)
+    worker_checksums[flat] = preempt_steal_checksum(flat);
 
   EAPP_RETURN(SLOTTEE_LT_USER_OCALL_MAGIC);
 }
 
 static void
-preempt_multihart_sched_entry(void* opaque)
+preempt_steal_sched_entry(void* opaque)
 {
   uintptr_t saved_tp = slottee_read_tp();
   uintptr_t group_id = (uintptr_t)opaque;
@@ -91,13 +101,13 @@ preempt_multihart_sched_entry(void* opaque)
 
   completed = (uintptr_t)slottee_preempt_run(specs,
       SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP,
-      SLOTTEE_PREEMPT_MULTIHART_BUDGET, 0);
+      SLOTTEE_PREEMPT_STEAL_BUDGET, SLOTTEE_PREEMPT_STEAL_FLAG);
 
   memset(&stats, 0, sizeof(stats));
   slottee_preempt_collect_stats(&stats);
 
   memset(&report, 0, sizeof(report));
-  report.magic = SLOTTEE_PREEMPT_MULTIHART_MAGIC;
+  report.magic = SLOTTEE_PREEMPT_STEAL_MAGIC;
   report.group_id = group_id;
   report.scheduler_slot = SLOTTEE_PREEMPT_MULTIHART_SCHED_SLOT(group_id);
   report.worker_count = SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP;
@@ -113,6 +123,7 @@ preempt_multihart_sched_entry(void* opaque)
   report.scheduler_duplicate_rejects = stats.scheduler_duplicate_rejects;
   report.fairness_gap = stats.fairness_gap;
   report.fairness_violations = stats.fairness_violations;
+  report.steals = stats.steals;
   for (uintptr_t w = 0; w < SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP; w++) {
     uintptr_t flat = group_id * SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP + w;
 
@@ -127,11 +138,9 @@ preempt_multihart_sched_entry(void* opaque)
     min_preempts = 0;
   report.min_preempts = min_preempts;
 
-  if (report.completed_workers != SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP ||
-      report.host_yields == 0 ||          /* budget>0: valve must have fired */
-      report.preempt_switches == 0 ||
-      report.min_preempts == 0 ||
-      report.runnable_queue_depth != 0 ||
+  /* Per-group sanity only; the cross-group sum/steal verdict is host-side
+   * (stealing makes per-group completed uneven by design). */
+  if (report.runnable_queue_depth != 0 ||
       report.scheduler_queue_leaks != 0 ||
       report.scheduler_unfinished != 0 ||
       report.scheduler_duplicate_rejects != 0 ||
@@ -162,12 +171,10 @@ eapp_entry()
 
   for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_MULTIHART_GROUPS; g++) {
     if (slottee_lt_spawn(SLOTTEE_PREEMPT_MULTIHART_SCHED_SLOT(g),
-            preempt_multihart_sched_entry, (void*)g) !=
-        SBI_ERR_SM_ENCLAVE_SUCCESS)
+            preempt_steal_sched_entry, (void*)g) != SBI_ERR_SM_ENCLAVE_SUCCESS)
       slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
   }
 
-  /* Idle until both host-entered scheduler groups finish. */
   while (slottee_atomic_load(&group_done) < SLOTTEE_PREEMPT_MULTIHART_GROUPS) {
     int ret = slottee_lt_wait_value(&group_done,
         SLOTTEE_PREEMPT_MULTIHART_GROUPS, SLOTTEE_LT_WAIT_OP_GE);

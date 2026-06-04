@@ -158,6 +158,7 @@ static uintptr_t slottee_global_notify_miss_count;
  * queue is left to the G7 wait/notify path only.
  */
 struct slottee_preempt_group {
+  volatile int lock;          /* per-group lock: cross-hart ISRs no longer spin on a global lock */
   volatile int sched_active;
   uintptr_t scheduler_slot;
   uintptr_t worker_count;
@@ -169,12 +170,17 @@ struct slottee_preempt_group {
   uintptr_t current_slot;
   uintptr_t switch_budget;
   uintptr_t switches_since_yield;
+  uintptr_t enable_steal;      /* PREEMPT_RUN flag: allow this hart to steal others' runnable workers */
+  uintptr_t steals;            /* workers this group migrated in via stealing */
   uintptr_t worker_slots[SLOTTEE_MAX_SLOTS];
   struct slottee_user_lt_queue runnable_queue;
   struct encl_ctx scheduler_ctx;
   int scheduler_ctx_valid;
 };
 static struct slottee_preempt_group slottee_preempt_groups[SLOTTEE_MAX_SLOTS];
+static uintptr_t slottee_preempt_steal_count;   /* global, atomic: total cross-hart migrations */
+
+#define SLOTTEE_PREEMPT_FLAG_STEAL 1u
 
 static void
 slottee_slot_policy_lock_acquire(void)
@@ -215,6 +221,33 @@ slottee_lt_scheduler_lock_acquire(void)
 }
 
 static void
+slottee_preempt_group_lock_acquire(struct slottee_preempt_group* g)
+{
+  while (__sync_lock_test_and_set(&g->lock, 1))
+    __asm__ volatile("nop");
+  __sync_synchronize();
+}
+
+static void
+slottee_preempt_group_lock_release(struct slottee_preempt_group* g)
+{
+  __sync_synchronize();
+  __sync_lock_release(&g->lock);
+}
+
+/* Non-blocking acquire used when stealing: a hart already holding its own group
+ * lock probes a victim group's lock and gives up immediately if contended, so
+ * two stealing harts can never deadlock on each other (no blocking cross-acquire). */
+static int
+slottee_preempt_group_trylock(struct slottee_preempt_group* g)
+{
+  if (__sync_lock_test_and_set(&g->lock, 1))
+    return 0;
+  __sync_synchronize();
+  return 1;
+}
+
+static void
 slottee_lt_scheduler_lock_release(void)
 {
   __sync_synchronize();
@@ -248,7 +281,8 @@ slottee_user_lt_queue_enqueue(struct slottee_user_lt_queue* queue,
 
   member = slottee_user_lt_queue_member(user, kind);
   if (!member || *member) {
-    slottee_user_scheduler_duplicate_rejects++;
+    /* atomic: bumped under the global lock (G7 path) or a per-group lock (preempt) */
+    (void)__sync_fetch_and_add(&slottee_user_scheduler_duplicate_rejects, 1);
     return 0;
   }
 
@@ -966,6 +1000,43 @@ slottee_preempt_pick_next(struct slottee_preempt_group* group)
 }
 
 /*
+ * Cross-hart work stealing: when `thief` has no runnable worker of its own, take
+ * one runnable (suspended) worker from another active group and re-home it to
+ * `thief` so this hart keeps making progress.  Caller holds thief's lock; the
+ * victim is acquired via try-lock so two stealing harts can never deadlock
+ * (no blocking cross-acquire).  Only suspended workers (in a group's runnable
+ * queue) are stolen — never the worker currently executing on the victim hart.
+ * The stolen worker's user stack/TLS lives in enclave memory reachable from any
+ * hart, so its saved_ctx resumes correctly wherever it is dispatched.
+ */
+static struct slottee_active_user_context*
+slottee_preempt_try_steal(struct slottee_preempt_group* thief)
+{
+  uintptr_t v;
+
+  for (v = 1; v < SLOTTEE_MAX_SLOTS; v++) {
+    struct slottee_preempt_group* victim = &slottee_preempt_groups[v];
+    struct slottee_active_user_context* w;
+
+    if (victim == thief || !victim->sched_active ||
+        victim->runnable_queue.count == 0)
+      continue;
+    if (!slottee_preempt_group_trylock(victim))
+      continue;
+    w = slottee_user_lt_queue_dequeue(&victim->runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE);
+    slottee_preempt_group_lock_release(victim);
+    if (w && w->saved_ctx_valid) {
+      w->preempt_group = thief->scheduler_slot;   /* migrate ownership */
+      thief->steals++;
+      (void)__sync_fetch_and_add(&slottee_preempt_steal_count, 1);
+      return w;
+    }
+  }
+  return 0;
+}
+
+/*
  * Timer-driven context switch for the OS-level preemptive scheduler.  Called
  * from the redirected S-mode timer ISR with the preempted worker's full frame in
  * *ctx.  Saving *ctx into the current worker and copying the next runnable
@@ -978,25 +1049,25 @@ slottee_preempt_timer_switch(struct slottee_preempt_group* group,
 {
   struct slottee_active_user_context* next;
 
-  slottee_lt_scheduler_lock_acquire();
+  slottee_preempt_group_lock_acquire(group);
   group->ticks++;
 
   /*
    * Host-cooperation safety valve: after switch_budget in-runtime switches,
    * yield to the host ONCE in place (do not change *ctx) so an unbounded
-   * workload cannot starve the host OS on this hart.  Release the scheduler lock
+   * workload cannot starve the host OS on this hart.  Release the group lock
    * BEFORE sbi_stop_enclave — the call does not return on this hart until the
-   * host resumes, and holding the (global) lock across it would deadlock another
-   * hart's scheduler op.  On resume sbi_stop_enclave returns here (same as the
-   * G5 path), *ctx is unchanged, and the same worker continues; the next tick
-   * does a normal in-runtime switch.  switch_budget==0 disables the valve.
+   * host resumes, and holding any scheduler lock across it could stall another
+   * hart's stealing.  On resume sbi_stop_enclave returns here (same as the G5
+   * path), *ctx is unchanged, and the same worker continues; the next tick does
+   * a normal in-runtime switch.  switch_budget==0 disables the valve.
    */
   if (group->switch_budget &&
       ++group->switches_since_yield >= group->switch_budget) {
     group->switches_since_yield = 0;
     group->host_yields++;
     slottee_user_lt_save_frame(cur, ctx);
-    slottee_lt_scheduler_lock_release();
+    slottee_preempt_group_lock_release(group);
     (void)sbi_stop_enclave(STOP_TIMER_INTERRUPT);
     return 1;
   }
@@ -1013,7 +1084,7 @@ slottee_preempt_timer_switch(struct slottee_preempt_group* group,
     cur->preempt_yield_count++;
     next->scheduler_state = SLOTTEE_USER_LT_RUNNING;
     next->preempt_dispatch_count++;
-    slottee_user_lt_record_dispatch(next);
+    next->dispatch_count++;   /* per-worker (group-local); no global ticket */
     group->current_slot = next->slot_id;
     group->switches++;
     *ctx = next->saved_ctx;
@@ -1022,7 +1093,7 @@ slottee_preempt_timer_switch(struct slottee_preempt_group* group,
     next->scheduler_state = SLOTTEE_USER_LT_RUNNING;
     group->current_slot = next->slot_id;
   }
-  slottee_lt_scheduler_lock_release();
+  slottee_preempt_group_lock_release(group);
   return 1;
 }
 
@@ -1036,10 +1107,14 @@ slottee_preempt_worker_exit(struct slottee_active_user_context* user,
     struct encl_ctx* ctx, uintptr_t value)
 {
   struct slottee_active_user_context* next;
-  struct slottee_preempt_group* group;
+  struct slottee_active_user_context* stolen;
+  struct slottee_preempt_group* group =
+      slottee_preempt_group_for(user->preempt_group);
 
-  slottee_lt_scheduler_lock_acquire();
-  group = slottee_preempt_group_for(user->preempt_group);
+  if (!group)
+    return 0;   /* not a managed preempt worker; fall back to normal exit */
+
+  slottee_preempt_group_lock_acquire(group);
 
   slottee_record_trap_frame(user, ctx, RUNTIME_SYSCALL_EXIT);
   user->exit_trap_count++;
@@ -1049,43 +1124,55 @@ slottee_preempt_worker_exit(struct slottee_active_user_context* user,
   user->tls_exit_mismatch += user->tls_exit_ok ? 0 : 1;
   user->scheduler_state = SLOTTEE_USER_LT_EXITED;
   user->preempt_worker = 0;
-  if (group && user->in_runnable_queue)
+  if (user->in_runnable_queue)
     (void)slottee_user_lt_queue_remove(&group->runnable_queue,
         SLOTTEE_USER_LT_QUEUE_RUNNABLE, user);
   user->active = 0;
   user->saved_ctx_valid = 0;
-  if (group)
-    group->completed++;
+  group->completed++;
   (void)value;
 
   next = slottee_preempt_pick_next(group);
   if (next && next->saved_ctx_valid) {
-    if (group)
-      group->exit_switches++;
+    group->exit_switches++;
     next->scheduler_state = SLOTTEE_USER_LT_RUNNING;
     next->preempt_dispatch_count++;
-    slottee_user_lt_record_dispatch(next);
-    if (group)
-      group->current_slot = next->slot_id;
+    next->dispatch_count++;
+    group->current_slot = next->slot_id;
     *ctx = next->saved_ctx;
-    slottee_lt_scheduler_lock_release();
+    slottee_preempt_group_lock_release(group);
     return 1;
   }
 
-  if (group) {
-    group->sched_active = 0;
-    group->current_slot = 0;
-    if (group->scheduler_ctx_valid) {
-      *ctx = group->scheduler_ctx;
-      ctx->regs.a0 = group->completed;
-      group->scheduler_ctx_valid = 0;
-    }
+  /*
+   * My runnable queue is empty.  Before idling back to my scheduler thread, try
+   * to steal a runnable worker from another group so this hart keeps doing
+   * useful work (cross-hart migration); the stolen worker runs to completion
+   * here and counts toward this group's completed total.
+   */
+  if (group->enable_steal &&
+      (stolen = slottee_preempt_try_steal(group)) != 0) {
+    group->exit_switches++;
+    stolen->scheduler_state = SLOTTEE_USER_LT_RUNNING;
+    stolen->preempt_dispatch_count++;
+    stolen->dispatch_count++;
+    group->current_slot = stolen->slot_id;
+    *ctx = stolen->saved_ctx;
+    slottee_preempt_group_lock_release(group);
+    return 1;
   }
-  slottee_lt_scheduler_lock_release();
-  printf("[slottee] preempt_all_done group=%lu completed=%lu switches=%lu exit_switches=%lu ticks=%lu host_yields=%lu\r\n",
-      user->preempt_group, group ? group->completed : 0,
-      group ? group->switches : 0, group ? group->exit_switches : 0,
-      group ? group->ticks : 0, group ? group->host_yields : 0);
+
+  group->sched_active = 0;
+  group->current_slot = 0;
+  if (group->scheduler_ctx_valid) {
+    *ctx = group->scheduler_ctx;
+    ctx->regs.a0 = group->completed;
+    group->scheduler_ctx_valid = 0;
+  }
+  slottee_preempt_group_lock_release(group);
+  printf("[slottee] preempt_all_done group=%lu completed=%lu switches=%lu exit_switches=%lu ticks=%lu host_yields=%lu steals=%lu\r\n",
+      group->scheduler_slot, group->completed, group->switches,
+      group->exit_switches, group->ticks, group->host_yields, group->steals);
   return 1;
 }
 
@@ -1594,7 +1681,7 @@ slottee_lt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
  */
 uintptr_t
 slottee_preempt_run(struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count,
-    uintptr_t switch_budget)
+    uintptr_t switch_budget, uintptr_t flags)
 {
   struct slottee_preempt_spec specs[SLOTTEE_MAX_SLOTS];
   struct slottee_active_user_context* sched = slottee_active_user_for_frame(ctx);
@@ -1633,7 +1720,7 @@ slottee_preempt_run(struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count,
         return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   }
 
-  slottee_lt_scheduler_lock_acquire();
+  slottee_preempt_group_lock_acquire(group);
 
   group->scheduler_slot = group_key;
   group->worker_count = 0;
@@ -1645,6 +1732,8 @@ slottee_preempt_run(struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count,
   group->current_slot = 0;
   group->switch_budget = switch_budget;
   group->switches_since_yield = 0;
+  group->enable_steal = (flags & SLOTTEE_PREEMPT_FLAG_STEAL) ? 1 : 0;
+  group->steals = 0;
   group->runnable_queue.head = 0;
   group->runnable_queue.tail = 0;
   group->runnable_queue.count = 0;
@@ -1664,7 +1753,7 @@ slottee_preempt_run(struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count,
         specs[i].fn, specs[i].arg, ctx);
     if (!user->user_alloc_ok) {
       group->scheduler_ctx_valid = 0;
-      slottee_lt_scheduler_lock_release();
+      slottee_preempt_group_lock_release(group);
       return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
     }
     (void)slottee_user_lt_queue_enqueue(&group->runnable_queue,
@@ -1676,19 +1765,19 @@ slottee_preempt_run(struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count,
   first = slottee_preempt_pick_next(group);
   if (!first) {
     group->scheduler_ctx_valid = 0;
-    slottee_lt_scheduler_lock_release();
+    slottee_preempt_group_lock_release(group);
     return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
   }
   first->scheduler_state = SLOTTEE_USER_LT_RUNNING;
   first->preempt_dispatch_count++;
-  slottee_user_lt_record_dispatch(first);
+  first->dispatch_count++;
   group->current_slot = first->slot_id;
   group->sched_active = 1;
   *ctx = first->saved_ctx;
 
-  slottee_lt_scheduler_lock_release();
-  printf("[slottee] preempt_run start group=%lu count=%lu budget=%lu first=%lu fn=0x%lx\r\n",
-      group_key, count, switch_budget, first->slot_id,
+  slottee_preempt_group_lock_release(group);
+  printf("[slottee] preempt_run start group=%lu count=%lu budget=%lu steal=%lu first=%lu fn=0x%lx\r\n",
+      group_key, count, switch_budget, group->enable_steal, first->slot_id,
       first->saved_ctx.regs.sepc);
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
 }
@@ -1706,50 +1795,53 @@ slottee_preempt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
   group = sched ? slottee_preempt_group_for(sched->slot_id) : 0;
 
   memset(&stats, 0, sizeof(stats));
-  slottee_lt_scheduler_lock_acquire();
+  /* diagnostic reads of G7-owned globals (benign across locks) */
+  stats.scheduler_wait_residue = slottee_user_wait_queue.count;
+  stats.scheduler_duplicate_rejects = slottee_user_scheduler_duplicate_rejects;
+  stats.fairness_min = (uintptr_t)-1;
+  stats.fairness_max = 0;
+
   if (group) {
+    slottee_preempt_group_lock_acquire(group);
     stats.worker_count = group->worker_count;
     stats.completed = group->completed;
     stats.preempt_switches = group->switches;
     stats.preempt_ticks = group->ticks;
     stats.host_yields = group->host_yields;
     stats.exit_switches = group->exit_switches;
+    stats.steals = group->steals;
     stats.runnable_queue_depth = group->runnable_queue.count;
     stats.active = group->sched_active;
-  }
-  stats.scheduler_wait_residue = slottee_user_wait_queue.count;
-  stats.scheduler_duplicate_rejects = slottee_user_scheduler_duplicate_rejects;
-  stats.fairness_min = (uintptr_t)-1;
-  stats.fairness_max = 0;
 
-  for (i = 0; group && i < group->worker_count && i < SLOTTEE_MAX_SLOTS; i++) {
-    uintptr_t slot = group->worker_slots[i];
-    struct slottee_active_user_context* user = &slottee_active_users[slot];
-    uintptr_t dispatched = user->dispatch_count;
+    for (i = 0; i < group->worker_count && i < SLOTTEE_MAX_SLOTS; i++) {
+      uintptr_t slot = group->worker_slots[i];
+      struct slottee_active_user_context* user = &slottee_active_users[slot];
+      uintptr_t dispatched = user->dispatch_count;
 
-    stats.per_worker_slot[i] = slot;
-    stats.per_worker_dispatch[i] = dispatched;
-    stats.per_worker_preempts[i] = user->preempt_count;
-    if (user->in_runnable_queue || user->in_wait_queue)
-      stats.scheduler_queue_leaks++;
-    if (user->scheduler_state != SLOTTEE_USER_LT_EXITED)
-      stats.scheduler_unfinished++;
-    if (dispatched < stats.fairness_min)
-      stats.fairness_min = dispatched;
-    if (dispatched > stats.fairness_max)
-      stats.fairness_max = dispatched;
+      stats.per_worker_slot[i] = slot;
+      stats.per_worker_dispatch[i] = dispatched;
+      stats.per_worker_preempts[i] = user->preempt_count;
+      if (user->in_runnable_queue || user->in_wait_queue)
+        stats.scheduler_queue_leaks++;
+      if (user->scheduler_state != SLOTTEE_USER_LT_EXITED)
+        stats.scheduler_unfinished++;
+      if (dispatched < stats.fairness_min)
+        stats.fairness_min = dispatched;
+      if (dispatched > stats.fairness_max)
+        stats.fairness_max = dispatched;
+    }
+    slottee_preempt_group_lock_release(group);
   }
   if (stats.fairness_min == (uintptr_t)-1)
     stats.fairness_min = 0;
   stats.fairness_gap = stats.fairness_max - stats.fairness_min;
   if (stats.fairness_gap > SLOTTEE_LT_FAIRNESS_GAP_LIMIT)
     stats.fairness_violations++;
-  slottee_lt_scheduler_lock_release();
 
-  printf("[slottee] preempt_stats group=%lu wc=%lu done=%lu sw=%lu host_yield=%lu d=%lu/%lu/%lu p=%lu/%lu/%lu unfin=%lu qleak=%lu active=%lu\r\n",
+  printf("[slottee] preempt_stats group=%lu wc=%lu done=%lu sw=%lu host_yield=%lu steals=%lu d=%lu/%lu/%lu p=%lu/%lu/%lu unfin=%lu qleak=%lu active=%lu\r\n",
       group ? group->scheduler_slot : 0,
       stats.worker_count, stats.completed, stats.preempt_switches,
-      stats.host_yields,
+      stats.host_yields, stats.steals,
       stats.per_worker_dispatch[0], stats.per_worker_dispatch[1],
       stats.per_worker_dispatch[2], stats.per_worker_preempts[0],
       stats.per_worker_preempts[1], stats.per_worker_preempts[2],

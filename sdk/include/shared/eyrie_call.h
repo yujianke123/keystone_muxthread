@@ -103,6 +103,7 @@ struct slottee_preempt_sched_stats {
   uintptr_t fairness_gap;
   uintptr_t fairness_violations;
   uintptr_t active;
+  uintptr_t steals;
   uintptr_t per_worker_slot[SLOTTEE_MAX_SLOTS];
   uintptr_t per_worker_dispatch[SLOTTEE_MAX_SLOTS];
   uintptr_t per_worker_preempts[SLOTTEE_MAX_SLOTS];

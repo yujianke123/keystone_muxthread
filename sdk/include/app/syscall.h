@@ -80,7 +80,7 @@ slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats);
 
 int
 slottee_preempt_run(const struct slottee_preempt_spec* specs, uintptr_t count,
-    uintptr_t switch_budget);
+    uintptr_t switch_budget, uintptr_t flags);
 
 int
 slottee_preempt_collect_stats(struct slottee_preempt_sched_stats* stats);

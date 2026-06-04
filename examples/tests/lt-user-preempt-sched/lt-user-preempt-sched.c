@@ -100,7 +100,7 @@ preempt_sched_entry(void* opaque)
    * only returns once every worker has exited, with a0 = completed count.
    * switch_budget=0 keeps the Phase-41 behavior (pure in-runtime, host_yields=0). */
   completed = (uintptr_t)slottee_preempt_run(specs,
-      SLOTTEE_PREEMPT_SCHED_WORKERS, 0);
+      SLOTTEE_PREEMPT_SCHED_WORKERS, 0, 0);
 
   memset(&stats, 0, sizeof(stats));
   slottee_preempt_collect_stats(&stats);

@@ -46,6 +46,15 @@
 #define SLOTTEE_PREEMPT_MULTIHART_ITERS      1500000UL
 #define SLOTTEE_PREEMPT_MULTIHART_BUDGET     4
 
+/* 第43阶段：跨 hart 工作窃取/迁移。复用 multihart 槽布局（2 组×2 worker），但
+ * group0 worker 短、group1 worker 长 → group0 hart 先空闲，窃取 group1 的排队 worker
+ * 迁到本 hart 跑。PREEMPT_RUN flags bit0 启用窃取。 */
+#define SLOTTEE_PREEMPT_STEAL_MAGIC          0x51513d3d
+#define SLOTTEE_PREEMPT_STEAL_FLAG           1u
+#define SLOTTEE_PREEMPT_STEAL_SHORT_ITERS    200000UL
+#define SLOTTEE_PREEMPT_STEAL_LONG_ITERS     3000000UL
+#define SLOTTEE_PREEMPT_STEAL_BUDGET         8
+
 struct slottee_multihart_ticket_config {
   uintptr_t magic;
   uintptr_t windows;
@@ -223,6 +232,7 @@ struct slottee_preempt_multihart_report {
   uintptr_t min_preempts;
   uintptr_t fairness_gap;
   uintptr_t fairness_violations;
+  uintptr_t steals;
   uintptr_t failures;
   uintptr_t per_worker_slot[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];
   uintptr_t per_worker_dispatch[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];

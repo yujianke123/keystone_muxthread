@@ -72,9 +72,9 @@ slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats) {
 
 int
 slottee_preempt_run(const struct slottee_preempt_spec* specs, uintptr_t count,
-    uintptr_t switch_budget) {
-  return SYSCALL_3(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_RUN, specs, count,
-      switch_budget);
+    uintptr_t switch_budget, uintptr_t flags) {
+  return SYSCALL_4(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_RUN, specs, count,
+      switch_budget, flags);
 }
 
 int
