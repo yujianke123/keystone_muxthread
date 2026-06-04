@@ -358,27 +358,26 @@ int enclave_slot_timer_redirectable(enclave_id eid, uintptr_t thread_index)
 }
 
 /*
- * 当前 hart 上正在运行的 slot 是否有 pending revoke。用于让跨 hart 撤销 rendezvous IPI 精确：
- * 只有当本 hart 确实在跑被撤销的那个 slot 时，IRQ_M_SOFT 才 stop 去完成撤销；否则（迟到/杂散
- * IPI、或本 hart 在跑别的 slot/不在 enclave 内）一律忽略，避免误中断后续合法 entry。
+ * 跨 hart 撤销 rendezvous 同步等待上界：mark_revoke 发 IPI 后最多等这么多周期让目标 hart 完成撤销；
+ * 超时则回退到"等目标下一次自然 boundary"（旧语义）。取值远大于实测 IPI 撤销延迟(~3.4e6)。
  */
-int slottee_hart_pending_slot_revoke(void)
+#define SLOTTEE_REVOKE_RENDEZVOUS_WAIT_CYCLES (64UL * 1024UL * 1024UL)
+
+/* 该 slot 的 lease 是否已不再 active-pending（撤销已完成或 lease 已变更）。 */
+static int slot_lease_revoke_settled(enclave_id eid, uintptr_t slot_id)
 {
-  enclave_id eid = cpu_get_enclave_id();
-  uintptr_t thread_index = cpu_get_enclave_thread_index();
   struct slot_lease_t *lease;
-  int pending = 0;
+  int settled;
 
   spin_lock(&encl_lock);
-  if (ENCLAVE_EXISTS(eid) && enclaves[eid].state == RUNNING) {
-    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
-    pending = lease &&
-        lease->active_hart == csr_read(mhartid) &&
-        slot_lease_has_pending_revoke(lease);
+  if (!ENCLAVE_EXISTS(eid)) {
+    spin_unlock(&encl_lock);
+    return 1;
   }
+  lease = &enclaves[eid].slot_leases[slot_id];
+  settled = (lease->state != SLOT_LEASE_ACTIVE) || !lease->revoke_pending;
   spin_unlock(&encl_lock);
-
-  return pending;
+  return settled;
 }
 
 static void mark_slot_lease_revoke_pending(struct slot_lease_t *lease)
@@ -1328,9 +1327,19 @@ out:
   }
   spin_unlock(&encl_lock);
   /* IPI 必须在释放 encl_lock 之后发：目标 hart 收到后会进 stop_enclave 抢 encl_lock，
-   * 若我们仍持锁则死锁。fire-and-forget（无 sync）。 */
-  if (kick_hart != 0)
+   * 若我们仍持锁则死锁。发完**同步等待**撤销完成——这样 IPI 在 mark 期间即被目标消费、撤销即时
+   * 生效，且不会有迟到的 IPI 落到下一次 entry（避免误中断）。超时则回退到自然 boundary 完成。 */
+  if (kick_hart != 0) {
+    uintptr_t start, now;
+
     slottee_send_revoke_ipi(kick_hart);
+    asm volatile("rdcycle %0" : "=r"(start));
+    while (!slot_lease_revoke_settled(eid, req->slot_id)) {
+      asm volatile("rdcycle %0" : "=r"(now));
+      if ((now - start) > SLOTTEE_REVOKE_RENDEZVOUS_WAIT_CYCLES)
+        break;   /* 超时回退：撤销仍 pending，将在目标下一次 boundary 完成（旧语义） */
+    }
+  }
   return ret;
 }
 

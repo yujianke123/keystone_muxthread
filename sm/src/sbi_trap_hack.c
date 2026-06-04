@@ -128,19 +128,17 @@ void sbi_trap_handler_keystone_enclave(struct sbi_trap_regs *regs)
                       }
 		case IRQ_M_SOFT: {
       /*
-       * 跨 hart 撤销 rendezvous IPI：仅当本 hart 正在运行的 slot 确有 pending revoke 时，才 stop
-       * 出去让 stop_enclave 完成撤销（强制 boundary）。否则是迟到/杂散 IPI（撤销已完成、或本 hart
-       * 在跑别的 slot/不在 enclave 内）——消费掉该 IPI（清 MSIP、跑 no-op process）后原地返回，
-       * 绝不误中断后续合法 entry。这样撤销 IPI 既快又精确。
+       * 软件 IPI（含跨 hart 撤销 rendezvous IPI 与其它 M_SOFT）：统一 stop_enclave 把本 hart 带回
+       * host —— 这是 Keystone 原有的安全语义（对未知来源的 M_SOFT 一律安全退出 host 处理；绝不在
+       * enclave 内 sbi_ipi_process 跑 OS IPI 回调以免在错误上下文死锁）。对撤销 IPI 而言，这次 stop
+       * 即让 stop_enclave 完成 pending revoke（强制 boundary）。撤销 IPI 不会误中断"后续合法 entry"：
+       * mark_revoke 发 IPI 后会**同步等待**撤销完成（见 enclave.c），IPI 在 mark 期间即被消费，不会
+       * 迟到落到下一次 entry。
        */
-      if (slottee_hart_pending_slot_revoke()) {
-        regs->mepc -= 4;
-        sbi_sm_stop_enclave(regs, STOP_TIMER_INTERRUPT);
-        regs->a0 = SBI_ERR_SM_ENCLAVE_INTERRUPTED;
-        regs->mepc += 4;
-      } else {
-        sbi_ipi_process();
-      }
+      regs->mepc -= 4;
+      sbi_sm_stop_enclave(regs, STOP_TIMER_INTERRUPT);
+      regs->a0 = SBI_ERR_SM_ENCLAVE_INTERRUPTED;
+      regs->mepc += 4;
 			break;
                      }
 		default:
