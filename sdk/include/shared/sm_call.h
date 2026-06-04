@@ -197,6 +197,7 @@ struct mark_revoke_req_t {
 struct mark_revoke_resp_t {
   uintptr_t status;
   uintptr_t epoch;
+  uintptr_t ipi_sent;   /* 1 if a cross-hart revoke rendezvous IPI was sent to the active hart */
 };
 
 #define SLOTTEE_MINT_CAP_VERSION 1

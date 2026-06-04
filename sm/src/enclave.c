@@ -12,8 +12,63 @@
 #include <sbi/riscv_asm.h>
 #include <sbi/riscv_locks.h>
 #include <sbi/sbi_console.h>
+#include <sbi/sbi_ipi.h>
+#include <sbi/sbi_scratch.h>
 
 struct enclave enclaves[ENCL_MAX];
+
+/*
+ * Cross-hart revoke rendezvous IPI.
+ *
+ * 安全关键路径优化：当 host 调用 mark_revoke 撤销一个正在**另一 hart 上 U-mode 运行**（未停在
+ * 任何 boundary）的 active slot 时，旧实现只置 revoke_pending、等目标 hart 下一次自然 boundary
+ * （timer-stop / resume / edge-call）才真正撤销——撤销延迟受目标 hart 的计算时长支配，最坏可被
+ * 一个忙循环 slot 拖很久。现在 SM 立即给目标 hart 发一个软件 IPI（MSIP）：目标 hart 陷入 M-mode
+ * 的 IRQ_M_SOFT，Keystone enclave trap handler 据此 stop_enclave，stop 路径完成
+ * complete_pending_revoke —— 即一次**强制 boundary / 跨 hart rendezvous**，把撤销延迟降到 IPI
+ * 投递级别，而非目标 hart 的下一次 timer。
+ *
+ * 注意：RT 内逻辑线程调度器的同步仍用 AMO 原子（不改），IPI 只用于 SM 安全关键路径上对其它 hart
+ * 的强制打断。process 回调为良性 no-op（IPI 真正效果是把目标 hart 踢进 M-mode；若目标在收到 IPI
+ * 前已离开 enclave，process 在 host 上下文消费该 IPI、无副作用）。发送为 fire-and-forget（无 sync
+ * 回调），且在释放 encl_lock 之后再发，避免目标 stop_enclave 抢 encl_lock 造成死锁。
+ */
+static int slottee_revoke_ipi_event = -1;
+
+static void slottee_revoke_ipi_process(struct sbi_scratch *scratch)
+{
+  (void)scratch;   /* 强制 boundary 的语义由 IRQ_M_SOFT→stop_enclave 完成；此处仅消费 IPI */
+}
+
+static struct sbi_ipi_event_ops slottee_revoke_ipi_ops = {
+  .name = "slottee_revoke",
+  .update = NULL,
+  .sync = NULL,                       /* fire-and-forget：不等目标，避免 encl_lock 死锁 */
+  .process = slottee_revoke_ipi_process,
+};
+
+void slottee_init_revoke_ipi(void)
+{
+  int id = sbi_ipi_event_create(&slottee_revoke_ipi_ops);
+
+  if (id >= 0)
+    slottee_revoke_ipi_event = id;
+  else
+    sbi_printf("[SM] slottee revoke IPI event create failed (%d)\n", id);
+}
+
+/* 给目标 hart 发跨 hart 撤销 rendezvous IPI。调用方必须**不**持有 encl_lock。 */
+static void slottee_send_revoke_ipi(uintptr_t target_hart)
+{
+  if (slottee_revoke_ipi_event < 0)
+    return;
+  if (target_hart == csr_read(mhartid))
+    return;
+  sbi_printf("[SM] slottee revoke rendezvous IPI -> hart %lu (from hart %lu)\n",
+      (unsigned long)target_hart, (unsigned long)csr_read(mhartid));
+  sbi_ipi_send_many((ulong)1, (ulong)target_hart,
+      (u32)slottee_revoke_ipi_event, NULL);
+}
 
 // Enclave IDs are unsigned ints, so we do not need to check if eid is
 // greater than or equal to 0
@@ -300,6 +355,30 @@ int enclave_slot_timer_redirectable(enclave_id eid, uintptr_t thread_index)
   spin_unlock(&encl_lock);
 
   return redirectable;
+}
+
+/*
+ * 当前 hart 上正在运行的 slot 是否有 pending revoke。用于让跨 hart 撤销 rendezvous IPI 精确：
+ * 只有当本 hart 确实在跑被撤销的那个 slot 时，IRQ_M_SOFT 才 stop 去完成撤销；否则（迟到/杂散
+ * IPI、或本 hart 在跑别的 slot/不在 enclave 内）一律忽略，避免误中断后续合法 entry。
+ */
+int slottee_hart_pending_slot_revoke(void)
+{
+  enclave_id eid = cpu_get_enclave_id();
+  uintptr_t thread_index = cpu_get_enclave_thread_index();
+  struct slot_lease_t *lease;
+  int pending = 0;
+
+  spin_lock(&encl_lock);
+  if (ENCLAVE_EXISTS(eid) && enclaves[eid].state == RUNNING) {
+    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+    pending = lease &&
+        lease->active_hart == csr_read(mhartid) &&
+        slot_lease_has_pending_revoke(lease);
+  }
+  spin_unlock(&encl_lock);
+
+  return pending;
 }
 
 static void mark_slot_lease_revoke_pending(struct slot_lease_t *lease)
@@ -1206,6 +1285,7 @@ unsigned long mark_revoke_enclave_slot(
 {
   unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
   struct slot_lease_t *lease;
+  uintptr_t kick_hart = 0;   /* != 0 → 撤销时该 slot 正活在另一 hart，需发 rendezvous IPI */
 
   if (!req || req->version != SLOTTEE_ENTER_SLOT_VERSION ||
       req->slot_id == 0 || req->slot_id >= SLOTTEE_MAX_SLOTS)
@@ -1221,6 +1301,12 @@ unsigned long mark_revoke_enclave_slot(
   lease = &enclaves[eid].slot_leases[req->slot_id];
   if (lease->state == SLOT_LEASE_ACTIVE) {
     mark_slot_lease_revoke_pending(lease);
+    /* 若该 slot 正在另一 hart 上 U-mode 运行：记录目标 hart，待解锁后发强制 rendezvous IPI，
+     * 把撤销从"等目标下一次自然 boundary"提前到 IPI 投递级别。 */
+    if (lease->active_hart != 0 && lease->active_hart != csr_read(mhartid)) {
+      kick_hart = lease->active_hart;
+      enclaves[eid].revoke_ipi_count++;
+    }
     if (resp)
       resp->epoch = enclaves[eid].current_slot_epoch + 1;
     goto out;
@@ -1238,8 +1324,13 @@ out:
     resp->status = ret;
     if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
       resp->epoch = 0;
+    resp->ipi_sent = (kick_hart != 0) ? 1 : 0;
   }
   spin_unlock(&encl_lock);
+  /* IPI 必须在释放 encl_lock 之后发：目标 hart 收到后会进 stop_enclave 抢 encl_lock，
+   * 若我们仍持锁则死锁。fire-and-forget（无 sync）。 */
+  if (kick_hart != 0)
+    slottee_send_revoke_ipi(kick_hart);
   return ret;
 }
 

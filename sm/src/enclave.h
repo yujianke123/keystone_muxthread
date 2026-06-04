@@ -109,6 +109,7 @@ struct enclave
   uintptr_t next_slot_lease_id;
   uintptr_t current_slot_epoch;
   uintptr_t lease_expired_count;
+  uintptr_t revoke_ipi_count;   /* cross-hart revoke rendezvous IPIs sent for this enclave */
   struct slot_lease_t slot_leases[SLOTTEE_MAX_SLOTS];
   byte cap_key[MDSIZE];
   uintptr_t cap_key_ready;
@@ -160,6 +161,8 @@ unsigned long activate_enclave_slot(
     enclave_id eid, const struct slot_cap_t *cap, uintptr_t slot_mode,
     struct enter_slot_resp_t *resp);
 int enclave_slot_timer_redirectable(enclave_id eid, uintptr_t thread_index);
+int slottee_hart_pending_slot_revoke(void);   /* current hart's running slot has a pending revoke */
+void slottee_init_revoke_ipi(void);   /* cold-boot: register cross-hart revoke rendezvous IPI event */
 unsigned long mark_revoke_enclave_slot(
     enclave_id eid, const struct mark_revoke_req_t *req, struct mark_revoke_resp_t *resp);
 unsigned long debug_enclave_slot_state(

@@ -205,6 +205,12 @@ struct slottee_matmul_combo_report {
   uintptr_t failures;
 };
 
+/* 跨 hart 撤销 rendezvous IPI 演示（--enter-slot-revoke-ipi）。 */
+#define SLOTTEE_REVOKE_IPI_SCHED_SLOT    1
+#define SLOTTEE_REVOKE_IPI_WORKER_SLOT   2
+#define SLOTTEE_REVOKE_IPI_WORKER_ITERS  800000000UL   /* 长 in-enclave 计算；with-IPI 撤销会中断它，
+                                                         * without-IPI(对照) 需等它整段跑完才能撤销 */
+
 struct slottee_multihart_ticket_config {
   uintptr_t magic;
   uintptr_t windows;

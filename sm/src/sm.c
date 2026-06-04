@@ -146,6 +146,9 @@ void sm_init(bool cold_boot)
     // Init the enclave metadata
     enclave_init_metadata();
 
+    // 注册跨 hart 撤销 rendezvous IPI 事件（安全关键路径优化）
+    slottee_init_revoke_ipi();
+
     sm_init_done = 1;
     mb();
   }

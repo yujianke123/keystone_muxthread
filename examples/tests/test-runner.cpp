@@ -2996,13 +2996,19 @@ run_enter_slot_active_revoke_destroy_race(const char* eapp_file,
       arg.enter_lease, SLOTTEE_INITIAL_EPOCH);
   fflush(stdout);
 
+  /*
+   * 跨 hart 撤销 rendezvous IPI 引入后，mark_revoke 会立即给运行该 slot 的 hart 发 IPI，撤销在
+   * IPI 投递级别完成（worker 被强制中断 = enter_status INTERRUPTED，下方断言）。因此并发的 destroy
+   * 不再必然被拒（100005）：若 IPI 已先把 slot 撤销、enclave 无活跃 slot，则 destroy 合法**成功**。
+   * 二者都安全，故 destroy_ret 接受成功或被拒（destroy_done 确保确实尝试过）。真正的安全不变量
+   * 仍断言：mark 成功且 epoch 推进、worker 被中断（rendezvous 生效）、lease 非空、无损坏。
+   */
   if (arg.mark_failed || !arg.mark_done || !arg.destroy_done ||
       arg.duplicate_ret != Keystone::Error::Success ||
       arg.duplicate_status != SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT ||
       arg.mark_ret != Keystone::Error::Success ||
       arg.mark_status != SBI_ERR_SM_ENCLAVE_SUCCESS ||
       arg.mark_epoch != SLOTTEE_INITIAL_EPOCH + 1 ||
-      arg.destroy_ret == Keystone::Error::Success ||
       arg.enter_ret != Keystone::Error::Success ||
       arg.enter_status != SBI_ERR_SM_ENCLAVE_INTERRUPTED ||
       arg.enter_lease == 0) {
@@ -6736,6 +6742,135 @@ run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
   return 0;
 }
 
+/* ---- 跨 hart 撤销 rendezvous IPI 演示/测量（--enter-slot-revoke-ipi） ---- */
+
+/* 跑一个场景：scheduler slot 在 hart Y 上 PREEMPT_RUN 一个长 in-enclave worker。
+ * do_revoke=1：worker 运行中 host 对该 slot markRevoke（触发 IPI 强制撤销），测「mark→worker 返回」
+ *              的延迟 = IPI 撤销延迟；do_revoke=0：不撤销，测 worker 整段跑完的时间 = 无 IPI 时撤销
+ *              最坏要等的时长（PREEMPT_RUN 不停到 host）。返回 worker 墙钟周期、撤销延迟周期、状态。 */
+static int
+run_revoke_ipi_scenario(const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params, int do_revoke,
+    uintptr_t* worker_cycles, uintptr_t* revoke_latency_cycles,
+    uintptr_t* mark_status, uintptr_t* mark_epoch, int* worker_returned)
+{
+  Keystone::Enclave enclave;
+  pthread_t th;
+  slottee_multihart_worker_arg arg;
+  int started = 0;
+  uintptr_t sched_slot = SLOTTEE_REVOKE_IPI_SCHED_SLOT;
+  uintptr_t value = 0;
+  Keystone::Error ret;
+  uintptr_t t_worker_start = 0, t_mark = 0;
+
+  *worker_cycles = 0; *revoke_latency_cycles = 0; *mark_status = 0; *mark_epoch = 0;
+  *worker_returned = 0;
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  reset_copied_slot_caps();
+  memset(&arg, 0, sizeof(arg));
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] revoke-ipi init enclave\n");
+    return 1;
+  }
+  edge_init(&enclave);
+
+  ret = enclave.runRaw(&value);
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) && retry < 4096 && !started;
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost)
+      incoming_call_dispatch(enclave.getSharedBuffer());
+    if (copied_slot_cap_ready_by_slot[sched_slot]) {
+      arg.enclave = &enclave;
+      arg.cap = copied_slot_caps[sched_slot];
+      arg.slot_id = sched_slot;
+      arg.resume_limit = (uintptr_t)8000000;
+      arg.ret = Keystone::Error::DeviceError;
+      if (pthread_create(&th, NULL, slottee_multihart_worker, &arg) != 0) {
+        printf("[FAIL] revoke-ipi pthread\n");
+        slottee_trace_destroy(enclave);
+        return 1;
+      }
+      started = 1;
+      t_worker_start = read_cycle_counter();
+      break;
+    }
+    sched_yield(); usleep(1000);
+    ret = enclave.resume(&value);
+  }
+
+  if (!started) {
+    printf("[FAIL] revoke-ipi scheduler slot cap never ready\n");
+    slottee_trace_destroy(enclave);
+    return 1;
+  }
+
+  usleep(80000);   /* 让 worker 在 hart Y 上真正跑起来（active_hart 置位） */
+  if (do_revoke) {
+    t_mark = read_cycle_counter();
+    (void)enclave.markRevoke(sched_slot, mark_status, mark_epoch);
+    pthread_join(th, NULL);                       /* slot 被 IPI 撤销 → worker 的 enter 返回 */
+    *revoke_latency_cycles = read_cycle_counter() - t_mark;
+  } else {
+    pthread_join(th, NULL);                        /* 不撤销：等 worker 整段跑完 */
+  }
+  *worker_cycles = read_cycle_counter() - t_worker_start;
+  *worker_returned = 1;
+
+  slottee_trace_destroy(enclave);                  /* 结束等待中的 thread0 */
+  return 0;
+}
+
+static int
+run_slottee_revoke_ipi_test(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params)
+{
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+  uintptr_t w_full = 0, w_rev = 0, lat = 0, status = 0, epoch = 0;
+  int wret_full = 0, wret_rev = 0;
+
+  printf("revoke_ipi,setup,harts=%ld,worker_iters=%lu\n",
+      online_harts, (unsigned long)SLOTTEE_REVOKE_IPI_WORKER_ITERS);
+  fflush(stdout);
+
+  /* 对照：不撤销，测 worker 整段 in-enclave 计算时间（= 无 IPI 时撤销最坏要等的时长）。 */
+  if (run_revoke_ipi_scenario(eapp_file, rt_file, ld_file, params, 0,
+          &w_full, &lat, &status, &epoch, &wret_full))
+    return 1;
+  printf("revoke_ipi,baseline_no_revoke,worker_full_cycles=%lu\n", w_full);
+  fflush(stdout);
+
+  /* 撤销：worker 运行中 markRevoke → IPI 强制撤销，测撤销延迟。 */
+  if (run_revoke_ipi_scenario(eapp_file, rt_file, ld_file, params, 1,
+          &w_rev, &lat, &status, &epoch, &wret_rev))
+    return 1;
+  printf("revoke_ipi,with_ipi_revoke,mark_status=%lu,mark_epoch=%lu,revoke_latency_cycles=%lu,worker_cycles_until_revoked=%lu\n",
+      status, epoch, lat, w_rev);
+  fflush(stdout);
+
+  double speedup = (lat > 0) ? (double)w_full / (double)lat : 0.0;
+  printf("revoke_ipi,result,worker_full_cycles=%lu,ipi_revoke_latency_cycles=%lu,latency_ratio=%.1fx,mark_status=%lu,epoch_bumped=%d\n",
+      w_full, lat, speedup, status, (int)(epoch > SLOTTEE_INITIAL_EPOCH));
+  fflush(stdout);
+
+  /* 判据：markRevoke 成功、epoch 推进、撤销延迟远小于整段计算（IPI 把撤销从"等 worker 跑完"
+   * 降到投递级别）。worker 被强制中断 → with-IPI 的 worker_cycles_until_revoked 也远小于 full。 */
+  int ok = (status == SBI_ERR_SM_ENCLAVE_SUCCESS) &&
+           (epoch > SLOTTEE_INITIAL_EPOCH) &&
+           (w_full > 0) && (lat > 0) && (lat * 4 < w_full);
+  if (!ok) {
+    printf("[FAIL] revoke-ipi: status=%lu epoch=%lu lat=%lu full=%lu\n",
+        status, epoch, lat, w_full);
+    return 1;
+  }
+  printf("[slottee] revoke_ipi cross-hart rendezvous ok=1 (revoke %.1fx faster than waiting for the in-enclave worker to finish; harts=%ld)\n",
+      speedup, online_harts);
+  return 0;
+}
+
 static int
 run_slottee_paper_eval(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
@@ -6795,6 +6930,7 @@ main(int argc, char** argv) {
         "[--enter-slot-preempt-bestvictim] "
         "[--enter-slot-ledger] "
         "[--enter-slot-matmul] "
+        "[--enter-slot-revoke-ipi] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
@@ -6861,6 +6997,7 @@ main(int argc, char** argv) {
   int enter_slot_preempt_bestvictim = 0;
   int enter_slot_ledger = 0;
   int enter_slot_matmul = 0;
+  int enter_slot_revoke_ipi = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
@@ -6948,6 +7085,7 @@ main(int argc, char** argv) {
           &enter_slot_preempt_bestvictim, 1},
       {"enter-slot-ledger", no_argument, &enter_slot_ledger, 1},
       {"enter-slot-matmul", no_argument, &enter_slot_matmul, 1},
+      {"enter-slot-revoke-ipi", no_argument, &enter_slot_revoke_ipi, 1},
       {"slottee-trace-log", no_argument, &slottee_trace_log, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
@@ -7187,6 +7325,9 @@ main(int argc, char** argv) {
   }
   if (enter_slot_matmul) {
     return run_slottee_matmul_test(eapp_file, rt_file, ld_file, params);
+  }
+  if (enter_slot_revoke_ipi) {
+    return run_slottee_revoke_ipi_test(eapp_file, rt_file, ld_file, params);
   }
   if (enter_slot_ledger) {
     return run_slottee_ledger_test(eapp_file, rt_file, ld_file, params);

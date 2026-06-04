@@ -37,7 +37,8 @@ set(slottee_stress_test_bins
   test-lt-user-preempt-steal
   test-lt-user-preempt-bestvictim
   test-lt-user-ledger
-  test-lt-user-matmul)
+  test-lt-user-matmul
+  test-lt-user-revoke-ipi)
 
 set(slottee_explicit_test_bins
   test-lt-user-mint-cap
@@ -168,6 +169,10 @@ target_link_libraries(test-lt-user-ledger ${KEYSTONE_LIB_EAPP})
 add_executable(test-lt-user-matmul
   lt-user-matmul/lt-user-matmul.c)
 target_link_libraries(test-lt-user-matmul ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-revoke-ipi
+  lt-user-revoke-ipi/lt-user-revoke-ipi.c)
+target_link_libraries(test-lt-user-revoke-ipi ${KEYSTONE_LIB_EAPP})
 
 ###############################################
 # a script for running all test enclaves
@@ -398,6 +403,10 @@ file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-matmul\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-matmul eyrie-rt loader.bin --enter-slot-matmul\n")
+file(APPEND ${test_script_tmp} "  exit $?\n")
+file(APPEND ${test_script_tmp} "fi\n")
+file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-revoke-ipi\" ]; then\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-revoke-ipi eyrie-rt loader.bin --enter-slot-revoke-ipi\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--slottee-host-dos-stress\" ]; then\n")
