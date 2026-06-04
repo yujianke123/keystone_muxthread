@@ -6155,31 +6155,29 @@ run_slottee_preempt_steal_test(const char* eapp_file,
   bool checksums_ok = true;
   uintptr_t total_completed = 0;
   uintptr_t total_steals = 0;
+  uintptr_t total_rebalances = 0;
+
+  /*
+   * Consolidated checksum verdict (sent by the eapp main thread after ALL
+   * workers, including migrated ones, finished).  Per-group reports cannot carry
+   * a lent-out worker's checksum (the lender reports before the borrower finishes
+   * it), so checksums are verified position-by-flat-id from here, not per-group.
+   */
+  struct slottee_preempt_steal_final final;
+  memset(&final, 0, sizeof(final));
+  get_preempt_steal_final(&final);
 
   for (uintptr_t g = 0; g < SLOTTEE_PREEMPT_MULTIHART_GROUPS; g++) {
     struct slottee_preempt_multihart_report* r = &reports[g];
 
     total_completed += r->completed_workers;
     total_steals += r->steals;
-    printf("preempt_steal,group,%lu,sched_slot=%lu,bound_hart=%lu,completed=%lu,steals=%lu,switches=%lu,host_yields=%lu,exit_sw=%lu,runnable_q=%lu,qleak=%lu,unfinished=%lu,failures=%lu\n",
+    total_rebalances += r->rebalances;
+    printf("preempt_steal,group,%lu,sched_slot=%lu,bound_hart=%lu,completed=%lu,steals=%lu,rebalances=%lu,switches=%lu,host_yields=%lu,exit_sw=%lu,runnable_q=%lu,qleak=%lu,unfinished=%lu,failures=%lu\n",
         g, r->scheduler_slot, sched_args[g].bound_hart, r->completed_workers,
-        r->steals, r->preempt_switches, r->host_yields, r->exit_switches,
-        r->runnable_queue_depth, r->scheduler_queue_leaks,
+        r->steals, r->rebalances, r->preempt_switches, r->host_yields,
+        r->exit_switches, r->runnable_queue_depth, r->scheduler_queue_leaks,
         r->scheduler_unfinished, r->failures);
-
-    for (uintptr_t w = 0; w < SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP; w++) {
-      uintptr_t flat = g * SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP + w;
-      uintptr_t iters = (flat / SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP) == 0 ?
-          SLOTTEE_PREEMPT_STEAL_SHORT_ITERS : SLOTTEE_PREEMPT_STEAL_LONG_ITERS;
-      volatile uintptr_t acc = SLOTTEE_PREEMPT_STEAL_MAGIC ^ ((uintptr_t)flat << 8);
-
-      for (uintptr_t iter = 0; iter < iters; iter++) {
-        acc += (iter ^ flat) + 1;
-        acc ^= (acc << 7) ^ (acc >> 3);
-      }
-      if (r->worker_checksums[w] != (uintptr_t)acc)
-        checksums_ok = false;
-    }
 
     ok = ok &&
         r->magic == SLOTTEE_PREEMPT_STEAL_MAGIC &&
@@ -6194,26 +6192,47 @@ run_slottee_preempt_steal_test(const char* eapp_file,
         sched_args[g].value == SLOTTEE_LT_USER_OCALL_MAGIC;
   }
 
+  /* Verify every worker checksum from the consolidated final report. */
+  for (uintptr_t flat = 0; flat < SLOTTEE_PREEMPT_STEAL_TOTAL_WORKERS; flat++) {
+    /* must mirror the eapp's preempt_steal_iters(): flat0=short, flat1=med, else long */
+    uintptr_t iters = (flat == 0) ? SLOTTEE_PREEMPT_STEAL_SHORT_ITERS :
+        (flat == 1) ? SLOTTEE_PREEMPT_STEAL_MED_ITERS :
+        SLOTTEE_PREEMPT_STEAL_LONG_ITERS;
+    volatile uintptr_t acc = SLOTTEE_PREEMPT_STEAL_MAGIC ^ ((uintptr_t)flat << 8);
+
+    for (uintptr_t iter = 0; iter < iters; iter++) {
+      acc += (iter ^ flat) + 1;
+      acc ^= (acc << 7) ^ (acc >> 3);
+    }
+    if (final.worker_checksums[flat] != (uintptr_t)acc)
+      checksums_ok = false;
+  }
+
   uintptr_t expect_total = (uintptr_t)SLOTTEE_PREEMPT_MULTIHART_GROUPS *
       (uintptr_t)SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP;
   uintptr_t total_steal_skips = reports[0].steal_skips;  /* global counter */
   ok = ok && checksums_ok &&
+      final.magic == SLOTTEE_PREEMPT_STEAL_FINAL_MAGIC &&
+      final.total_workers == expect_total &&
+      final.failures == 0 &&
       total_completed == expect_total &&
       total_steals > 0 &&
-      total_steals <= expect_total;   /* migrate-once bound: no unbounded ping-pong */
+      total_steals <= expect_total &&   /* migrate-once bound: no unbounded ping-pong */
+      total_rebalances > 0;             /* proactive periodic rebalance fired */
 
   slottee_trace_destroy(enclave);
 
   if (!ok) {
-    printf("[FAIL] preempt steal invalid (total_completed=%lu/%lu total_steals=%lu(<=%lu?) steal_skips=%lu checksums_ok=%d)\n",
+    printf("[FAIL] preempt steal invalid (total_completed=%lu/%lu total_steals=%lu(<=%lu?) rebalances=%lu steal_skips=%lu checksums_ok=%d final_magic=0x%lx final_fail=%lu)\n",
         total_completed, expect_total, total_steals, expect_total,
-        total_steal_skips, (int)checksums_ok);
+        total_rebalances, total_steal_skips, (int)checksums_ok,
+        final.magic, final.failures);
     return 1;
   }
 
-  printf("[slottee] preempt_steal groups=%lu total_completed=%lu total_steals=%lu(bounded<=%lu) steal_skips=%lu checksums_ok=%d hart0=%lu hart1=%lu ok=1\n",
+  printf("[slottee] preempt_steal groups=%lu total_completed=%lu total_steals=%lu(bounded<=%lu) rebalances=%lu steal_skips=%lu checksums_ok=%d hart0=%lu hart1=%lu ok=1\n",
       (uintptr_t)SLOTTEE_PREEMPT_MULTIHART_GROUPS, total_completed, total_steals,
-      expect_total, total_steal_skips, (int)checksums_ok,
+      expect_total, total_rebalances, total_steal_skips, (int)checksums_ok,
       sched_args[0].bound_hart, sched_args[1].bound_hart);
   return 0;
 }

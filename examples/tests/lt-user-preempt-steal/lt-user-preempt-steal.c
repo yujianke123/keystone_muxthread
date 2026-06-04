@@ -20,6 +20,7 @@
  */
 
 #define OCALL_PREEMPT_MULTIHART_REPORT 12
+#define OCALL_PREEMPT_STEAL_FINAL 13
 
 #define PREEMPT_STEAL_TOTAL_WORKERS \
   (SLOTTEE_PREEMPT_MULTIHART_GROUPS * SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP)
@@ -51,10 +52,17 @@ slottee_return_with_tp(uintptr_t tp, unsigned long value)
 static uintptr_t
 preempt_steal_iters(uintptr_t flat_index)
 {
-  uintptr_t group = flat_index / SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP;
-
-  return group == 0 ? SLOTTEE_PREEMPT_STEAL_SHORT_ITERS
-                    : SLOTTEE_PREEMPT_STEAL_LONG_ITERS;
+  /*
+   * group0 worker0 = short, group0 worker1 = medium: after the short exits,
+   * group0 keeps ONE worker running alone (queue empty) for a long window, so
+   * the proactive periodic rebalancer reliably fires (pulls a group1 long)
+   * rather than the passive worker-exit path winning the race.  group1 = long.
+   */
+  if (flat_index == 0)
+    return SLOTTEE_PREEMPT_STEAL_SHORT_ITERS;
+  if (flat_index == 1)
+    return SLOTTEE_PREEMPT_STEAL_MED_ITERS;
+  return SLOTTEE_PREEMPT_STEAL_LONG_ITERS;
 }
 
 static uintptr_t
@@ -125,6 +133,7 @@ preempt_steal_sched_entry(void* opaque)
   report.fairness_violations = stats.fairness_violations;
   report.steals = stats.steals;
   report.steal_skips = stats.steal_skips;
+  report.rebalances = stats.rebalances;
   for (uintptr_t w = 0; w < SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP; w++) {
     uintptr_t flat = group_id * SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP + w;
 
@@ -189,6 +198,31 @@ eapp_entry()
       slottee_atomic_fetch_add(&group_failed, 1);
       break;
     }
+  }
+
+  /*
+   * Consolidated checksum verdict: now that every group's PREEMPT_RUN has
+   * returned (group_done == GROUPS), ALL workers — including any stolen across
+   * harts — have finished and written worker_checksums[].  Send one final report
+   * with every worker's checksum so the host verifies correctness independent of
+   * which group reported (a lending group emits its per-group report before a
+   * lent-out worker finishes on the borrowing hart, so its checksum slot is
+   * stale there).  Position-indexed by flat worker id, never migrated. */
+  {
+    struct slottee_preempt_steal_final final;
+
+    memset(&final, 0, sizeof(final));
+    final.magic = SLOTTEE_PREEMPT_STEAL_FINAL_MAGIC;
+    final.total_workers = PREEMPT_STEAL_TOTAL_WORKERS;
+    for (uintptr_t f = 0; f < PREEMPT_STEAL_TOTAL_WORKERS; f++) {
+      final.worker_checksums[f] = worker_checksums[f];
+      if (worker_checksums[f] == 0)
+        final.failures++;   /* a worker never wrote its checksum */
+    }
+    if (ocall(OCALL_PREEMPT_STEAL_FINAL, &final, sizeof(final), 0, 0) != 0)
+      slottee_atomic_fetch_add(&group_failed, 1);
+    else if (final.failures)
+      slottee_atomic_fetch_add(&group_failed, (long)final.failures);
   }
 
   slottee_return_with_tp(saved_tp,

@@ -172,7 +172,8 @@ struct slottee_preempt_group {
   uintptr_t switch_budget;
   uintptr_t switches_since_yield;
   uintptr_t enable_steal;      /* PREEMPT_RUN flag: allow this hart to steal others' runnable workers */
-  uintptr_t steals;            /* workers this group migrated in via stealing */
+  uintptr_t steals;            /* workers this group migrated in via stealing (passive + proactive) */
+  uintptr_t rebalances;        /* proactive periodic-rebalance pulls (subset of steals) */
   uintptr_t worker_slots[SLOTTEE_MAX_SLOTS];
   struct slottee_user_lt_queue runnable_queue;
   struct encl_ctx scheduler_ctx;
@@ -181,8 +182,18 @@ struct slottee_preempt_group {
 static struct slottee_preempt_group slottee_preempt_groups[SLOTTEE_MAX_SLOTS];
 static uintptr_t slottee_preempt_steal_count;   /* global, atomic: total cross-hart migrations */
 static uintptr_t slottee_preempt_steal_skips;   /* global, atomic: re-steals prevented (already-migrated) */
+static uintptr_t slottee_preempt_rebalance_count; /* global, atomic: proactive periodic-rebalance pulls */
 
 #define SLOTTEE_PREEMPT_FLAG_STEAL 1u
+/* Proactive periodic rebalance: on every REBALANCE_PERIOD-th timer tick a hart
+ * pulls one worker from the busiest peer IF that peer's runnable queue exceeds
+ * this hart's by THRESHOLD, instead of waiting for its own queue to fully drain
+ * (the passive worker-exit path).  The timer tick itself is the period; under the
+ * coarse QEMU timer (few ticks per run) PERIOD=1 (check each tick) is what makes
+ * the proactive path reliably win the race against passive within a short
+ * underloaded window.  THRESHOLD>=1 prevents thrash when groups are balanced. */
+#define SLOTTEE_PREEMPT_REBALANCE_PERIOD 1u
+#define SLOTTEE_PREEMPT_REBALANCE_THRESHOLD 1u
 
 static void
 slottee_slot_policy_lock_acquire(void)
@@ -1014,7 +1025,8 @@ slottee_preempt_pick_next(struct slottee_preempt_group* group)
  * hart, so its saved_ctx resumes correctly wherever it is dispatched.
  */
 static struct slottee_active_user_context*
-slottee_preempt_try_steal(struct slottee_preempt_group* thief)
+slottee_preempt_try_steal(struct slottee_preempt_group* thief,
+    uintptr_t min_victim_count)
 {
   struct slottee_preempt_group* victim = 0;
   struct slottee_active_user_context* w;
@@ -1038,7 +1050,10 @@ slottee_preempt_try_steal(struct slottee_preempt_group* thief)
       victim = g;
     }
   }
-  if (!victim || best == 0)
+  /* min_victim_count gates the imbalance: passive steal uses 1 (any surplus);
+   * proactive rebalance uses my_count + threshold (only pull when a peer is
+   * meaningfully busier), so a balanced system never thrashes. */
+  if (!victim || best < min_victim_count)
     return 0;
 
   if (!slottee_preempt_group_trylock(victim))
@@ -1127,6 +1142,28 @@ slottee_preempt_timer_switch(struct slottee_preempt_group* group,
     next->scheduler_state = SLOTTEE_USER_LT_RUNNING;
     group->current_slot = next->slot_id;
   }
+
+  /*
+   * Proactive periodic rebalance: every REBALANCE_PERIOD ticks, if this hart is
+   * underloaded relative to the busiest peer (peer queue exceeds mine by
+   * THRESHOLD), pull one runnable worker NOW instead of waiting for this group
+   * to fully drain (the passive worker-exit path).  Reuses the load-balanced,
+   * migrate-once steal core; the pulled worker joins this group's runnable queue
+   * and runs here on a later tick.  Gated on enable_steal, so multihart/
+   * preempt-sched (steal off) and single-group runs are unaffected.
+   */
+  if (group->enable_steal &&
+      (group->ticks % SLOTTEE_PREEMPT_REBALANCE_PERIOD) == 0) {
+    struct slottee_active_user_context* pulled = slottee_preempt_try_steal(
+        group, group->runnable_queue.count + SLOTTEE_PREEMPT_REBALANCE_THRESHOLD);
+    if (pulled) {
+      pulled->scheduler_state = SLOTTEE_USER_LT_YIELDED;
+      (void)slottee_user_lt_queue_enqueue(&group->runnable_queue,
+          SLOTTEE_USER_LT_QUEUE_RUNNABLE, pulled);
+      group->rebalances++;
+      (void)__sync_fetch_and_add(&slottee_preempt_rebalance_count, 1);
+    }
+  }
   slottee_preempt_group_lock_release(group);
   return 1;
 }
@@ -1185,7 +1222,7 @@ slottee_preempt_worker_exit(struct slottee_active_user_context* user,
    * here and counts toward this group's completed total.
    */
   if (group->enable_steal &&
-      (stolen = slottee_preempt_try_steal(group)) != 0) {
+      (stolen = slottee_preempt_try_steal(group, 1)) != 0) {
     group->exit_switches++;
     stolen->scheduler_state = SLOTTEE_USER_LT_RUNNING;
     stolen->preempt_dispatch_count++;
@@ -1768,6 +1805,7 @@ slottee_preempt_run(struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count,
   group->switches_since_yield = 0;
   group->enable_steal = (flags & SLOTTEE_PREEMPT_FLAG_STEAL) ? 1 : 0;
   group->steals = 0;
+  group->rebalances = 0;
   group->runnable_queue.head = 0;
   group->runnable_queue.tail = 0;
   group->runnable_queue.count = 0;
@@ -1845,6 +1883,7 @@ slottee_preempt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
     stats.exit_switches = group->exit_switches;
     stats.steals = group->steals;
     stats.steal_skips = slottee_preempt_steal_skips;
+    stats.rebalances = group->rebalances;
     stats.runnable_queue_depth = group->runnable_queue.count;
     stats.active = group->sched_active;
 
@@ -1856,6 +1895,17 @@ slottee_preempt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
       stats.per_worker_slot[i] = slot;
       stats.per_worker_dispatch[i] = dispatched;
       stats.per_worker_preempts[i] = user->preempt_count;
+      /*
+       * Migration-aware accounting: a worker this group SPAWNED but that has
+       * since been stolen to another hart (preempt_group reassigned) is no
+       * longer this group's responsibility — the borrowing group runs it to
+       * completion and the host verifies its checksum from the consolidated
+       * final report.  Counting it here would false-positive unfinished/qleak
+       * because the lender's PREEMPT_RUN returns BEFORE the lent worker finishes
+       * elsewhere.  Skip the liveness/fairness checks for migrated-away workers.
+       */
+      if (user->preempt_group != group->scheduler_slot)
+        continue;
       if (user->in_runnable_queue || user->in_wait_queue)
         stats.scheduler_queue_leaks++;
       if (user->scheduler_state != SLOTTEE_USER_LT_EXITED)

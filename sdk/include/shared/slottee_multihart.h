@@ -50,10 +50,30 @@
  * group0 worker 短、group1 worker 长 → group0 hart 先空闲，窃取 group1 的排队 worker
  * 迁到本 hart 跑。PREEMPT_RUN flags bit0 启用窃取。 */
 #define SLOTTEE_PREEMPT_STEAL_MAGIC          0x51513d3d
+#define SLOTTEE_PREEMPT_STEAL_FINAL_MAGIC    0x51513e3e
 #define SLOTTEE_PREEMPT_STEAL_FLAG           1u
 #define SLOTTEE_PREEMPT_STEAL_SHORT_ITERS    200000UL
+#define SLOTTEE_PREEMPT_STEAL_MED_ITERS      1500000UL
 #define SLOTTEE_PREEMPT_STEAL_LONG_ITERS     3000000UL
 #define SLOTTEE_PREEMPT_STEAL_BUDGET         8
+#define SLOTTEE_PREEMPT_STEAL_TOTAL_WORKERS \
+  (SLOTTEE_PREEMPT_MULTIHART_GROUPS * SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP)
+
+/*
+ * Consolidated steal verdict, OCALLed once by the eapp MAIN thread AFTER every
+ * group has finished (group_done == GROUPS, so every worker — including any that
+ * migrated across harts — has run to completion and written its checksum).  This
+ * decouples checksum verification from the per-group reports, which a LENDING
+ * group emits BEFORE a worker it lent out finishes on the borrowing hart (its
+ * checksum slot would still be stale there).  The host verifies all worker
+ * checksums from here regardless of where/when each worker actually ran.
+ */
+struct slottee_preempt_steal_final {
+  uintptr_t magic;
+  uintptr_t total_workers;
+  uintptr_t failures;
+  uintptr_t worker_checksums[SLOTTEE_PREEMPT_STEAL_TOTAL_WORKERS];
+};
 
 struct slottee_multihart_ticket_config {
   uintptr_t magic;
@@ -234,6 +254,7 @@ struct slottee_preempt_multihart_report {
   uintptr_t fairness_violations;
   uintptr_t steals;
   uintptr_t steal_skips;
+  uintptr_t rebalances;
   uintptr_t failures;
   uintptr_t per_worker_slot[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];
   uintptr_t per_worker_dispatch[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];
