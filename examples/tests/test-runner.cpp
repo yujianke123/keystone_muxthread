@@ -6687,20 +6687,22 @@ run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
     const char* ld_file, Keystone::Params params)
 {
   static const long sizes[SLOTTEE_MATMUL_NSIZES] = {16, 32, 64, 128, 256, 512};
-  static const long gset[3] = {1, 2, 4};
-  struct slottee_matmul_combo_report grid[SLOTTEE_MATMUL_NSIZES][3];
+  /* G=0：真正的 Keystone 单线程基线（thread0 直跑 kernel，零 SlotTEE 机制）；
+   * G=1：SlotTEE 单 worker（量化 SlotTEE 单线程调度开销）；G=2/4：SlotTEE 多线程。 */
+  static const long gset[4] = {0, 1, 2, 4};
+  struct slottee_matmul_combo_report grid[SLOTTEE_MATMUL_NSIZES][4];
   long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
   bool ok = true;
 
   memset(grid, 0, sizeof(grid));
-  printf("matmul,setup,harts=%ld,sizes=16..512,threads=1/2/4,metric=rdcycle_in_enclave_compute\n",
+  printf("matmul,setup,harts=%ld,sizes=16..512,threads=0/1/2/4,g0=keystone_direct,metric=rdcycle_in_enclave_compute\n",
       online_harts);
   fflush(stdout);
 
   for (int si = 0; si < SLOTTEE_MATMUL_NSIZES; si++) {
     long N = sizes[si];
     uintptr_t expect_csum = matmul_host_checksum(N);
-    for (int gi = 0; gi < 3; gi++) {
+    for (int gi = 0; gi < 4; gi++) {
       long G = gset[gi];
       struct slottee_matmul_combo_report* r = &grid[si][gi];
       int rc = run_matmul_combo(eapp_file, rt_file, ld_file, params, N, G, r);
@@ -6716,20 +6718,23 @@ run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
     }
   }
 
-  /* 汇总：speedup（compute 口径，= single/multi 的 max-worker-compute）+ sync% */
-  printf("matmul,result,N,single_compute,t2_compute,t4_compute,speedup2,speedup4,t4_sync_pct,csum\n");
+  /* 汇总：speedup（compute 口径）= Keystone 单线程基线(G=0) / SlotTEE 多线程(G=2,4) 的 max-worker-compute；
+   * overhead1 = (SlotTEE 单 worker - Keystone 基线)/基线；t4_sync% = (wall-compute)/wall（含 host 跨 hart 编排）。 */
+  printf("matmul,result,N,keystone_single,slottee1,t2_compute,t4_compute,overhead1_pct,speedup2,speedup4,t4_sync_pct,csum\n");
   for (int si = 0; si < SLOTTEE_MATMUL_NSIZES; si++) {
     long N = sizes[si];
-    double c1 = (double)grid[si][0].max_compute;   /* G=1 single (Keystone baseline) */
-    double c2 = (double)grid[si][1].max_compute;   /* G=2 */
-    double c4 = (double)grid[si][2].max_compute;   /* G=4 */
-    double sp2 = (c2 > 0) ? c1 / c2 : 0.0;
-    double sp4 = (c4 > 0) ? c1 / c4 : 0.0;
-    /* sync% at 4 threads: (wall - max_compute)/wall */
-    double w4 = (double)grid[si][2].wall_cycles;
+    double c0 = (double)grid[si][0].max_compute;   /* G=0 真正 Keystone 单线程基线 */
+    double c1 = (double)grid[si][1].max_compute;   /* G=1 SlotTEE 单 worker（开销对照） */
+    double c2 = (double)grid[si][2].max_compute;   /* G=2 SlotTEE */
+    double c4 = (double)grid[si][3].max_compute;   /* G=4 SlotTEE */
+    double ovh1 = (c0 > 0) ? (c1 - c0) / c0 * 100.0 : 0.0;
+    double sp2 = (c2 > 0) ? c0 / c2 : 0.0;
+    double sp4 = (c4 > 0) ? c0 / c4 : 0.0;
+    /* sync% at 4 threads: (wall - max_compute)/wall（含 host 跨 hart slot 进入编排，非纯 in-enclave sync） */
+    double w4 = (double)grid[si][3].wall_cycles;
     double sync4 = (w4 > 0) ? (w4 - c4) / w4 * 100.0 : 0.0;
-    printf("matmul,result,%ld,%.0f,%.0f,%.0f,%.3f,%.3f,%.2f,0x%lx\n",
-        N, c1, c2, c4, sp2, sp4, sync4, grid[si][0].checksum);
+    printf("matmul,result,%ld,%.0f,%.0f,%.0f,%.0f,%.2f,%.3f,%.3f,%.2f,0x%lx\n",
+        N, c0, c1, c2, c4, ovh1, sp2, sp4, sync4, grid[si][0].checksum);
   }
   fflush(stdout);
 
@@ -6737,7 +6742,7 @@ run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
     printf("[FAIL] matmul comparison had failures\n");
     return 1;
   }
-  printf("[slottee] matmul single(Keystone)/multi(SlotTEE 2,4-thread) comparison ok=1 (harts=%ld)\n",
+  printf("[slottee] matmul single(Keystone direct)/multi(SlotTEE 2,4-thread) comparison ok=1 (harts=%ld)\n",
       online_harts);
   return 0;
 }

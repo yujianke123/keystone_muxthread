@@ -9,16 +9,21 @@
 /*
  * ParTEE 式单/多线程矩阵乘法对比基准（--enter-slot-matmul）。一次 enclave run 测一个
  * (N, groups) 组合（host 经 config OCALL 指定）：
- *   - groups==1：单线程基线（1 个 worker 算整个 C=A×B）≈ Keystone 单线程；
+ *   - groups==0：**真正的 Keystone 单线程基线** —— thread0（enclave 入口线程）直接跑整段
+ *     C=A×B kernel，零 slot / 零 LT / 零 PREEMPT_RUN / 零 wait-notify。即 stock Keystone
+ *     enclave 单线程执行，rdcycle 紧贴 kernel，不含任何 SlotTEE 调度机制。这是 speedup 的分子。
+ *   - groups==1：SlotTEE 单 worker（1 个 worker LT 算整个 C）—— 仅用于量化 SlotTEE 相对
+ *     Keystone 基线的单线程调度开销（overhead = (c1-c0)/c0），不进 ParTEE 式三线对比图。
  *   - groups==2/4：SlotTEE 多线程，G 个 worker LT（host pthread 各进一个 scheduler slot、
  *     落在不同 hart）经 PREEMPT_RUN 在 enclave 内并行算 C 的不相交行块。
  * 每个 worker 用 rdcycle 自计其 compute 周期（同 hart delta，避免跨 hart 计数器不同步）；
- * host 对每个 N 取 max-worker-compute 作并行 compute 时间，speedup = compute(N,1)/compute(N,G)。
+ * host 对每个 N 取 max-worker-compute 作并行 compute 时间，speedup = compute(Keystone,0)/compute(N,G)。
  * C 由 (i,j) 确定 → 所有 groups 配置结果逐位一致（checksum 相等 + host 重算校验）。
  *
  * 用 PREEMPT_RUN 跑 worker：1 worker/组、budget=0、flags=0 → 计算全程留在 enclave 内
  * （timer 触发时只此一个 runnable，原地保留、零 host 中转），避免长计算被 timer 反复 stop 到
- * host 的往返风暴。
+ * host 的往返风暴。Keystone 基线（groups==0）则不进 PREEMPT_RUN，与 stock Keystone 一样
+ * 由 SM 在 timer 时 stop 到 host 再 resume（这正是要对标的基线行为）。
  */
 
 #define OCALL_GET_MATMUL_CONFIG 16
@@ -166,55 +171,72 @@ eapp_entry()
   memset(&cfg, 0, sizeof(cfg));
   if (ocall(OCALL_GET_MATMUL_CONFIG, 0, 0, &cfg, sizeof(cfg)) != 0 ||
       cfg.magic != SLOTTEE_MATMUL_MAGIC || cfg.n <= 0 ||
-      cfg.n > SLOTTEE_MATMUL_MAXN || cfg.groups < 1 ||
+      cfg.n > SLOTTEE_MATMUL_MAXN || cfg.groups < 0 ||
       cfg.groups > SLOTTEE_MATMUL_WORKERS)
     slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
 
   cfg_n = cfg.n;
   cfg_groups = cfg.groups;
-  slottee_atomic_store(&group_done, 0);
-  slottee_atomic_store(&group_failed, 0);
-  memset(wdur, 0, sizeof(wdur));
 
   matmul_fill(cfg_n);
-
-  t0 = read_cycles();
-  for (long g = 0; g < cfg_groups; g++) {
-    if (slottee_lt_spawn(SLOTTEE_MATMUL_FIRST_WORKER_SLOT + g, matmul_sched_entry,
-            (void*)(uintptr_t)g) != SBI_ERR_SM_ENCLAVE_SUCCESS)
-      slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
-  }
-
-  while (slottee_atomic_load(&group_done) < cfg_groups) {
-    int ret = slottee_lt_wait_value(&group_done, cfg_groups, SLOTTEE_LT_WAIT_OP_GE);
-
-    if (ret != SLOTTEE_LT_WAIT_RESULT_READY &&
-        ret != SLOTTEE_LT_WAIT_RESULT_BLOCKED) {
-      slottee_atomic_fetch_add(&group_failed, 1);
-      break;
-    }
-    if (--budget == 0) {
-      slottee_atomic_fetch_add(&group_failed, 1);
-      break;
-    }
-  }
-  t1 = read_cycles();
 
   memset(&report, 0, sizeof(report));
   report.magic = SLOTTEE_MATMUL_MAGIC;
   report.n = cfg_n;
   report.groups = cfg_groups;
-  report.wall_cycles = t1 - t0;
-  report.max_compute = 0;
-  report.sum_compute = 0;
-  for (long g = 0; g < cfg_groups && g < SLOTTEE_MATMUL_WORKERS; g++) {
-    report.worker_compute[g] = wdur[g];
-    if (wdur[g] > report.max_compute)
-      report.max_compute = wdur[g];
-    report.sum_compute += wdur[g];
+
+  if (cfg_groups == 0) {
+    /* 真正的 Keystone 单线程基线：thread0 直接跑整段 kernel，rdcycle 紧贴 kernel。
+     * 零 slot/LT/PREEMPT/wait-notify —— 与 stock Keystone enclave 单线程执行等价。 */
+    t0 = read_cycles();
+    matmul_rows(0, cfg_n, cfg_n);
+    t1 = read_cycles();
+    report.wall_cycles = t1 - t0;          /* 基线无 spawn/汇合，wall == compute */
+    report.max_compute = t1 - t0;
+    report.sum_compute = t1 - t0;
+    report.worker_compute[0] = t1 - t0;
+    report.checksum = matmul_checksum(cfg_n);
+    report.failures = 0;
+  } else {
+    /* SlotTEE 路径：groups==1 量化单 worker 开销；groups==2/4 跨 hart 并行。 */
+    slottee_atomic_store(&group_done, 0);
+    slottee_atomic_store(&group_failed, 0);
+    memset(wdur, 0, sizeof(wdur));
+
+    t0 = read_cycles();
+    for (long g = 0; g < cfg_groups; g++) {
+      if (slottee_lt_spawn(SLOTTEE_MATMUL_FIRST_WORKER_SLOT + g, matmul_sched_entry,
+              (void*)(uintptr_t)g) != SBI_ERR_SM_ENCLAVE_SUCCESS)
+        slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
+    }
+
+    while (slottee_atomic_load(&group_done) < cfg_groups) {
+      int ret = slottee_lt_wait_value(&group_done, cfg_groups, SLOTTEE_LT_WAIT_OP_GE);
+
+      if (ret != SLOTTEE_LT_WAIT_RESULT_READY &&
+          ret != SLOTTEE_LT_WAIT_RESULT_BLOCKED) {
+        slottee_atomic_fetch_add(&group_failed, 1);
+        break;
+      }
+      if (--budget == 0) {
+        slottee_atomic_fetch_add(&group_failed, 1);
+        break;
+      }
+    }
+    t1 = read_cycles();
+
+    report.wall_cycles = t1 - t0;
+    report.max_compute = 0;
+    report.sum_compute = 0;
+    for (long g = 0; g < cfg_groups && g < SLOTTEE_MATMUL_WORKERS; g++) {
+      report.worker_compute[g] = wdur[g];
+      if (wdur[g] > report.max_compute)
+        report.max_compute = wdur[g];
+      report.sum_compute += wdur[g];
+    }
+    report.checksum = matmul_checksum(cfg_n);
+    report.failures = (uintptr_t)slottee_atomic_load(&group_failed);
   }
-  report.checksum = matmul_checksum(cfg_n);
-  report.failures = (uintptr_t)slottee_atomic_load(&group_failed);
 
   if (ocall(OCALL_MATMUL_REPORT, &report, sizeof(report), 0, 0) != 0)
     report.failures++;
