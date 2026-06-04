@@ -23,6 +23,8 @@
 #define OCALL_PREEMPT_STEAL_FINAL 13
 #define OCALL_PREEMPT_BV_REPORT 14
 #define OCALL_LEDGER_REPORT 15
+#define OCALL_GET_MATMUL_CONFIG 16
+#define OCALL_MATMUL_REPORT 17
 
 static struct slottee_edgecall_stress_report copied_edgecall_stress_report;
 static struct slottee_edgecall_stress_payload copied_edgecall_stress_payload;
@@ -34,6 +36,8 @@ static struct slottee_preempt_steal_final copied_preempt_steal_final;
 static struct slottee_preempt_bestvictim_report
     copied_preempt_bestvictim_reports[SLOTTEE_PREEMPT_BV_GROUPS];
 static struct slottee_ledger_report copied_ledger_report;
+static struct slottee_matmul_config matmul_config;
+static struct slottee_matmul_combo_report copied_matmul_report;
 static uintptr_t edgecall_stress_echo_count;
 
 void
@@ -58,6 +62,8 @@ edge_init(Keystone::Enclave* enclave) {
   register_call(OCALL_PREEMPT_STEAL_FINAL, copy_preempt_steal_final_wrapper);
   register_call(OCALL_PREEMPT_BV_REPORT, copy_preempt_bestvictim_report_wrapper);
   register_call(OCALL_LEDGER_REPORT, copy_ledger_report_wrapper);
+  register_call(OCALL_GET_MATMUL_CONFIG, get_matmul_config_wrapper);
+  register_call(OCALL_MATMUL_REPORT, copy_matmul_report_wrapper);
 
   edge_call_init_internals(
       (uintptr_t)enclave->getSharedBuffer(), enclave->getSharedBufferSize());
@@ -124,6 +130,21 @@ reset_ledger_state(void)
 }
 
 void
+set_matmul_config(long n, long groups)
+{
+  memset(&matmul_config, 0, sizeof(matmul_config));
+  matmul_config.magic = SLOTTEE_MATMUL_MAGIC;
+  matmul_config.n = n;
+  matmul_config.groups = groups;
+}
+
+void
+reset_matmul_report(void)
+{
+  memset(&copied_matmul_report, 0, sizeof(copied_matmul_report));
+}
+
+void
 reset_preempt_multihart_state(void)
 {
   memset(&copied_preempt_steal_final, 0, sizeof(copied_preempt_steal_final));
@@ -159,6 +180,13 @@ get_ledger_report(struct slottee_ledger_report* report)
 {
   if (report)
     *report = copied_ledger_report;
+}
+
+void
+get_matmul_report(struct slottee_matmul_combo_report* report)
+{
+  if (report)
+    *report = copied_matmul_report;
 }
 
 void
@@ -432,6 +460,39 @@ copy_preempt_bestvictim_report_wrapper(void* buffer) {
   }
 
   copy_preempt_bestvictim_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+void
+get_matmul_config_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t data_section = edge_call_data_ptr();
+
+  memcpy((void*)data_section, &matmul_config, sizeof(matmul_config));
+  if (edge_call_setup_ret(edge_call, (void*)data_section, sizeof(matmul_config)))
+    edge_call->return_data.call_status = CALL_STATUS_BAD_PTR;
+  else
+    edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_matmul_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_matmul_report))
+    memcpy(&copied_matmul_report, buffer, size);
+}
+
+void
+copy_matmul_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_matmul_combo_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+  copy_matmul_report((void*)call_args, args_len);
   edge_call->return_data.call_status = CALL_STATUS_OK;
 }
 

@@ -67,6 +67,12 @@ void copy_ledger_report_wrapper(void* buffer);
 void get_ledger_report(struct slottee_ledger_report* report);
 void reset_ledger_state(void);
 
+void get_matmul_config_wrapper(void* buffer);
+void copy_matmul_report_wrapper(void* buffer);
+void set_matmul_config(long n, long groups);
+void get_matmul_report(struct slottee_matmul_combo_report* report);
+void reset_matmul_report(void);
+
 void get_multihart_ticket_config_wrapper(void* buffer);
 void get_multihart_ticket_config(
     struct slottee_multihart_ticket_config* config);

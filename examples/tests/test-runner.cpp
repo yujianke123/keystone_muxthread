@@ -6574,6 +6574,168 @@ run_slottee_ledger_test(const char* eapp_file,
   return 0;
 }
 
+/* ---- ParTEE 式 matmul 单(Keystone)/多(SlotTEE)线程对比（--enter-slot-matmul） ---- */
+
+/* host 侧 matmul 重算（核对 enclave 报告的 checksum，独立于 G）。与 eapp 公式逐字一致。 */
+static uintptr_t
+matmul_host_checksum(long n)
+{
+  static int hA[SLOTTEE_MATMUL_MAXN][SLOTTEE_MATMUL_MAXN];
+  static int hB[SLOTTEE_MATMUL_MAXN][SLOTTEE_MATMUL_MAXN];
+  uintptr_t acc = 1469598103u;
+
+  for (long i = 0; i < n; i++)
+    for (long j = 0; j < n; j++) {
+      hA[i][j] = (int)((i * 7 + j * 3 + 1) & 0x7f);
+      hB[i][j] = (int)((i * 5 + j * 11 + 2) & 0x7f);
+    }
+  for (long i = 0; i < n; i++)
+    for (long j = 0; j < n; j++) {
+      int s = 0;
+      for (long k = 0; k < n; k++)
+        s += hA[i][k] * hB[k][j];
+      acc ^= (uintptr_t)(unsigned int)s;
+      acc *= 1099511628211u;
+    }
+  return acc;
+}
+
+/* 跑一个 (N, G) 组合：fresh enclave，host 进 G 个 scheduler slot（落在不同 hart），
+ * eapp 用 PREEMPT_RUN 让 G 个 worker 并行算 C 的行块；收一份 combo 报告。 */
+static int
+run_matmul_combo(const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params, long N, long G,
+    struct slottee_matmul_combo_report* out)
+{
+  Keystone::Enclave enclave;
+  pthread_t th[SLOTTEE_MATMUL_WORKERS];
+  slottee_multihart_worker_arg args[SLOTTEE_MATMUL_WORKERS];
+  int started[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t sched_slot[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t value = 0;
+  Keystone::Error ret;
+
+  params.setFreeMemSize(24 * 1024 * 1024);
+  params.setUntrustedSize(256 * 1024);
+  set_matmul_config(N, G);
+  reset_matmul_report();
+  reset_copied_slot_caps();
+  memset(th, 0, sizeof(th));
+  memset(args, 0, sizeof(args));
+  memset(started, 0, sizeof(started));
+  for (long g = 0; g < G; g++)
+    sched_slot[g] = SLOTTEE_MATMUL_FIRST_WORKER_SLOT + g;   /* 1..G */
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] matmul init enclave (N=%ld G=%ld)\n", N, G);
+    return 1;
+  }
+  edge_init(&enclave);
+
+  ret = enclave.runRaw(&value);
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < (uintptr_t)4000000;
+       retry++) {
+    if (ret == Keystone::Error::EdgeCallHost)
+      incoming_call_dispatch(enclave.getSharedBuffer());
+
+    for (long g = 0; g < G; g++) {
+      if (!started[g] && copied_slot_cap_ready_by_slot[sched_slot[g]]) {
+        memset(&args[g], 0, sizeof(args[g]));
+        args[g].enclave = &enclave;
+        args[g].cap = copied_slot_caps[sched_slot[g]];
+        args[g].slot_id = sched_slot[g];
+        args[g].resume_limit = (uintptr_t)4000000;
+        args[g].ret = Keystone::Error::DeviceError;
+        if (pthread_create(&th[g], NULL, slottee_multihart_worker, &args[g]) != 0) {
+          printf("[FAIL] matmul pthread (N=%ld G=%ld g=%ld)\n", N, G, g);
+          slottee_trace_destroy(enclave);
+          return 1;
+        }
+        started[g] = 1;
+        sched_yield();
+        usleep(500);
+      }
+    }
+    sched_yield();
+    ret = enclave.resume(&value);
+    if (ret == Keystone::Error::Success && value == SLOTTEE_LT_USER_OCALL_MAGIC)
+      break;
+  }
+
+  for (long g = 0; g < G; g++)
+    if (started[g])
+      pthread_join(th[g], NULL);
+
+  get_matmul_report(out);
+  slottee_trace_destroy(enclave);
+
+  return (ret == Keystone::Error::Success && value == SLOTTEE_LT_USER_OCALL_MAGIC &&
+      out->magic == SLOTTEE_MATMUL_MAGIC && out->failures == 0) ? 0 : 1;
+}
+
+static int
+run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params)
+{
+  static const long sizes[SLOTTEE_MATMUL_NSIZES] = {16, 32, 64, 128, 256, 512};
+  static const long gset[3] = {1, 2, 4};
+  struct slottee_matmul_combo_report grid[SLOTTEE_MATMUL_NSIZES][3];
+  long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
+  bool ok = true;
+
+  memset(grid, 0, sizeof(grid));
+  printf("matmul,setup,harts=%ld,sizes=16..512,threads=1/2/4,metric=rdcycle_in_enclave_compute\n",
+      online_harts);
+  fflush(stdout);
+
+  for (int si = 0; si < SLOTTEE_MATMUL_NSIZES; si++) {
+    long N = sizes[si];
+    uintptr_t expect_csum = matmul_host_checksum(N);
+    for (int gi = 0; gi < 3; gi++) {
+      long G = gset[gi];
+      struct slottee_matmul_combo_report* r = &grid[si][gi];
+      int rc = run_matmul_combo(eapp_file, rt_file, ld_file, params, N, G, r);
+      bool csum_ok = (r->checksum == expect_csum);
+      if (rc != 0 || !csum_ok) {
+        ok = false;
+        printf("[FAIL] matmul combo N=%ld G=%ld rc=%d csum_ok=%d (got=0x%lx expect=0x%lx)\n",
+            N, G, rc, (int)csum_ok, r->checksum, expect_csum);
+      }
+      printf("matmul,combo,N=%ld,threads=%ld,max_compute=%lu,sum_compute=%lu,wall=%lu,csum_ok=%d\n",
+          N, G, r->max_compute, r->sum_compute, r->wall_cycles, (int)csum_ok);
+      fflush(stdout);
+    }
+  }
+
+  /* 汇总：speedup（compute 口径，= single/multi 的 max-worker-compute）+ sync% */
+  printf("matmul,result,N,single_compute,t2_compute,t4_compute,speedup2,speedup4,t4_sync_pct,csum\n");
+  for (int si = 0; si < SLOTTEE_MATMUL_NSIZES; si++) {
+    long N = sizes[si];
+    double c1 = (double)grid[si][0].max_compute;   /* G=1 single (Keystone baseline) */
+    double c2 = (double)grid[si][1].max_compute;   /* G=2 */
+    double c4 = (double)grid[si][2].max_compute;   /* G=4 */
+    double sp2 = (c2 > 0) ? c1 / c2 : 0.0;
+    double sp4 = (c4 > 0) ? c1 / c4 : 0.0;
+    /* sync% at 4 threads: (wall - max_compute)/wall */
+    double w4 = (double)grid[si][2].wall_cycles;
+    double sync4 = (w4 > 0) ? (w4 - c4) / w4 * 100.0 : 0.0;
+    printf("matmul,result,%ld,%.0f,%.0f,%.0f,%.3f,%.3f,%.2f,0x%lx\n",
+        N, c1, c2, c4, sp2, sp4, sync4, grid[si][0].checksum);
+  }
+  fflush(stdout);
+
+  if (!ok) {
+    printf("[FAIL] matmul comparison had failures\n");
+    return 1;
+  }
+  printf("[slottee] matmul single(Keystone)/multi(SlotTEE 2,4-thread) comparison ok=1 (harts=%ld)\n",
+      online_harts);
+  return 0;
+}
+
 static int
 run_slottee_paper_eval(const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params)
@@ -6632,6 +6794,7 @@ main(int argc, char** argv) {
         "[--enter-slot-preempt-steal] "
         "[--enter-slot-preempt-bestvictim] "
         "[--enter-slot-ledger] "
+        "[--enter-slot-matmul] "
         "[--slottee-debug-mint-gate] "
         "[--slottee-paper-eval] [--slottee-ticket-demo] "
         "[--slottee-multihart-ticket] "
@@ -6697,6 +6860,7 @@ main(int argc, char** argv) {
   int enter_slot_preempt_steal = 0;
   int enter_slot_preempt_bestvictim = 0;
   int enter_slot_ledger = 0;
+  int enter_slot_matmul = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
@@ -6783,6 +6947,7 @@ main(int argc, char** argv) {
       {"enter-slot-preempt-bestvictim", no_argument,
           &enter_slot_preempt_bestvictim, 1},
       {"enter-slot-ledger", no_argument, &enter_slot_ledger, 1},
+      {"enter-slot-matmul", no_argument, &enter_slot_matmul, 1},
       {"slottee-trace-log", no_argument, &slottee_trace_log, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
@@ -7019,6 +7184,9 @@ main(int argc, char** argv) {
 
   if (enter_slot_preempt_bestvictim) {
     return run_slottee_preempt_bestvictim_test(eapp_file, rt_file, ld_file, params);
+  }
+  if (enter_slot_matmul) {
+    return run_slottee_matmul_test(eapp_file, rt_file, ld_file, params);
   }
   if (enter_slot_ledger) {
     return run_slottee_ledger_test(eapp_file, rt_file, ld_file, params);

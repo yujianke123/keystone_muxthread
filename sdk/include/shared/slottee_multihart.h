@@ -168,6 +168,43 @@ struct slottee_ledger_report {
   uintptr_t failures;
 };
 
+/*
+ * ParTEE 式单线程(Keystone) vs 多线程(SlotTEE) 矩阵乘法对比基准（--enter-slot-matmul）。
+ * 对每个矩阵规模 N ∈ {16,32,64,128,256,512}，测三种配置的执行周期：
+ *   - single：主线程（thread0，普通 enclave 线程，不经 SlotTEE 调度器）直接算整个 C=A×B
+ *             —— 即 Keystone 单线程能力的基线；
+ *   - P2/P4：SlotTEE 用 2/4 个 worker LT（host pthread 各进一个 slot，落在不同 hart）并行算
+ *             C 的不相交行块 —— SlotTEE 多线程能力。
+ * 每个 worker 用 rdcycle 自计其 compute 周期；主线程用 rdcycle 量 release→all-done 的 wall。
+ * speedup = single / multi；sync% = (wall - max_worker_compute)/wall。C 由 (i,j) 确定 → 三种
+ * 配置结果逐位一致（checksum 相等即并行未破坏正确性，host 另行重算校验）。对应 ParTEE Fig.4。
+ */
+#define SLOTTEE_MATMUL_MAGIC          0x51514141
+#define SLOTTEE_MATMUL_NSIZES         6
+#define SLOTTEE_MATMUL_MAXN           512
+#define SLOTTEE_MATMUL_WORKERS        4        /* 最大线程数 G；scheduler slot 1..G、worker slot 1+G..2G */
+#define SLOTTEE_MATMUL_FIRST_WORKER_SLOT 1
+
+/* host → eapp：每次 enclave run 测一个 (N, groups) 组合。 */
+struct slottee_matmul_config {
+  uintptr_t magic;
+  long n;        /* 矩阵规模 N */
+  long groups;   /* 线程数 G（1=单线程基线，2/4=SlotTEE 多线程） */
+};
+
+/* eapp → host：单组合报告。host 把 18 个组合聚合成 speedup/sync% 表 + 绘图。 */
+struct slottee_matmul_combo_report {
+  uintptr_t magic;
+  long n;
+  long groups;
+  unsigned long wall_cycles;                          /* 主线程 spawn→all-done（含一次性开销） */
+  unsigned long max_compute;                          /* max worker compute（并行 compute 时间） */
+  unsigned long sum_compute;                          /* sum worker compute（总计算量） */
+  unsigned long worker_compute[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t checksum;                                 /* C 校验和（所有 G 应相等，host 重算校验） */
+  uintptr_t failures;
+};
+
 struct slottee_multihart_ticket_config {
   uintptr_t magic;
   uintptr_t windows;

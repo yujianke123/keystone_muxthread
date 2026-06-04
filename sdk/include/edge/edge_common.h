@@ -14,7 +14,7 @@ typedef size_t edge_data_offset;
 
 typedef void (*edgecallwrapper)(void*);
 
-#define MAX_EDGE_CALL 16
+#define MAX_EDGE_CALL 24
 
 /*
  * Table is indexed by call_id in [0, MAX_EDGE_CALL]; size must be
