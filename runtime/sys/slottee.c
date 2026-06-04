@@ -91,6 +91,7 @@ struct slottee_active_user_context {
   uintptr_t preempt_dispatch_count;
   uintptr_t preempt_worker;
   uintptr_t preempt_group;
+  uintptr_t migrated;        /* set once when stolen; a worker migrates at most once (bounds ping-pong) */
   uintptr_t dispatch_count;
   uintptr_t in_runnable_queue;
   uintptr_t in_wait_queue;
@@ -179,6 +180,7 @@ struct slottee_preempt_group {
 };
 static struct slottee_preempt_group slottee_preempt_groups[SLOTTEE_MAX_SLOTS];
 static uintptr_t slottee_preempt_steal_count;   /* global, atomic: total cross-hart migrations */
+static uintptr_t slottee_preempt_steal_skips;   /* global, atomic: re-steals prevented (already-migrated) */
 
 #define SLOTTEE_PREEMPT_FLAG_STEAL 1u
 
@@ -825,6 +827,7 @@ slottee_activate_user_context(uintptr_t slot_id, uintptr_t lease_id, uintptr_t m
   user->preempt_dispatch_count = 0;
   user->preempt_worker = 0;
   user->preempt_group = 0;
+  user->migrated = 0;
   user->dispatch_count = 0;
   user->in_runnable_queue = 0;
   user->in_wait_queue = 0;
@@ -933,6 +936,7 @@ slottee_preempt_init_worker(struct slottee_active_user_context* user,
   user->hart_id = sbi_current_hart();
   user->preempt_worker = 1;
   user->preempt_group = group_key;
+  user->migrated = 0;
   user->last_trap_syscall = 0;
   user->last_trap_scause = 0;
   user->last_trap_sepc = 0;
@@ -1012,26 +1016,56 @@ slottee_preempt_pick_next(struct slottee_preempt_group* group)
 static struct slottee_active_user_context*
 slottee_preempt_try_steal(struct slottee_preempt_group* thief)
 {
+  struct slottee_preempt_group* victim = 0;
+  struct slottee_active_user_context* w;
+  uintptr_t best = 0;
   uintptr_t v;
 
+  /*
+   * Load-balanced victim selection: pick the MOST-LOADED other active group
+   * (largest runnable queue) rather than the first non-empty one, so an idle
+   * hart pulls from the busiest queue and overall imbalance shrinks fastest.
+   * The count reads here are an unlocked hint; the dequeue below under the
+   * victim's lock is authoritative.
+   */
   for (v = 1; v < SLOTTEE_MAX_SLOTS; v++) {
-    struct slottee_preempt_group* victim = &slottee_preempt_groups[v];
-    struct slottee_active_user_context* w;
+    struct slottee_preempt_group* g = &slottee_preempt_groups[v];
 
-    if (victim == thief || !victim->sched_active ||
-        victim->runnable_queue.count == 0)
+    if (g == thief || !g->sched_active)
       continue;
-    if (!slottee_preempt_group_trylock(victim))
-      continue;
-    w = slottee_user_lt_queue_dequeue(&victim->runnable_queue,
-        SLOTTEE_USER_LT_QUEUE_RUNNABLE);
-    slottee_preempt_group_lock_release(victim);
-    if (w && w->saved_ctx_valid) {
-      w->preempt_group = thief->scheduler_slot;   /* migrate ownership */
-      thief->steals++;
-      (void)__sync_fetch_and_add(&slottee_preempt_steal_count, 1);
-      return w;
+    if (g->runnable_queue.count > best) {
+      best = g->runnable_queue.count;
+      victim = g;
     }
+  }
+  if (!victim || best == 0)
+    return 0;
+
+  if (!slottee_preempt_group_trylock(victim))
+    return 0;   /* contended: skip this round (try-lock → deadlock-free) */
+  w = slottee_user_lt_queue_dequeue(&victim->runnable_queue,
+      SLOTTEE_USER_LT_QUEUE_RUNNABLE);
+  if (w && w->migrated) {
+    /*
+     * Bound ping-pong: a worker migrates AT MOST ONCE.  An already-migrated
+     * worker is returned to its current owner instead of bouncing again, so
+     * total steals <= worker count over the whole run.
+     */
+    (void)slottee_user_lt_queue_enqueue(&victim->runnable_queue,
+        SLOTTEE_USER_LT_QUEUE_RUNNABLE, w);
+    slottee_preempt_group_lock_release(victim);
+    (void)__sync_fetch_and_add(&slottee_preempt_steal_skips, 1);
+    return 0;
+  }
+  slottee_preempt_group_lock_release(victim);
+  if (w && w->saved_ctx_valid) {
+    w->preempt_group = thief->scheduler_slot;   /* migrate ownership (once) */
+    w->migrated = 1;
+    thief->steals++;
+    (void)__sync_fetch_and_add(&slottee_preempt_steal_count, 1);
+    printf("[slottee] preempt_steal thief=%lu victim=%lu victim_count=%lu worker=%lu\r\n",
+        thief->scheduler_slot, victim->scheduler_slot, best, w->slot_id);
+    return w;
   }
   return 0;
 }
@@ -1810,6 +1844,7 @@ slottee_preempt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
     stats.host_yields = group->host_yields;
     stats.exit_switches = group->exit_switches;
     stats.steals = group->steals;
+    stats.steal_skips = slottee_preempt_steal_skips;
     stats.runnable_queue_depth = group->runnable_queue.count;
     stats.active = group->sched_active;
 

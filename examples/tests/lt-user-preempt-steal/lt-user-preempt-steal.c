@@ -124,6 +124,7 @@ preempt_steal_sched_entry(void* opaque)
   report.fairness_gap = stats.fairness_gap;
   report.fairness_violations = stats.fairness_violations;
   report.steals = stats.steals;
+  report.steal_skips = stats.steal_skips;
   for (uintptr_t w = 0; w < SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP; w++) {
     uintptr_t flat = group_id * SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP + w;
 

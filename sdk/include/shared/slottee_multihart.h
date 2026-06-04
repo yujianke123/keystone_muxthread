@@ -233,6 +233,7 @@ struct slottee_preempt_multihart_report {
   uintptr_t fairness_gap;
   uintptr_t fairness_violations;
   uintptr_t steals;
+  uintptr_t steal_skips;
   uintptr_t failures;
   uintptr_t per_worker_slot[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];
   uintptr_t per_worker_dispatch[SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP];

@@ -6196,21 +6196,25 @@ run_slottee_preempt_steal_test(const char* eapp_file,
 
   uintptr_t expect_total = (uintptr_t)SLOTTEE_PREEMPT_MULTIHART_GROUPS *
       (uintptr_t)SLOTTEE_PREEMPT_MULTIHART_WORKERS_PER_GROUP;
+  uintptr_t total_steal_skips = reports[0].steal_skips;  /* global counter */
   ok = ok && checksums_ok &&
       total_completed == expect_total &&
-      total_steals > 0;
+      total_steals > 0 &&
+      total_steals <= expect_total;   /* migrate-once bound: no unbounded ping-pong */
 
   slottee_trace_destroy(enclave);
 
   if (!ok) {
-    printf("[FAIL] preempt steal invalid (total_completed=%lu/%lu total_steals=%lu checksums_ok=%d)\n",
-        total_completed, expect_total, total_steals, (int)checksums_ok);
+    printf("[FAIL] preempt steal invalid (total_completed=%lu/%lu total_steals=%lu(<=%lu?) steal_skips=%lu checksums_ok=%d)\n",
+        total_completed, expect_total, total_steals, expect_total,
+        total_steal_skips, (int)checksums_ok);
     return 1;
   }
 
-  printf("[slottee] preempt_steal groups=%lu total_completed=%lu total_steals=%lu checksums_ok=%d hart0=%lu hart1=%lu ok=1\n",
+  printf("[slottee] preempt_steal groups=%lu total_completed=%lu total_steals=%lu(bounded<=%lu) steal_skips=%lu checksums_ok=%d hart0=%lu hart1=%lu ok=1\n",
       (uintptr_t)SLOTTEE_PREEMPT_MULTIHART_GROUPS, total_completed, total_steals,
-      (int)checksums_ok, sched_args[0].bound_hart, sched_args[1].bound_hart);
+      expect_total, total_steal_skips, (int)checksums_ok,
+      sched_args[0].bound_hart, sched_args[1].bound_hart);
   return 0;
 }
 
