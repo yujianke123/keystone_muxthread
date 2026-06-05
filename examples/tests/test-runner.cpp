@@ -6642,10 +6642,16 @@ run_matmul_combo(const char* eapp_file, const char* rt_file, const char* ld_file
   for (uintptr_t retry = 0;
        (ret == Keystone::Error::EdgeCallHost ||
         ret == Keystone::Error::EnclaveInterrupted) &&
-       retry < (uintptr_t)4000000;
+       retry < (uintptr_t)100000000;
        retry++) {
     if (ret == Keystone::Error::EdgeCallHost)
       incoming_call_dispatch(enclave.getSharedBuffer());
+    /* Throttle thread0's untimed busy-wait ping-pong (sbi_stop→resume) so it
+     * cannot exhaust the retry cap before the slow workers finish — required when
+     * the timer quantum is large/disabled (P4 no-preempt isolation), harmless
+     * otherwise. */
+    else if (ret == Keystone::Error::EnclaveInterrupted)
+      usleep(30);
 
     for (long g = 0; g < G; g++) {
       if (!started[g] && copied_slot_cap_ready_by_slot[sched_slot[g]]) {
