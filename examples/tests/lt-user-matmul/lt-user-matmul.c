@@ -181,6 +181,182 @@ matmul_sched_entry(void* opaque)
       SLOTTEE_LT_USER_OCALL_MAGIC : SLOTTEE_LT_USER_ILLEGAL_MAGIC);
 }
 
+/* P1 现场诊断（周期自检，fresh/persistent 共用）：A 行周期 128 → 正确的 C 满足
+ * C[i][j]==C[i&127][j]（i>=128）；记录不一致行数与第一个错误位置/值模式。 */
+static void
+matmul_report_diag(struct slottee_matmul_combo_report* report, long n)
+{
+  report->diag_valid = (uintptr_t)(n >= 256);
+  report->diag_mismatch_rows = 0;
+  if (!report->diag_valid)
+    return;
+  for (long i = 128; i < n; i++) {
+    long bad = 0;
+    for (long j = 0; j < n; j++) {
+      if (C[i][j] != C[i & 127][j]) {
+        if (!report->diag_mismatch_rows && !bad) {
+          report->diag_i = (uintptr_t)i;
+          report->diag_j = (uintptr_t)j;
+          report->diag_got = (uintptr_t)(unsigned int)C[i][j];
+          report->diag_ref = (uintptr_t)(unsigned int)C[i & 127][j];
+        }
+        bad = 1;
+      }
+    }
+    report->diag_mismatch_rows += (uintptr_t)bad;
+  }
+}
+
+/*
+ * ---- P2 persistent worker 模式 ----
+ * enter 一次（spawn_seq + G 个 PREEMPT_RUN）、worker 常驻任务循环；thread0 自跑
+ * 全 N sweep，每任务经 AMO 槽下发（ptask_epoch++ 发布，ptask_n==0 为哨兵退出），
+ * 每个 N 一份 report（OCALL 17 多次）。每任务 wall 不含 ENTER_SLOT 链 → 验证
+ * enter 摊销后的编排占比。任务间 worker 忙转 AMO poll（间隔短，实验环境可接受）。
+ */
+static long ptask_epoch;   /* thread0 每发布一个任务 +1 */
+static long ptask_n;       /* 当前任务 N；0 = 哨兵（worker 退出） */
+static long ptask_done;    /* 本任务完成 worker 数（AMO） */
+
+static void
+matmul_worker_persistent(void* opaque)
+{
+  long g = (long)(uintptr_t)opaque;
+  long seen = 0;
+
+  __sync_synchronize();   /* acquire: 读 cfg_groups/A/Bt 前（配对 thread0 release） */
+  for (;;) {
+    while (slottee_atomic_load(&ptask_epoch) == seen)
+      ;   /* 忙转等任务 */
+    seen = slottee_atomic_load(&ptask_epoch);
+    __sync_synchronize();   /* acquire: 任务数据(A/Bt/ptask_n)在 epoch 发布前就绪 */
+    long n = slottee_atomic_load(&ptask_n);
+    if (n == 0)
+      break;
+    long gc = cfg_groups;
+    long rows = n / gc;
+    long r0 = g * rows;
+    long r1 = (g == gc - 1) ? n : (r0 + rows);
+    unsigned long s = read_cycles();
+    matmul_rows(r0, r1, n);
+    unsigned long e = read_cycles();
+    if (g >= 0 && g < SLOTTEE_MATMUL_WORKERS) {
+      wdur[g] = e - s;
+      wr0[g] = (uintptr_t)r0;
+      wr1[g] = (uintptr_t)r1;
+    }
+    __sync_synchronize();   /* release: C 行块对 thread0 可见后再报完成 */
+    slottee_atomic_fetch_add(&ptask_done, 1);
+  }
+  EAPP_RETURN(SLOTTEE_LT_USER_OCALL_MAGIC);
+}
+
+static void
+matmul_sched_entry_persistent(void* opaque)
+{
+  uintptr_t saved_tp = slottee_read_tp();
+  long g = (long)(uintptr_t)opaque;
+  struct slottee_preempt_spec spec;
+  uintptr_t completed;
+
+  __sync_synchronize();
+  spec.fn = (uintptr_t)&matmul_worker_persistent;
+  spec.arg = (uintptr_t)g;
+  spec.slot = SLOTTEE_MATMUL_FIRST_WORKER_SLOT + cfg_groups + g;
+  completed = (uintptr_t)slottee_preempt_run(&spec, 1, 0 /*budget*/, 0 /*flags*/);
+  if (completed != 1)
+    slottee_atomic_fetch_add(&group_failed, 1);
+  slottee_atomic_fetch_add(&group_done, 1);
+  slottee_return_with_tp(saved_tp, completed == 1 ?
+      SLOTTEE_LT_USER_OCALL_MAGIC : SLOTTEE_LT_USER_ILLEGAL_MAGIC);
+}
+
+static void
+matmul_run_persistent_sweep(uintptr_t saved_tp)
+{
+  static const long sizes[SLOTTEE_MATMUL_NSIZES] = {16, 32, 64, 128, 256, 512};
+  struct slottee_matmul_combo_report report;
+  const unsigned long join_budget_cyc = 60000000000UL;
+  uintptr_t total_failures = 0;
+
+  slottee_atomic_store(&group_done, 0);
+  slottee_atomic_store(&group_failed, 0);
+  slottee_atomic_store(&ptask_epoch, 0);
+  slottee_atomic_store(&ptask_done, 0);
+  slottee_atomic_store(&ptask_n, -1);
+  __sync_synchronize();
+
+  /* enter 链只发生一次：spawn_seq 批量导出 → host 同轮 enter 全部 worker */
+  if (slottee_lt_spawn_seq(SLOTTEE_MATMUL_FIRST_WORKER_SLOT,
+          (uintptr_t)cfg_groups, matmul_sched_entry_persistent) !=
+      SBI_ERR_SM_ENCLAVE_SUCCESS)
+    slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
+
+  for (int si = 0; si < SLOTTEE_MATMUL_NSIZES; si++) {
+    long n = sizes[si];
+    unsigned long t0, t1, join_start;
+
+    matmul_fill(n);
+    memset(wdur, 0, sizeof(wdur));
+    memset(wr0, 0, sizeof(wr0));
+    memset(wr1, 0, sizeof(wr1));
+    slottee_atomic_store(&ptask_done, 0);
+    slottee_atomic_store(&ptask_n, n);
+    __sync_synchronize();   /* release: A/Bt + 任务参数就绪后再发布 epoch */
+
+    t0 = read_cycles();
+    slottee_atomic_fetch_add(&ptask_epoch, 1);   /* 发布任务 */
+    join_start = read_cycles();
+    while (slottee_atomic_load(&ptask_done) < cfg_groups) {
+      (void)slottee_lt_host_yield();
+      if (read_cycles() - join_start > join_budget_cyc) {
+        slottee_atomic_fetch_add(&group_failed, 1);
+        break;
+      }
+    }
+    t1 = read_cycles();
+    __sync_synchronize();   /* acquire: 读 worker 写的 C/wdur 前 */
+
+    memset(&report, 0, sizeof(report));
+    report.magic = SLOTTEE_MATMUL_MAGIC;
+    report.n = n;
+    report.groups = cfg_groups;
+    report.wall_cycles = t1 - t0;
+    for (long g = 0; g < cfg_groups && g < SLOTTEE_MATMUL_WORKERS; g++) {
+      report.worker_compute[g] = wdur[g];
+      if (wdur[g] > report.max_compute)
+        report.max_compute = wdur[g];
+      report.sum_compute += wdur[g];
+      report.worker_r0[g] = wr0[g];
+      report.worker_r1[g] = wr1[g];
+    }
+    report.checksum = matmul_checksum(n);
+    report.failures = (uintptr_t)slottee_atomic_load(&group_failed);
+    matmul_report_diag(&report, n);
+    if (ocall(OCALL_MATMUL_REPORT, &report, sizeof(report), 0, 0) != 0)
+      report.failures++;
+    total_failures += report.failures;
+  }
+
+  /* 哨兵：worker 退出 → scheduler LT 返回 → group_done 收敛 */
+  slottee_atomic_store(&ptask_n, 0);
+  __sync_synchronize();
+  slottee_atomic_fetch_add(&ptask_epoch, 1);
+  {
+    unsigned long join_start = read_cycles();
+    while (slottee_atomic_load(&group_done) < cfg_groups) {
+      (void)slottee_lt_host_yield();
+      if (read_cycles() - join_start > join_budget_cyc) {
+        total_failures++;
+        break;
+      }
+    }
+  }
+
+  slottee_return_with_tp(saved_tp, total_failures ?
+      SLOTTEE_LT_USER_ILLEGAL_MAGIC : SLOTTEE_LT_USER_OCALL_MAGIC);
+}
+
 void EAPP_ENTRY
 eapp_entry()
 {
@@ -191,13 +367,22 @@ eapp_entry()
 
   memset(&cfg, 0, sizeof(cfg));
   if (ocall(OCALL_GET_MATMUL_CONFIG, 0, 0, &cfg, sizeof(cfg)) != 0 ||
-      cfg.magic != SLOTTEE_MATMUL_MAGIC || cfg.n <= 0 ||
-      cfg.n > SLOTTEE_MATMUL_MAXN || cfg.groups < 0 ||
+      cfg.magic != SLOTTEE_MATMUL_MAGIC || cfg.groups < 0 ||
       cfg.groups > SLOTTEE_MATMUL_WORKERS)
     slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
 
-  cfg_n = cfg.n;
   cfg_groups = cfg.groups;
+
+  /* P2 persistent 模式：n 由 eapp 内部 sweep（config.n 不用）；groups>=1。 */
+  if (cfg.persistent) {
+    if (cfg_groups < 1)
+      slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
+    matmul_run_persistent_sweep(saved_tp);   /* noreturn */
+  }
+
+  if (cfg.n <= 0 || cfg.n > SLOTTEE_MATMUL_MAXN)
+    slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
+  cfg_n = cfg.n;
 
   matmul_fill(cfg_n);
   /*
@@ -284,31 +469,7 @@ eapp_entry()
     }
   }
 
-  /*
-   * P1 现场诊断（周期自检）：A 行周期 128（7*128≡0 mod128 → A[i+128]=A[i]）→
-   * 正确的 C 必满足 C[i][j]==C[i&127][j]（i>=128）。任一 band 算错时这里在
-   * enclave 内当场定位错误行/列与值模式（零输入/被踩/索引错），随 report 带回
-   * host 在 [retry]/[FAIL] 时打印。N>=256 才有参照（diag_valid）；O(N^2) 只读。
-   */
-  report.diag_valid = (uintptr_t)(cfg_n >= 256);
-  report.diag_mismatch_rows = 0;
-  if (report.diag_valid) {
-    for (long i = 128; i < cfg_n; i++) {
-      long bad = 0;
-      for (long j = 0; j < cfg_n; j++) {
-        if (C[i][j] != C[i & 127][j]) {
-          if (!report.diag_mismatch_rows && !bad) {
-            report.diag_i = (uintptr_t)i;
-            report.diag_j = (uintptr_t)j;
-            report.diag_got = (uintptr_t)(unsigned int)C[i][j];
-            report.diag_ref = (uintptr_t)(unsigned int)C[i & 127][j];
-          }
-          bad = 1;
-        }
-      }
-      report.diag_mismatch_rows += (uintptr_t)bad;
-    }
-  }
+  matmul_report_diag(&report, cfg_n);   /* P1 现场诊断（共用函数） */
 
   if (ocall(OCALL_MATMUL_REPORT, &report, sizeof(report), 0, 0) != 0)
     report.failures++;

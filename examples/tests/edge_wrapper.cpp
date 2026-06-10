@@ -132,10 +132,17 @@ reset_ledger_state(void)
 void
 set_matmul_config(long n, long groups)
 {
+  set_matmul_config_ex(n, groups, 0);
+}
+
+void
+set_matmul_config_ex(long n, long groups, long persistent)
+{
   memset(&matmul_config, 0, sizeof(matmul_config));
   matmul_config.magic = SLOTTEE_MATMUL_MAGIC;
   matmul_config.n = n;
   matmul_config.groups = groups;
+  matmul_config.persistent = (uintptr_t)persistent;
 }
 
 void
@@ -479,10 +486,19 @@ get_matmul_config_wrapper(void* buffer) {
     edge_call->return_data.call_status = CALL_STATUS_OK;
 }
 
+static int matmul_report_seq;   /* P2: persistent 模式 host 逐份收 report 的序号 */
+
 static void
 copy_matmul_report(void* buffer, size_t size) {
-  if (size == sizeof(copied_matmul_report))
+  if (size == sizeof(copied_matmul_report)) {
     memcpy(&copied_matmul_report, buffer, size);
+    matmul_report_seq++;
+  }
+}
+
+int
+get_matmul_report_seq(void) {
+  return matmul_report_seq;
 }
 
 void

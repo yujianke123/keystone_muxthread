@@ -6661,11 +6661,29 @@ run_matmul_combo(const char* eapp_file, const char* rt_file, const char* ld_file
 
   ret = enclave.runRaw(&value);
   uintptr_t idle_spins = 0;   /* 连续 EnclaveInterrupted 计数（P3 adaptive sleep） */
+  /*
+   * P1 fault 闭合：组合级 wall-clock 超时（时间制）。0x186a8 类 fault 落在
+   * scheduler 链上时既有重试机制不闭合（实测可卡死 35min+）；超时即放弃本次
+   * 尝试 → 强拆 enclave（解卡 in-flight ioctl）→ join → 返回 rc=1 → 外层
+   * fresh-enclave retry 接管。阈值 600e9 cyc 对正常组合（最长 ~1.5e9 compute
+   * + 编排）与 no-timer 慢模式都留足余量。
+   */
+  const uintptr_t combo_timeout_cyc = 600000000000ULL;
+  uintptr_t combo_start = read_cycle_counter();
+  bool combo_timed_out = false;
   for (uintptr_t retry = 0;
        (ret == Keystone::Error::EdgeCallHost ||
         ret == Keystone::Error::EnclaveInterrupted) &&
        retry < (uintptr_t)100000000;
        retry++) {
+    if ((retry & 0xff) == 0 &&
+        read_cycle_counter() - combo_start > combo_timeout_cyc) {
+      combo_timed_out = true;
+      printf("[timeout] matmul combo N=%ld G=%ld exceeded budget; destroying enclave for retry\n",
+          N, G);
+      fflush(stdout);
+      break;
+    }
     if (ret == Keystone::Error::EdgeCallHost) {
       incoming_call_dispatch(enclave.getSharedBuffer());
       idle_spins = 0;
@@ -6721,6 +6739,16 @@ run_matmul_combo(const char* eapp_file, const char* rt_file, const char* ld_file
       break;
   }
 
+  if (combo_timed_out) {
+    /* P1：先强拆（让卡在 enterSlot/resume ioctl 里的 worker pthread 解卡返回），
+     * 再 join，避免 join 卡死；本次按失败计，外层 fresh-enclave retry 接管。 */
+    slottee_trace_destroy(enclave);
+    for (long g = 0; g < G; g++)
+      if (started[g])
+        pthread_join(th[g], NULL);
+    return 1;
+  }
+
   for (long g = 0; g < G; g++)
     if (started[g])
       pthread_join(th[g], NULL);
@@ -6732,10 +6760,171 @@ run_matmul_combo(const char* eapp_file, const char* rt_file, const char* ld_file
       out->magic == SLOTTEE_MATMUL_MAGIC && out->failures == 0) ? 0 : 1;
 }
 
+/*
+ * P2 persistent worker 模式：一次 enclave init + 一次 enter G 个 worker（spawn_seq
+ * 批量导出），eapp 自跑全 N sweep（每任务经 AMO 槽下发、每 N 一份 report），host
+ * 逐份收集——每任务 wall 不含 ENTER_SLOT 链，验证 enter 摊销后的编排占比。
+ * SLOTTEE_MATMUL_PERSISTENT=<G> 启用（与 fresh 模式并存，口径论文双列）。
+ */
+static int
+run_persistent_matmul_test(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params, long G)
+{
+  static const long sizes[SLOTTEE_MATMUL_NSIZES] = {16, 32, 64, 128, 256, 512};
+  struct slottee_matmul_combo_report reports[SLOTTEE_MATMUL_NSIZES];
+  Keystone::Enclave enclave;
+  pthread_t th[SLOTTEE_MATMUL_WORKERS];
+  slottee_multihart_worker_arg args[SLOTTEE_MATMUL_WORKERS];
+  int started[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t sched_slot[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t value = 0;
+  Keystone::Error ret;
+  int collected = 0;
+  int last_seq = 0;
+  bool ok = true;
+
+  if (G < 1 || G > SLOTTEE_MATMUL_WORKERS) {
+    printf("[FAIL] matmul persistent invalid G=%ld\n", G);
+    return 1;
+  }
+  printf("matmul,psetup,harts=%ld,threads=%ld,mode=persistent,metric=rdcycle_in_enclave_compute\n",
+      sysconf(_SC_NPROCESSORS_ONLN), G);
+  fflush(stdout);
+
+  memset(reports, 0, sizeof(reports));
+  memset(th, 0, sizeof(th));
+  memset(args, 0, sizeof(args));
+  memset(started, 0, sizeof(started));
+  params.setFreeMemSize(24 * 1024 * 1024);
+  params.setUntrustedSize(256 * 1024);
+  set_matmul_config_ex(0 /*n unused*/, G, 1 /*persistent*/);
+  reset_matmul_report();
+  reset_copied_slot_caps();
+  for (long g = 0; g < G; g++)
+    sched_slot[g] = SLOTTEE_MATMUL_FIRST_WORKER_SLOT + g;
+
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] matmul persistent init enclave\n");
+    return 1;
+  }
+  edge_init(&enclave);
+
+  ret = enclave.runRaw(&value);
+  uintptr_t idle_spins = 0;
+  const uintptr_t sweep_timeout_cyc = 1200000000000ULL;   /* 整 sweep 上限（P1 同型兜底） */
+  uintptr_t sweep_start = read_cycle_counter();
+  bool timed_out = false;
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost ||
+        ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < (uintptr_t)100000000;
+       retry++) {
+    if ((retry & 0xff) == 0 &&
+        read_cycle_counter() - sweep_start > sweep_timeout_cyc) {
+      timed_out = true;
+      printf("[timeout] matmul persistent sweep exceeded budget\n");
+      fflush(stdout);
+      break;
+    }
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      idle_spins = 0;
+      int seq = get_matmul_report_seq();
+      if (seq > last_seq && collected < SLOTTEE_MATMUL_NSIZES) {
+        get_matmul_report(&reports[collected]);
+        collected++;
+        last_seq = seq;
+      }
+    } else if (ret == Keystone::Error::EnclaveInterrupted) {
+      idle_spins++;
+      if (idle_spins > 4096)
+        usleep(50);
+      else if (idle_spins > 256)
+        usleep(5);
+    }
+    for (long g = 0; g < G; g++) {
+      if (!started[g] && copied_slot_cap_ready_by_slot[sched_slot[g]]) {
+        memset(&args[g], 0, sizeof(args[g]));
+        args[g].enclave = &enclave;
+        args[g].cap = copied_slot_caps[sched_slot[g]];
+        args[g].slot_id = sched_slot[g];
+        args[g].resume_limit = (uintptr_t)100000000;
+        args[g].ret = Keystone::Error::DeviceError;
+        if (pthread_create(&th[g], NULL, slottee_multihart_worker, &args[g]) != 0) {
+          printf("[FAIL] matmul persistent pthread g=%ld\n", g);
+          slottee_trace_destroy(enclave);
+          return 1;
+        }
+        started[g] = 1;
+        idle_spins = 257;
+        sched_yield();
+      }
+    }
+    sched_yield();
+    ret = enclave.resume(&value);
+    if (ret == Keystone::Error::Success && value == SLOTTEE_LT_USER_OCALL_MAGIC)
+      break;
+  }
+
+  if (timed_out) {
+    slottee_trace_destroy(enclave);
+    for (long g = 0; g < G; g++)
+      if (started[g])
+        pthread_join(th[g], NULL);
+    printf("[FAIL] matmul persistent timed out (collected=%d)\n", collected);
+    return 1;
+  }
+
+  for (long g = 0; g < G; g++)
+    if (started[g])
+      pthread_join(th[g], NULL);
+  slottee_trace_destroy(enclave);
+
+  /* 汇总：每任务 wall 不含 enter 链 → orch_pct=(wall-max_compute)/wall */
+  bool run_ok = (ret == Keystone::Error::Success &&
+      value == SLOTTEE_LT_USER_OCALL_MAGIC && collected == SLOTTEE_MATMUL_NSIZES);
+  if (!run_ok) {
+    printf("[FAIL] matmul persistent run (ret-ok=%d collected=%d)\n",
+        (int)(ret == Keystone::Error::Success), collected);
+    ok = false;
+  }
+  for (int i = 0; i < collected; i++) {
+    struct slottee_matmul_combo_report* r = &reports[i];
+    bool csum_ok = (r->checksum == matmul_host_checksum(r->n));
+    double w = (double)r->wall_cycles;
+    double c = (double)r->max_compute;
+    double orch = (w > 0) ? (w - c) / w * 100.0 : 0.0;
+    if (!csum_ok || r->failures) {
+      ok = false;
+      printf("[FAIL] matmul persistent N=%ld csum_ok=%d failures=%lu\n",
+          r->n, (int)csum_ok, r->failures);
+      if (r->diag_valid)
+        printf("[diag]  N=%ld mismatch_rows=%lu first=(%lu,%lu) got=%lu ref=%lu\n",
+            r->n, r->diag_mismatch_rows, r->diag_i, r->diag_j, r->diag_got, r->diag_ref);
+    }
+    printf("matmul,pcombo,N=%ld,threads=%ld,max_compute=%lu,sum_compute=%lu,wall=%lu,orch_pct=%.2f,csum_ok=%d\n",
+        r->n, G, r->max_compute, r->sum_compute, r->wall_cycles, orch, (int)csum_ok);
+  }
+  fflush(stdout);
+  (void)sizes;
+
+  if (ok)
+    printf("[slottee] matmul persistent sweep ok=1 (threads=%ld, enter amortized over %d tasks)\n",
+        G, collected);
+  else
+    printf("[FAIL] matmul persistent sweep had failures\n");
+  return ok ? 0 : 1;
+}
+
 static int
 run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
     const char* ld_file, Keystone::Params params)
 {
+  /* P2：SLOTTEE_MATMUL_PERSISTENT=<G> 切 persistent worker 模式（fresh 模式不变） */
+  const char* pers = getenv("SLOTTEE_MATMUL_PERSISTENT");
+  if (pers && atol(pers) >= 1)
+    return run_persistent_matmul_test(eapp_file, rt_file, ld_file, params, atol(pers));
+
   static const long sizes[SLOTTEE_MATMUL_NSIZES] = {16, 32, 64, 128, 256, 512};
   /* G=0：真正的 Keystone 单线程基线（thread0 直跑 kernel，零 SlotTEE 机制）；
    * G=1：SlotTEE 单 worker（量化 SlotTEE 单线程调度开销）；G=2/4：SlotTEE 多线程。 */

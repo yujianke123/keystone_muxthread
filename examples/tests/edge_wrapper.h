@@ -70,6 +70,8 @@ void reset_ledger_state(void);
 void get_matmul_config_wrapper(void* buffer);
 void copy_matmul_report_wrapper(void* buffer);
 void set_matmul_config(long n, long groups);
+void set_matmul_config_ex(long n, long groups, long persistent);
+int get_matmul_report_seq(void);
 void get_matmul_report(struct slottee_matmul_combo_report* report);
 void reset_matmul_report(void);
 

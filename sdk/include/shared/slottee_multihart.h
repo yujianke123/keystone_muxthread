@@ -190,6 +190,9 @@ struct slottee_matmul_config {
   uintptr_t magic;
   long n;        /* 矩阵规模 N */
   long groups;   /* 线程数 G（1=单线程基线，2/4=SlotTEE 多线程） */
+  /* P2 persistent worker 模式（尾部追加）：1 = enter 一次、worker 常驻，eapp 自跑
+   * 全 N sweep、每任务经 AMO 槽下发、每 N 一份 report —— ENTER_SLOT 链摊销验证。 */
+  uintptr_t persistent;
 };
 
 /* eapp → host：单组合报告。host 把 18 个组合聚合成 speedup/sync% 表 + 绘图。 */
