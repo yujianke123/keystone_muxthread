@@ -15,6 +15,7 @@ void slottee_set_user_entry(uintptr_t entry);
 uintptr_t slottee_slot_request(uintptr_t policy_ptr);
 uintptr_t slottee_slot_release(uintptr_t slot_id);
 uintptr_t slottee_lt_spawn(uintptr_t slot_id, uintptr_t fn, uintptr_t arg);
+uintptr_t slottee_lt_spawn_seq(uintptr_t first_slot, uintptr_t count, uintptr_t fn);
 uintptr_t slottee_lt_wait_value(
     struct encl_ctx* ctx, uintptr_t user_ptr, uintptr_t target, uintptr_t op);
 uintptr_t slottee_lt_notify_value(struct encl_ctx* ctx, uintptr_t user_ptr);

@@ -71,6 +71,11 @@ slottee_lt_host_yield(void) {
 }
 
 int
+slottee_lt_spawn_seq(uintptr_t first_slot, uintptr_t count, slottee_lt_fn_t fn) {
+  return SYSCALL_3(RUNTIME_SYSCALL_SLOTTEE_LT_SPAWN_SEQ, first_slot, count, fn);
+}
+
+int
 slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats) {
   return SYSCALL_1(RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS, stats);
 }

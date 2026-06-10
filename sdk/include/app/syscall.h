@@ -79,6 +79,9 @@ int
 slottee_lt_host_yield(void);
 
 int
+slottee_lt_spawn_seq(uintptr_t first_slot, uintptr_t count, slottee_lt_fn_t fn);
+
+int
 slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats);
 
 int

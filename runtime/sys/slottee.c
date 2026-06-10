@@ -1494,21 +1494,27 @@ slottee_slot_trampoline(uintptr_t slot_token)
   return slottee_slot_trampoline_with_arg(slot_token, 0, 0);
 }
 
+/*
+ * 一次 edge-call 导出 count 个 cap（R4a 批量导出）。单 cap 导出 = count==1。
+ * 批量化把 spawn 链的 G 次 OCALL 往返收敛为 1 次，使 host 同轮看到全部 cap、
+ * G 个 worker pthread 同时进入（消除 worker 错峰开始——编排 wall 的大头）。
+ */
 static uintptr_t
-slottee_lt_export_cap(const struct slot_cap_t* cap)
+slottee_lt_export_caps(const struct slot_cap_t* caps, uintptr_t count)
 {
   struct edge_call* edge_call = (struct edge_call*)shared_buffer;
   uintptr_t buffer_data_start = edge_call_data_ptr();
 
-  if (!cap || sizeof(*cap) > shared_buffer_size -
+  if (!caps || count == 0 || count >= SLOTTEE_MAX_SLOTS ||
+      count * sizeof(*caps) > shared_buffer_size -
           (buffer_data_start - shared_buffer))
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   edge_call->call_id = SLOTTEE_LT_SPAWN_OCALL_COPY_SLOT_CAP;
-  memcpy((void*)buffer_data_start, cap, sizeof(*cap));
+  memcpy((void*)buffer_data_start, caps, count * sizeof(*caps));
 
   if (edge_call_setup_call(edge_call, (void*)buffer_data_start,
-          sizeof(*cap)) != 0)
+          count * sizeof(*caps)) != 0)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   if (sbi_stop_enclave(STOP_EDGE_CALL_HOST) != 0)
@@ -1518,6 +1524,12 @@ slottee_lt_export_cap(const struct slot_cap_t* cap)
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
 
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+static uintptr_t
+slottee_lt_export_cap(const struct slot_cap_t* cap)
+{
+  return slottee_lt_export_caps(cap, 1);
 }
 
 static uintptr_t
@@ -1642,6 +1654,66 @@ slottee_lt_spawn(uintptr_t slot_id, uintptr_t fn, uintptr_t arg)
   }
 
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+/*
+ * R4a 批量 spawn：在连续 slot [first_slot, first_slot+count) 上登记同一入口 fn
+ * （arg = 组内序号 g），cap 全部 mint 后**一次** edge-call 批量导出。相对 G 次
+ * slottee_lt_spawn（每次一个 OCALL 往返），spawn 链从 G×RTT 收敛为 1×RTT，
+ * host 同轮 spawn 全部 worker pthread → 消除 worker 错峰开始。
+ * 失败时反登记本次已登记的 entries（cap 已 mint 无副作用，epoch/lease 由 SM 管）。
+ */
+uintptr_t
+slottee_lt_spawn_seq(uintptr_t first_slot, uintptr_t count, uintptr_t fn)
+{
+  struct slot_cap_t caps[SLOTTEE_MAX_SLOTS];
+  struct mint_slot_cap_req_t req;
+  struct mint_slot_cap_resp_t resp;
+  uintptr_t ret;
+  uintptr_t g;
+
+  if (first_slot == 0 || count == 0 ||
+      first_slot + count > SLOTTEE_MAX_SLOTS ||
+      !slottee_user_entry_addr_ok(fn))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  for (g = 0; g < count; g++) {
+    uintptr_t slot_id = first_slot + g;
+
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    req.version = SLOTTEE_MINT_CAP_VERSION;
+    req.slot_id = slot_id;
+    req.cap_seq = SLOTTEE_DEFAULT_CAP_SEQ;
+    req.rights = SLOTTEE_CAP_RIGHT_ENTER;
+    req.max_lease_cycles = SLOTTEE_DEFAULT_MAX_LEASE_CYCLES;
+
+    ret = sbi_mint_slot_cap((uintptr_t)&req, (uintptr_t)&resp);
+    if (resp.status)
+      ret = resp.status;
+    if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
+      goto unwind;
+
+    slottee_lt_entries[slot_id].slot_id = slot_id;
+    slottee_lt_entries[slot_id].fn = fn;
+    slottee_lt_entries[slot_id].arg = g;
+    __sync_synchronize();
+    slottee_lt_entries[slot_id].registered = 1;
+    caps[g] = resp.cap;
+  }
+
+  ret = slottee_lt_export_caps(caps, count);
+  if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
+    goto unwind;
+
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+
+unwind:
+  while (g > 0) {
+    g--;
+    slottee_lt_entries[first_slot + g].registered = 0;
+  }
+  return ret;
 }
 
 uintptr_t

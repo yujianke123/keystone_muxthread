@@ -22,6 +22,8 @@
 /* timer-independent 轻量让出：仅 stop 到 host 让 resume loop 推进，不注册 wait
  * queue、不依赖 notify/timer——用于纯 AMO poll 型 join（no-preempt 模式可用）。 */
 #define RUNTIME_SYSCALL_SLOTTEE_LT_HOST_YIELD 1014
+/* R4a 批量 spawn：连续 slot 同一入口(arg=组内序号)，cap 一次性批量导出（1 次 OCALL RTT） */
+#define RUNTIME_SYSCALL_SLOTTEE_LT_SPAWN_SEQ 1015
 #define RUNTIME_SYSCALL_EXIT                1101
 
 #define SLOTTEE_LT_WAIT_OP_EQ          0

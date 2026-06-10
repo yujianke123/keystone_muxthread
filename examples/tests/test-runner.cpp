@@ -6606,6 +6606,27 @@ matmul_host_checksum(long n)
   return acc;
 }
 
+/* R1 配置过滤：SLOTTEE_MATMUL_ONLY="256:2,256:4,512:2,512:4" 只跑列出的 (N,G)
+ * 组合——no-timer / icount 等慢模式聚焦脆弱组合攒统计样本用。未设置 = 全扫。 */
+static bool
+matmul_combo_selected(const char* only, long N, long G)
+{
+  char tok[32];
+  size_t tl;
+  const char* p = only;
+
+  snprintf(tok, sizeof(tok), "%ld:%ld", N, G);
+  tl = strlen(tok);
+  while ((p = strstr(p, tok)) != NULL) {
+    bool head = (p == only || p[-1] == ',');
+    bool tail = (p[tl] == '\0' || p[tl] == ',');
+    if (head && tail)
+      return true;
+    p += tl;
+  }
+  return false;
+}
+
 /* 跑一个 (N, G) 组合：fresh enclave，host 进 G 个 scheduler slot（落在不同 hart），
  * eapp 用 PREEMPT_RUN 让 G 个 worker 并行算 C 的行块；收一份 combo 报告。 */
 static int
@@ -6650,16 +6671,27 @@ run_matmul_combo(const char* eapp_file, const char* rt_file, const char* ld_file
       idle_spins = 0;
     } else if (ret == Keystone::Error::EnclaveInterrupted) {
       /*
-       * P3 adaptive sleep：thread0 poll join 期间每次 stop→resume 都走这里——
-       * 固定 usleep(30) 在 N=512 4线程下贡献了 host 编排 wall 的大头。改为
-       * 前 256 次忙转不睡（worker 即将完成的常见路径），之后小睡渐增，仍保住
-       * no-preempt 模式不耗尽重试上界（P4 修复的目的）。
+       * R4b worker-done 感知：全部 worker pthread 已写回完成标志(args[g].ret 不再是
+       * DeviceError 初值)后，thread0 的 poll 即将命中 group_done==G——此时密集
+       * resume(不睡)把 join 发现延迟压到最小；worker 运行期则按 adaptive sleep
+       * 稀疏 poll(前 256 次忙转不睡→5µs→50µs)，兼顾 no-preempt 模式不忙转。
+       * args[g].ret 由 worker 线程单调一次写，host 弱一致读到旧值仅多睡一轮，无害。
        */
-      idle_spins++;
-      if (idle_spins > 4096)
-        usleep(50);
-      else if (idle_spins > 256)
-        usleep(5);
+      bool workers_done = (G > 0);
+      for (long g = 0; g < G; g++)
+        if (!started[g] || args[g].ret == Keystone::Error::DeviceError) {
+          workers_done = false;
+          break;
+        }
+      if (workers_done) {
+        idle_spins = 0;
+      } else {
+        idle_spins++;
+        if (idle_spins > 4096)
+          usleep(50);
+        else if (idle_spins > 256)
+          usleep(5);
+      }
     }
 
     for (long g = 0; g < G; g++) {
@@ -6676,8 +6708,10 @@ run_matmul_combo(const char* eapp_file, const char* rt_file, const char* ld_file
           return 1;
         }
         started[g] = 1;
-        idle_spins = 0;
-        /* P3 batch spawn：同一轮把所有 ready 的 cap 都 spawn，不再每个 usleep(500) */
+        /* R4 修正：spawn 轮直接进小睡档（而非清零密集 resume）——批量导出后 G 个
+         * ENTER_SLOT 同窗进行，thread0 密集 resume 会与它们争 driver/SM 路径，
+         * 实测使 G=4 小中 N 的编排爆炸；让 thread0 退让，enter 全速完成。 */
+        idle_spins = 257;
         sched_yield();
       }
     }
@@ -6713,8 +6747,9 @@ run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
   int total_retries = 0;
 
   memset(grid, 0, sizeof(grid));
-  printf("matmul,setup,harts=%ld,sizes=16..512,threads=0/1/2/4,g0=keystone_direct,metric=rdcycle_in_enclave_compute\n",
-      online_harts);
+  const char* only = getenv("SLOTTEE_MATMUL_ONLY");   /* R1 配置过滤 */
+  printf("matmul,setup,harts=%ld,sizes=16..512,threads=0/1/2/4,g0=keystone_direct,metric=rdcycle_in_enclave_compute%s%s\n",
+      online_harts, only ? ",only=" : "", only ? only : "");
   fflush(stdout);
 
   for (int si = 0; si < SLOTTEE_MATMUL_NSIZES; si++) {
@@ -6722,6 +6757,8 @@ run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
     uintptr_t expect_csum = matmul_host_checksum(N);
     for (int gi = 0; gi < 4; gi++) {
       long G = gset[gi];
+      if (only && !matmul_combo_selected(only, N, G))
+        continue;   /* R1: 未选中组合跳过（grid 留 0，汇总行除零已有保护） */
       struct slottee_matmul_combo_report* r = &grid[si][gi];
       int rc = 0;
       bool csum_ok = false;

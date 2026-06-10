@@ -269,13 +269,17 @@ copy_slot_cap_wrapper(void* buffer) {
   uintptr_t call_args;
   size_t args_len;
 
+  /* R4a 批量导出兼容：载荷为 k 个连续 slot_cap_t（k>=1），逐个登记。
+   * 单 cap 路径（既有 slottee_lt_spawn）= k==1，行为不变。 */
   if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
-      args_len != sizeof(struct slot_cap_t)) {
+      args_len == 0 || args_len % sizeof(struct slot_cap_t) != 0 ||
+      args_len / sizeof(struct slot_cap_t) >= SLOTTEE_MAX_SLOTS) {
     edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
     return;
   }
 
-  copy_slot_cap((void*)call_args, args_len);
+  for (size_t off = 0; off < args_len; off += sizeof(struct slot_cap_t))
+    copy_slot_cap((void*)(call_args + off), sizeof(struct slot_cap_t));
   edge_call->return_data.call_status = CALL_STATUS_OK;
 }
 

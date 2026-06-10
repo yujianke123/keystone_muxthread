@@ -187,7 +187,6 @@ eapp_entry()
   uintptr_t saved_tp = slottee_read_tp();
   struct slottee_matmul_config cfg;
   struct slottee_matmul_combo_report report;
-  uintptr_t budget = 1u << 20;
   unsigned long t0, t1;
 
   memset(&cfg, 0, sizeof(cfg));
@@ -237,24 +236,33 @@ eapp_entry()
     memset(wr1, 0, sizeof(wr1));
 
     t0 = read_cycles();
-    for (long g = 0; g < cfg_groups; g++) {
-      if (slottee_lt_spawn(SLOTTEE_MATMUL_FIRST_WORKER_SLOT + g, matmul_sched_entry,
-              (void*)(uintptr_t)g) != SBI_ERR_SM_ENCLAVE_SUCCESS)
-        slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
-    }
+    /* R4a 批量 spawn：G 个 scheduler slot 的 cap 一次 OCALL 批量导出（原 G 次往返），
+     * host 同轮 spawn 全部 worker pthread → 消除 worker 错峰开始（编排 wall 大头）。
+     * arg=组内序号 g 由 RT 登记（语义同原 per-slot spawn(slot, fn, g)）。 */
+    if (slottee_lt_spawn_seq(SLOTTEE_MATMUL_FIRST_WORKER_SLOT, (uintptr_t)cfg_groups,
+            matmul_sched_entry) != SBI_ERR_SM_ENCLAVE_SUCCESS)
+      slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
 
-    while (slottee_atomic_load(&group_done) < cfg_groups) {
-      /*
-       * P2: timer-independent join——worker 用 AMO 更新 group_done（见
-       * matmul_sched_entry），thread0 纯 poll + 轻量让出 host（host_yield 仅
-       * stop 到 host 让 resume loop 推进 spawn/续跑，不注册 wait queue、不依赖
-       * notify/timer）。由此 N=512 G=2/4 可在 huge-quantum / no-preempt 模式
-       * 运行（timer 依赖性对照实验），正常模式行为等价。
-       */
-      (void)slottee_lt_host_yield();
-      if (--budget == 0) {
-        slottee_atomic_fetch_add(&group_failed, 1);
-        break;
+    /* R3: join 预算改时间制（rdcycle）。次数制(原 1<<20 次 poll)在 no-timer 慢
+     * poll 节奏(WSL ms 级 sleep 粒度)下 ~17 分钟即假烧穿造成"准活锁"观感；
+     * 60e9 cyc 远大于最长 worker(N=512 G1 ~1.4e9)，仍能防真活锁。 */
+    {
+      const unsigned long join_budget_cyc = 60000000000UL;
+      unsigned long join_start = read_cycles();
+
+      while (slottee_atomic_load(&group_done) < cfg_groups) {
+        /*
+         * P2: timer-independent join——worker 用 AMO 更新 group_done（见
+         * matmul_sched_entry），thread0 纯 poll + 轻量让出 host（host_yield 仅
+         * stop 到 host 让 resume loop 推进 spawn/续跑，不注册 wait queue、不依赖
+         * notify/timer）。由此 N=512 G=2/4 可在 huge-quantum / no-preempt 模式
+         * 运行（timer 依赖性对照实验），正常模式行为等价。
+         */
+        (void)slottee_lt_host_yield();
+        if (read_cycles() - join_start > join_budget_cyc) {
+          slottee_atomic_fetch_add(&group_failed, 1);
+          break;
+        }
       }
     }
     t1 = read_cycles();
