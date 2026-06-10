@@ -338,6 +338,9 @@ void handle_syscall(struct encl_ctx* ctx)
   case(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_STATS):
     ret = slottee_preempt_collect_stats(ctx, arg0);
     break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_HOST_YIELD):
+    ret = slottee_lt_host_yield();
+    break;
 
 
 #ifdef USE_LINUX_SYSCALL

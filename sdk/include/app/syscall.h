@@ -76,6 +76,9 @@ int
 slottee_lt_notify_value(const long* ptr);
 
 int
+slottee_lt_host_yield(void);
+
+int
 slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats);
 
 int

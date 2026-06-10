@@ -66,6 +66,11 @@ slottee_lt_notify_value(const long* ptr) {
 }
 
 int
+slottee_lt_host_yield(void) {
+  return SYSCALL_0(RUNTIME_SYSCALL_SLOTTEE_LT_HOST_YIELD);
+}
+
+int
 slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats) {
   return SYSCALL_1(RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS, stats);
 }

@@ -37,9 +37,11 @@ static int C[SLOTTEE_MATMUL_MAXN][SLOTTEE_MATMUL_MAXN];
 
 static long cfg_n;          /* 当前矩阵规模 N */
 static long cfg_groups;     /* 当前线程数 G */
-static long group_done;     /* 已完成的组数（wait/notify 汇合） */
+static long group_done;     /* 已完成的组数（worker AMO 更新，thread0 纯 poll join） */
 static long group_failed;
 static unsigned long wdur[SLOTTEE_MATMUL_WORKERS];   /* 每 worker 自计 compute 周期 */
+static uintptr_t wr0[SLOTTEE_MATMUL_WORKERS];        /* P1 诊断: 每 worker 实际行区间 */
+static uintptr_t wr1[SLOTTEE_MATMUL_WORKERS];
 
 static unsigned long
 read_cycles(void)
@@ -141,8 +143,11 @@ matmul_worker(void* opaque)
   s = read_cycles();
   matmul_rows(r0, r1, n);
   e = read_cycles();
-  if (g >= 0 && g < SLOTTEE_MATMUL_WORKERS)
+  if (g >= 0 && g < SLOTTEE_MATMUL_WORKERS) {
     wdur[g] = e - s;
+    wr0[g] = (uintptr_t)r0;   /* P1 诊断: 回报实际行区间(索引被破坏可见) */
+    wr1[g] = (uintptr_t)r1;
+  }
 
   EAPP_RETURN(SLOTTEE_LT_USER_OCALL_MAGIC);
 }
@@ -228,6 +233,8 @@ eapp_entry()
     slottee_atomic_store(&group_done, 0);
     slottee_atomic_store(&group_failed, 0);
     memset(wdur, 0, sizeof(wdur));
+    memset(wr0, 0, sizeof(wr0));
+    memset(wr1, 0, sizeof(wr1));
 
     t0 = read_cycles();
     for (long g = 0; g < cfg_groups; g++) {
@@ -237,13 +244,14 @@ eapp_entry()
     }
 
     while (slottee_atomic_load(&group_done) < cfg_groups) {
-      int ret = slottee_lt_wait_value(&group_done, cfg_groups, SLOTTEE_LT_WAIT_OP_GE);
-
-      if (ret != SLOTTEE_LT_WAIT_RESULT_READY &&
-          ret != SLOTTEE_LT_WAIT_RESULT_BLOCKED) {
-        slottee_atomic_fetch_add(&group_failed, 1);
-        break;
-      }
+      /*
+       * P2: timer-independent join——worker 用 AMO 更新 group_done（见
+       * matmul_sched_entry），thread0 纯 poll + 轻量让出 host（host_yield 仅
+       * stop 到 host 让 resume loop 推进 spawn/续跑，不注册 wait queue、不依赖
+       * notify/timer）。由此 N=512 G=2/4 可在 huge-quantum / no-preempt 模式
+       * 运行（timer 依赖性对照实验），正常模式行为等价。
+       */
+      (void)slottee_lt_host_yield();
       if (--budget == 0) {
         slottee_atomic_fetch_add(&group_failed, 1);
         break;
@@ -262,6 +270,36 @@ eapp_entry()
     }
     report.checksum = matmul_checksum(cfg_n);
     report.failures = (uintptr_t)slottee_atomic_load(&group_failed);
+    for (long g = 0; g < cfg_groups && g < SLOTTEE_MATMUL_WORKERS; g++) {
+      report.worker_r0[g] = wr0[g];
+      report.worker_r1[g] = wr1[g];
+    }
+  }
+
+  /*
+   * P1 现场诊断（周期自检）：A 行周期 128（7*128≡0 mod128 → A[i+128]=A[i]）→
+   * 正确的 C 必满足 C[i][j]==C[i&127][j]（i>=128）。任一 band 算错时这里在
+   * enclave 内当场定位错误行/列与值模式（零输入/被踩/索引错），随 report 带回
+   * host 在 [retry]/[FAIL] 时打印。N>=256 才有参照（diag_valid）；O(N^2) 只读。
+   */
+  report.diag_valid = (uintptr_t)(cfg_n >= 256);
+  report.diag_mismatch_rows = 0;
+  if (report.diag_valid) {
+    for (long i = 128; i < cfg_n; i++) {
+      long bad = 0;
+      for (long j = 0; j < cfg_n; j++) {
+        if (C[i][j] != C[i & 127][j]) {
+          if (!report.diag_mismatch_rows && !bad) {
+            report.diag_i = (uintptr_t)i;
+            report.diag_j = (uintptr_t)j;
+            report.diag_got = (uintptr_t)(unsigned int)C[i][j];
+            report.diag_ref = (uintptr_t)(unsigned int)C[i & 127][j];
+          }
+          bad = 1;
+        }
+      }
+      report.diag_mismatch_rows += (uintptr_t)bad;
+    }
   }
 
   if (ocall(OCALL_MATMUL_REPORT, &report, sizeof(report), 0, 0) != 0)

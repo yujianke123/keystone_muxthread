@@ -18,6 +18,7 @@ uintptr_t slottee_lt_spawn(uintptr_t slot_id, uintptr_t fn, uintptr_t arg);
 uintptr_t slottee_lt_wait_value(
     struct encl_ctx* ctx, uintptr_t user_ptr, uintptr_t target, uintptr_t op);
 uintptr_t slottee_lt_notify_value(struct encl_ctx* ctx, uintptr_t user_ptr);
+uintptr_t slottee_lt_host_yield(void);
 uintptr_t slottee_lt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr);
 uintptr_t slottee_lt_timer_preempt(struct encl_ctx* ctx);
 uintptr_t slottee_preempt_run(

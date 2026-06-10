@@ -172,6 +172,7 @@ struct slottee_preempt_group {
   uintptr_t switch_budget;
   uintptr_t switches_since_yield;
   uintptr_t enable_steal;      /* PREEMPT_RUN flag: allow this hart to steal others' runnable workers */
+  uintptr_t fast_single;       /* 单 worker 且无窃取/无安全阀的组: timer tick 走免锁快路径(不 save_frame/不入队) */
   uintptr_t steals;            /* workers this group migrated in via stealing (passive + proactive) */
   uintptr_t rebalances;        /* proactive periodic-rebalance pulls (subset of steals) */
   uintptr_t last_steal_victim_slot;   /* scheduler slot of the most recent steal victim */
@@ -1299,6 +1300,11 @@ slottee_lt_timer_preempt(struct encl_ctx* ctx)
     struct slottee_preempt_group* group =
         slottee_preempt_group_for(user->preempt_group);
     if (group && group->sched_active) {
+      if (group->fast_single) {
+        /* 单 worker/无窃取/无安全阀: 无可切换对象, tick 即返回(免锁; ticks 仅本 hart 写) */
+        group->ticks++;
+        return 1;
+      }
       slottee_record_trap_frame(user, ctx, STOP_TIMER_INTERRUPT);
       return slottee_preempt_timer_switch(group, user, ctx);
     }
@@ -1691,6 +1697,19 @@ slottee_lt_notify_value(struct encl_ctx* ctx, uintptr_t user_ptr)
   return SLOTTEE_LT_NOTIFY_RESULT_MISS;
 }
 
+/*
+ * Timer-independent 轻量让出：仅 stop 到 host（host resume loop 借此推进 worker
+ * spawn / resume），不注册 wait queue、不依赖 notify/timer——配对 eapp 侧纯 AMO
+ * poll 型 join，使 no-preempt / huge-quantum 模式可运行（根因隔离对照实验），
+ * 正常模式下语义与 wait_value 的 stop-resume 循环等价但完全解耦 G7 wait/notify。
+ */
+uintptr_t
+slottee_lt_host_yield(void)
+{
+  (void)sbi_stop_enclave(STOP_TIMER_INTERRUPT);
+  return 0;
+}
+
 uintptr_t
 slottee_lt_collect_stats(struct encl_ctx* ctx, uintptr_t stats_ptr)
 {
@@ -1839,6 +1858,14 @@ slottee_preempt_run(struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count,
   group->switch_budget = switch_budget;
   group->switches_since_yield = 0;
   group->enable_steal = (flags & SLOTTEE_PREEMPT_FLAG_STEAL) ? 1 : 0;
+  /*
+   * Single-runnable timer fast path（性能优化）：1 worker + 无窃取 + 无 host 安全阀
+   * 的组（如 matmul 每组 1 worker、budget=0、steal=0），timer tick 没有任何可切换
+   * 对象——原路径每 tick 仍 加锁+save_frame(整帧拷贝)+入队+出队(自己)，纯开销。
+   * 满足条件时 tick 直接返回（见 slottee_lt_timer_preempt），与已验证的 no-op ISR
+   * 隔离实验同行为。多 worker / steal / budget>0 的组不受影响（fast_single=0）。
+   */
+  group->fast_single = (count == 1 && !group->enable_steal && !switch_budget);
   group->steals = 0;
   group->rebalances = 0;
   group->runnable_queue.head = 0;

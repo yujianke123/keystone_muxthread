@@ -6639,19 +6639,28 @@ run_matmul_combo(const char* eapp_file, const char* rt_file, const char* ld_file
   edge_init(&enclave);
 
   ret = enclave.runRaw(&value);
+  uintptr_t idle_spins = 0;   /* 连续 EnclaveInterrupted 计数（P3 adaptive sleep） */
   for (uintptr_t retry = 0;
        (ret == Keystone::Error::EdgeCallHost ||
         ret == Keystone::Error::EnclaveInterrupted) &&
        retry < (uintptr_t)100000000;
        retry++) {
-    if (ret == Keystone::Error::EdgeCallHost)
+    if (ret == Keystone::Error::EdgeCallHost) {
       incoming_call_dispatch(enclave.getSharedBuffer());
-    /* Throttle thread0's untimed busy-wait ping-pong (sbi_stop→resume) so it
-     * cannot exhaust the retry cap before the slow workers finish — required when
-     * the timer quantum is large/disabled (P4 no-preempt isolation), harmless
-     * otherwise. */
-    else if (ret == Keystone::Error::EnclaveInterrupted)
-      usleep(30);
+      idle_spins = 0;
+    } else if (ret == Keystone::Error::EnclaveInterrupted) {
+      /*
+       * P3 adaptive sleep：thread0 poll join 期间每次 stop→resume 都走这里——
+       * 固定 usleep(30) 在 N=512 4线程下贡献了 host 编排 wall 的大头。改为
+       * 前 256 次忙转不睡（worker 即将完成的常见路径），之后小睡渐增，仍保住
+       * no-preempt 模式不耗尽重试上界（P4 修复的目的）。
+       */
+      idle_spins++;
+      if (idle_spins > 4096)
+        usleep(50);
+      else if (idle_spins > 256)
+        usleep(5);
+    }
 
     for (long g = 0; g < G; g++) {
       if (!started[g] && copied_slot_cap_ready_by_slot[sched_slot[g]]) {
@@ -6667,8 +6676,9 @@ run_matmul_combo(const char* eapp_file, const char* rt_file, const char* ld_file
           return 1;
         }
         started[g] = 1;
+        idle_spins = 0;
+        /* P3 batch spawn：同一轮把所有 ready 的 cap 都 spawn，不再每个 usleep(500) */
         sched_yield();
-        usleep(500);
       }
     }
     sched_yield();
@@ -6699,6 +6709,8 @@ run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
   struct slottee_matmul_combo_report grid[SLOTTEE_MATMUL_NSIZES][4];
   long online_harts = sysconf(_SC_NPROCESSORS_ONLN);
   bool ok = true;
+  int total_attempts = 0;   /* P1 retry 分布汇总 */
+  int total_retries = 0;
 
   memset(grid, 0, sizeof(grid));
   printf("matmul,setup,harts=%ld,sizes=16..512,threads=0/1/2/4,g0=keystone_direct,metric=rdcycle_in_enclave_compute\n",
@@ -6729,9 +6741,20 @@ run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
         attempts++;
         rc = run_matmul_combo(eapp_file, rt_file, ld_file, params, N, G, r);
         csum_ok = (r->checksum == expect_csum);
-        if ((rc != 0 || !csum_ok) && attempts < MATMUL_MAX_ATTEMPTS)
+        if ((rc != 0 || !csum_ok) && attempts < MATMUL_MAX_ATTEMPTS) {
           printf("[retry] matmul combo N=%ld G=%ld attempt=%d rc=%d csum_ok=%d (got=0x%lx expect=0x%lx)\n",
               N, G, attempts, rc, (int)csum_ok, r->checksum, expect_csum);
+          /* P1 现场保存：eapp 周期自检（A 行周期 128）当场定位的错误位置/值模式 +
+           * 每 worker 实际行区间——失败被重试覆盖前先落日志。 */
+          if (r->diag_valid)
+            printf("[diag]  N=%ld G=%ld mismatch_rows=%lu first=(%lu,%lu) got=%lu ref=%lu\n",
+                N, G, r->diag_mismatch_rows, r->diag_i, r->diag_j,
+                r->diag_got, r->diag_ref);
+          for (long g = 0; g < G && g < SLOTTEE_MATMUL_WORKERS; g++)
+            printf("[diag]    worker%ld band=[%lu,%lu) compute=%lu\n",
+                g, r->worker_r0[g], r->worker_r1[g], r->worker_compute[g]);
+          fflush(stdout);
+        }
       } while ((rc != 0 || !csum_ok) && attempts < MATMUL_MAX_ATTEMPTS);
 
       if (rc != 0 || !csum_ok) {
@@ -6739,11 +6762,16 @@ run_slottee_matmul_test(const char* eapp_file, const char* rt_file,
         printf("[FAIL] matmul combo N=%ld G=%ld after %d attempts rc=%d csum_ok=%d (got=0x%lx expect=0x%lx)\n",
             N, G, attempts, rc, (int)csum_ok, r->checksum, expect_csum);
       }
+      total_attempts += attempts;
+      total_retries += attempts - 1;
       printf("matmul,combo,N=%ld,threads=%ld,max_compute=%lu,sum_compute=%lu,wall=%lu,csum_ok=%d,attempts=%d\n",
           N, G, r->max_compute, r->sum_compute, r->wall_cycles, (int)csum_ok, attempts);
       fflush(stdout);
     }
   }
+  /* P1 retry 分布汇总（结构化；每组合的 attempts 已在 combo 行） */
+  printf("matmul,retrysum,total_attempts=%d,total_retries=%d\n",
+      total_attempts, total_retries);
 
   /* 汇总：speedup（compute 口径）= Keystone 单线程基线(G=0) / SlotTEE 多线程(G=2,4) 的 max-worker-compute；
    * overhead1 = (SlotTEE 单 worker - Keystone 基线)/基线；t4_sync% = (wall-compute)/wall（含 host 跨 hart 编排）。 */

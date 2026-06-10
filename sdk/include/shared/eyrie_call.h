@@ -19,6 +19,9 @@
 #define RUNTIME_SYSCALL_SLOTTEE_SLOT_RELEASE 1011
 #define RUNTIME_SYSCALL_SLOTTEE_PREEMPT_RUN  1012
 #define RUNTIME_SYSCALL_SLOTTEE_PREEMPT_STATS 1013
+/* timer-independent 轻量让出：仅 stop 到 host 让 resume loop 推进，不注册 wait
+ * queue、不依赖 notify/timer——用于纯 AMO poll 型 join（no-preempt 模式可用）。 */
+#define RUNTIME_SYSCALL_SLOTTEE_LT_HOST_YIELD 1014
 #define RUNTIME_SYSCALL_EXIT                1101
 
 #define SLOTTEE_LT_WAIT_OP_EQ          0

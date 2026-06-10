@@ -203,6 +203,13 @@ struct slottee_matmul_combo_report {
   unsigned long worker_compute[SLOTTEE_MATMUL_WORKERS];
   uintptr_t checksum;                                 /* C 校验和（所有 G 应相等，host 重算校验） */
   uintptr_t failures;
+  /* —— miscompute 现场诊断（P1）：尾部追加，不动既有字段偏移 —— */
+  uintptr_t worker_r0[SLOTTEE_MATMUL_WORKERS];        /* 每 worker 实际算的行区间 [r0,r1)（索引被破坏可见） */
+  uintptr_t worker_r1[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t diag_valid;                               /* 1=做了周期自检（N>=256 才有 128 行周期参照） */
+  uintptr_t diag_mismatch_rows;                       /* 自检不一致行数：C[i][*] != C[i mod 128][*] 的 i 个数 */
+  uintptr_t diag_i, diag_j;                           /* 第一个不一致位置 */
+  uintptr_t diag_got, diag_ref;                       /* 该处错值 vs 参照行值（值模式判别 stale-input/被踩/索引错） */
 };
 
 /* 跨 hart 撤销 rendezvous IPI 演示（--enter-slot-revoke-ipi）。 */
