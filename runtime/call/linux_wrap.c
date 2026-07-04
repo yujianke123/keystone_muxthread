@@ -20,7 +20,7 @@
 uintptr_t linux_clock_gettime(__clockid_t clock, struct timespec *tp){
   print_strace("[runtime] clock_gettime not fully supported (clock %x, assuming)\r\n", clock);
   unsigned long cycles;
-  __asm__ __volatile__("rdcycle %0" : "=r"(cycles));
+  __asm__ __volatile__("rdtime %0" : "=r"(cycles));
 
   unsigned long sec = cycles / CLOCK_FREQ;
   unsigned long nsec = (cycles % CLOCK_FREQ);

@@ -114,19 +114,19 @@ main(int argc, char** argv) {
   params.setUntrustedSize(untrusted_size);
 
   if (self_timing) {
-    asm volatile("rdcycle %0" : "=r"(cycles1));
+    asm volatile("rdtime %0" : "=r"(cycles1));
   }
 
   enclave.init(eapp_file, rt_file, ld_file, params);
 
   if (self_timing) {
-    asm volatile("rdcycle %0" : "=r"(cycles2));
+    asm volatile("rdtime %0" : "=r"(cycles2));
   }
 
   edge_init(&enclave);
 
   if (self_timing) {
-    asm volatile("rdcycle %0" : "=r"(cycles3));
+    asm volatile("rdtime %0" : "=r"(cycles3));
   }
 
   uintptr_t encl_ret;
@@ -137,7 +137,7 @@ main(int argc, char** argv) {
   }
 
   if (self_timing) {
-    asm volatile("rdcycle %0" : "=r"(cycles4));
+    asm volatile("rdtime %0" : "=r"(cycles4));
     printf("[keystone-test] Init: %lu cycles\r\n", cycles2 - cycles1);
     printf("[keystone-test] Runtime: %lu cycles\r\n", cycles4 - cycles3);
   }
