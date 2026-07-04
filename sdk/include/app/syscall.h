@@ -10,6 +10,7 @@
 #include "sealing.h"
 
 #include "shared/eyrie_call.h"
+#include "shared/sm_call.h"
 
 #define SYSCALL(which, arg0, arg1, arg2, arg3, arg4)           \
   ({                                                           \
@@ -52,5 +53,42 @@ int
 get_sealing_key(
     struct sealing_key* sealing_key_struct, size_t sealing_key_struct_size,
     void* key_ident, size_t key_ident_size);
+
+int
+slottee_mint_cap(
+    const struct mint_slot_cap_req_t* req, struct mint_slot_cap_resp_t* resp);
+
+int
+slottee_slot_request(const struct slottee_slot_policy* policy);
+
+int
+slottee_slot_release(uintptr_t slot_id);
+
+typedef void (*slottee_lt_fn_t)(void*);
+
+int
+slottee_lt_spawn(uintptr_t slot_id, slottee_lt_fn_t fn, void* arg);
+
+int
+slottee_lt_wait_value(const long* ptr, long target, uintptr_t op);
+
+int
+slottee_lt_notify_value(const long* ptr);
+
+int
+slottee_lt_host_yield(void);
+
+int
+slottee_lt_spawn_seq(uintptr_t first_slot, uintptr_t count, slottee_lt_fn_t fn);
+
+int
+slottee_lt_collect_stats(struct slottee_lt_runtime_stats* stats);
+
+int
+slottee_preempt_run(const struct slottee_preempt_spec* specs, uintptr_t count,
+    uintptr_t switch_budget, uintptr_t flags);
+
+int
+slottee_preempt_collect_stats(struct slottee_preempt_sched_stats* stats);
 
 #endif /* syscall.h */

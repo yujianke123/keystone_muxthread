@@ -65,7 +65,24 @@ class Enclave {
       const char* eapppath, const char* runtimepath, const char* loaderpath, Params _params,
       uintptr_t alternatePhysAddr);
   Error destroy();
+  Error runRaw(uintptr_t* ret = nullptr);
   Error run(uintptr_t* ret = nullptr);
+  Error resume(uintptr_t* ret = nullptr);
+  Error enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value = nullptr);
+  Error enterSlot(
+      uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value = nullptr);
+  Error enterSlotWithEpoch(
+      uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t* value = nullptr);
+  Error enterSlotWithVersion(
+      uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+      uintptr_t* value = nullptr);
+  Error enterSlotWithCap(
+      const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value = nullptr);
+  Error enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp);
+  Error markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch = nullptr);
+  Error slotteeDebug(const slottee_debug_req_t& req, slottee_debug_resp_t* resp);
+  Error leaseWatchdogCheck(uintptr_t* status, uintptr_t* reclaimed);
 };
 
 uint64_t

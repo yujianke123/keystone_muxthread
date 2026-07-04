@@ -6,23 +6,32 @@
 #include "call/sbi.h"
 #include "sys/timex.h"
 #include "sys/interrupt.h"
+#include "sys/slottee.h"
 #include "util/printf.h"
 #include <asm/csr.h>
 
-#define DEFAULT_CLOCK_DELAY 10000
-
 void init_timer(void)
 {
-  sbi_set_timer(get_cycles64() + DEFAULT_CLOCK_DELAY);
+  sbi_set_timer(get_cycles64() + SLOTTEE_LT_QUANTUM_CYCLES);
+  /*
+   * Leave SIE clear until the final sret so reentry cannot take a timer
+   * interrupt while sscratch still points at the user LT stack.
+   */
   csr_set(sstatus, SR_SPIE);
   csr_set(sie, SIE_STIE | SIE_SSIE);
 }
 
-void handle_timer_interrupt()
+void handle_timer_interrupt(struct encl_ctx* regs)
 {
-  sbi_stop_enclave(0);
-  unsigned long next_cycle = get_cycles64() + DEFAULT_CLOCK_DELAY;
+  if (!slottee_lt_timer_preempt(regs))
+    sbi_stop_enclave(STOP_TIMER_INTERRUPT);
+  unsigned long next_cycle = get_cycles64() + SLOTTEE_LT_QUANTUM_CYCLES;
   sbi_set_timer(next_cycle);
+  /*
+   * Do not re-enable SIE inside the S-mode trap handler.  return_to_encl may
+   * temporarily stage the user LT stack in sscratch before the final sret; a
+   * nested timer interrupt in that window would save the trap frame on U memory.
+   */
   csr_set(sstatus, SR_SPIE);
   return;
 }
@@ -33,7 +42,7 @@ void handle_interrupts(struct encl_ctx* regs)
 
   switch(cause) {
     case INTERRUPT_CAUSE_TIMER:
-      handle_timer_interrupt();
+      handle_timer_interrupt(regs);
       break;
     /* ignore other interrupts */
     case INTERRUPT_CAUSE_SOFTWARE:

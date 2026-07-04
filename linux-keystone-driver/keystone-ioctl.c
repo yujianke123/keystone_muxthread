@@ -53,6 +53,8 @@ int keystone_finalize_enclave(unsigned long arg)
 
   enclave->is_init = false;
 
+  memset(&create_args, 0, sizeof(create_args));
+
   /* SBI Call */
   create_args.epm_region.paddr = enclave->epm->pa;
   create_args.epm_region.size = enclave->epm->size;
@@ -72,6 +74,7 @@ int keystone_finalize_enclave(unsigned long arg)
   create_args.user_paddr = enclp->user_paddr;
   create_args.free_paddr = enclp->free_paddr;
   create_args.free_requested = enclp->free_requested;
+  create_args.slot_entry = enclp->slot_entry;
 
   ret = sbi_sm_create_enclave(&create_args);
 
@@ -220,6 +223,128 @@ int keystone_resume_enclave(unsigned long data)
   return 0;
 }
 
+int keystone_enter_slot(unsigned long data)
+{
+  struct sbiret ret;
+  struct keystone_ioctl_enter_slot *arg = (struct keystone_ioctl_enter_slot*) data;
+  unsigned long ueid = arg->eid;
+  struct enclave* enclave;
+  enclave = get_enclave_by_id(ueid);
+
+  if (!enclave)
+  {
+    keystone_err("invalid enclave id\n");
+    return -EINVAL;
+  }
+
+  if (enclave->eid < 0) {
+    keystone_err("real enclave does not exist\n");
+    return -EINVAL;
+  }
+
+  arg->req.cap.eid = enclave->eid;
+  memset(&arg->resp, 0, sizeof(arg->resp));
+
+  ret = sbi_sm_enter_slot(enclave->eid, &arg->req, &arg->resp);
+
+  if (!arg->resp.status)
+    arg->resp.status = ret.error;
+  if (!arg->resp.value)
+    arg->resp.value = ret.value;
+
+  return 0;
+}
+
+int keystone_mark_revoke(unsigned long data)
+{
+  struct sbiret ret;
+  struct keystone_ioctl_mark_revoke *arg = (struct keystone_ioctl_mark_revoke*) data;
+  unsigned long ueid = arg->eid;
+  struct enclave* enclave;
+  enclave = get_enclave_by_id(ueid);
+
+  if (!enclave)
+  {
+    keystone_err("invalid enclave id\n");
+    return -EINVAL;
+  }
+
+  if (enclave->eid < 0) {
+    keystone_err("real enclave does not exist\n");
+    return -EINVAL;
+  }
+
+  memset(&arg->resp, 0, sizeof(arg->resp));
+
+  ret = sbi_sm_mark_revoke(enclave->eid, &arg->req, &arg->resp);
+
+  if (!arg->resp.status)
+    arg->resp.status = ret.error;
+  if (!arg->resp.epoch)
+    arg->resp.epoch = ret.value;
+
+  return 0;
+}
+
+int keystone_slottee_debug(unsigned long data)
+{
+  struct sbiret ret;
+  struct keystone_ioctl_slottee_debug *arg = (struct keystone_ioctl_slottee_debug*) data;
+  unsigned long ueid = arg->eid;
+  struct enclave* enclave;
+  enclave = get_enclave_by_id(ueid);
+
+  if (!enclave)
+  {
+    keystone_err("invalid enclave id\n");
+    return -EINVAL;
+  }
+
+  if (enclave->eid < 0) {
+    keystone_err("real enclave does not exist\n");
+    return -EINVAL;
+  }
+
+  memset(&arg->resp, 0, sizeof(arg->resp));
+
+  ret = sbi_sm_slottee_debug(enclave->eid, &arg->req, &arg->resp);
+
+  if (!arg->resp.status)
+    arg->resp.status = ret.error;
+
+  return 0;
+}
+
+int keystone_lease_watchdog_check(unsigned long data)
+{
+  struct sbiret ret;
+  struct keystone_ioctl_lease_watchdog_check *arg =
+      (struct keystone_ioctl_lease_watchdog_check*) data;
+  unsigned long ueid = arg->eid;
+  struct enclave* enclave;
+  enclave = get_enclave_by_id(ueid);
+
+  if (!enclave)
+  {
+    keystone_err("invalid enclave id\n");
+    return -EINVAL;
+  }
+
+  if (enclave->eid < 0) {
+    keystone_err("real enclave does not exist\n");
+    return -EINVAL;
+  }
+
+  arg->status = 0;
+  arg->reclaimed = 0;
+
+  ret = sbi_sm_lease_watchdog_check(enclave->eid);
+  arg->status = ret.error;
+  arg->reclaimed = ret.value;
+
+  return 0;
+}
+
 long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 {
   long ret;
@@ -251,6 +376,18 @@ long keystone_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
       break;
     case KEYSTONE_IOC_RESUME_ENCLAVE:
       ret = keystone_resume_enclave((unsigned long) data);
+      break;
+    case KEYSTONE_IOC_ENTER_SLOT:
+      ret = keystone_enter_slot((unsigned long) data);
+      break;
+    case KEYSTONE_IOC_MARK_REVOKE:
+      ret = keystone_mark_revoke((unsigned long) data);
+      break;
+    case KEYSTONE_IOC_SLOTTEE_DEBUG:
+      ret = keystone_slottee_debug((unsigned long) data);
+      break;
+    case KEYSTONE_IOC_LEASE_WATCHDOG_CHECK:
+      ret = keystone_lease_watchdog_check((unsigned long) data);
       break;
     /* Note that following commands could have been implemented as a part of ADD_PAGE ioctl.
      * However, there was a weird bug in compiler that generates a wrong control flow

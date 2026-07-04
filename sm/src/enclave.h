@@ -18,8 +18,7 @@
 #include TARGET_PLATFORM_HEADER
 
 #define ATTEST_DATA_MAXLEN  1024
-/* TODO: does not support multithreaded enclave yet */
-#define MAX_ENCL_THREADS 1
+#define MAX_ENCL_THREADS SLOTTEE_MAX_SLOTS
 
 typedef enum {
   INVALID = -1,
@@ -32,6 +31,34 @@ typedef enum {
 
 /* For now, eid's are a simple unsigned int */
 typedef unsigned int enclave_id;
+
+typedef enum {
+  SLOT_LEASE_FREE = 0,
+  SLOT_LEASE_RESERVED = 1,
+  SLOT_LEASE_ACTIVE = 2,
+  SLOT_LEASE_EXITING = 3,
+  SLOT_LEASE_REVOKED = 4,
+  SLOT_LEASE_EXPIRED = 5,
+} slot_lease_state;
+
+struct slot_lease_t
+{
+  uintptr_t slot_id;
+  uintptr_t lease_id;
+  uintptr_t epoch;
+  uintptr_t cap_seq;
+  uintptr_t rights;
+  uintptr_t max_lease_cycles;
+  uintptr_t bound_hart;
+  uintptr_t expiry_cycle;
+  uintptr_t entry_pc;
+  uintptr_t exit_reason;
+  uintptr_t active_hart;
+  uintptr_t thread_index;
+  uintptr_t slot_mode;
+  uintptr_t revoke_pending;
+  slot_lease_state state;
+};
 
 /* Metadata around memory regions associate with this enclave
  * EPM is the 'home' for the enclave, contains runtime code/etc
@@ -72,7 +99,21 @@ struct enclave
 
   /* enclave execution context */
   unsigned int n_thread;
+  uintptr_t stopped_thread_index;
+  uintptr_t stopped_threads[MAX_ENCL_THREADS];
   struct thread_state threads[MAX_ENCL_THREADS];
+  int slot_reentry_ready;
+  struct csrs slot_reentry_csrs;
+  uintptr_t slot_reentry_mstatus;
+
+  uintptr_t next_slot_lease_id;
+  uintptr_t current_slot_epoch;
+  uintptr_t lease_expired_count;
+  uintptr_t revoke_ipi_count;   /* cross-hart revoke rendezvous IPIs sent for this enclave */
+  struct slot_lease_t slot_leases[SLOTTEE_MAX_SLOTS];
+  byte cap_key[MDSIZE];
+  uintptr_t cap_key_ready;
+  uintptr_t cap_key_generation;
 
   struct platform_enclave_data ped;
 };
@@ -112,8 +153,32 @@ unsigned long create_enclave(unsigned long *eid, struct keystone_sbi_create_t cr
 unsigned long destroy_enclave(enclave_id eid);
 unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid);
+unsigned long resume_enclave_slot(
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id);
+unsigned long reserve_enclave_slot(
+    enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp);
+unsigned long activate_enclave_slot(
+    enclave_id eid, const struct slot_cap_t *cap, uintptr_t slot_mode,
+    struct enter_slot_resp_t *resp);
+int enclave_slot_timer_redirectable(enclave_id eid, uintptr_t thread_index);
+void slottee_init_revoke_ipi(void);   /* cold-boot: register cross-hart revoke rendezvous IPI event */
+unsigned long mark_revoke_enclave_slot(
+    enclave_id eid, const struct mark_revoke_req_t *req, struct mark_revoke_resp_t *resp);
+unsigned long debug_enclave_slot_state(
+    enclave_id eid, const struct slottee_debug_req_t *req, struct slottee_debug_resp_t *resp);
+unsigned long lease_watchdog_check(enclave_id eid);
+void enter_activated_enclave_slot(
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
+    uintptr_t slot_mode);
 // callables from the enclave
+unsigned long mint_enclave_slot_cap(
+    enclave_id eid, const struct mint_slot_cap_req_t *req, struct mint_slot_cap_resp_t *resp);
 unsigned long exit_enclave(struct sbi_trap_regs *regs, enclave_id eid);
+unsigned long exit_enclave_slot(
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
+    uintptr_t exit_reason, uintptr_t value);
+unsigned long init_enclave_slot_reentry_template(
+    struct sbi_trap_regs *regs, enclave_id eid);
 unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave_id eid);
 unsigned long attest_enclave(uintptr_t report, uintptr_t data, uintptr_t size, enclave_id eid);
 // attestation

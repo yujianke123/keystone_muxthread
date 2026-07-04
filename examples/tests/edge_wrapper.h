@@ -7,6 +7,8 @@
 
 #include "edge/edge_call.h"
 #include "host/keystone.h"
+#include "shared/sm_call.h"
+#include "shared/slottee_multihart.h"
 
 typedef struct packaged_str{
   unsigned long str_offset;
@@ -25,6 +27,57 @@ void print_value(unsigned long val);
 
 void copy_report_wrapper(void* buffer);
 void copy_report(void* shared_buffer);
+
+void copy_slot_cap_wrapper(void* buffer);
+void copy_slot_cap(void* shared_buffer, size_t size);
+
+void copy_multihart_ticket_report_wrapper(void* buffer);
+void copy_multihart_ticket_report(void* shared_buffer, size_t size);
+
+void copy_edgecall_stress_report_wrapper(void* buffer);
+void get_edgecall_stress_report(struct slottee_edgecall_stress_report* report);
+
+uintptr_t get_edgecall_stress_echo_count(void);
+
+void copy_edgecall_stress_payload_wrapper(void* buffer);
+void reset_edgecall_stress_state(void);
+
+void copy_timer_preempt_report_wrapper(void* buffer);
+void get_timer_preempt_report(struct slottee_timer_preempt_report* report);
+void reset_timer_preempt_state(void);
+
+void copy_preempt_sched_report_wrapper(void* buffer);
+void get_preempt_sched_report(struct slottee_preempt_sched_report* report);
+void reset_preempt_sched_state(void);
+
+void copy_preempt_multihart_report_wrapper(void* buffer);
+void get_preempt_multihart_report(uintptr_t group_id,
+    struct slottee_preempt_multihart_report* report);
+void reset_preempt_multihart_state(void);
+
+void copy_preempt_steal_final_wrapper(void* buffer);
+void get_preempt_steal_final(struct slottee_preempt_steal_final* final);
+
+void copy_preempt_bestvictim_report_wrapper(void* buffer);
+void get_preempt_bestvictim_report(uintptr_t group_id,
+    struct slottee_preempt_bestvictim_report* report);
+void reset_preempt_bestvictim_state(void);
+
+void copy_ledger_report_wrapper(void* buffer);
+void get_ledger_report(struct slottee_ledger_report* report);
+void reset_ledger_state(void);
+
+void get_matmul_config_wrapper(void* buffer);
+void copy_matmul_report_wrapper(void* buffer);
+void set_matmul_config(long n, long groups);
+void set_matmul_config_ex(long n, long groups, long persistent);
+int get_matmul_report_seq(void);
+void get_matmul_report(struct slottee_matmul_combo_report* report);
+void reset_matmul_report(void);
+
+void get_multihart_ticket_config_wrapper(void* buffer);
+void get_multihart_ticket_config(
+    struct slottee_multihart_ticket_config* config);
 
 void get_host_string_wrapper(void* buffer);
 const char* get_host_string();

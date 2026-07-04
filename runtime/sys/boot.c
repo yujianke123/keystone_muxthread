@@ -8,6 +8,7 @@
 #include "call/sbi.h"
 #include "mm/freemem.h"
 #include "mm/mm.h"
+#include "sys/slottee.h"
 #include "sys/env.h"
 #include "mm/paging.h"
 #include "loader/elf.h"
@@ -43,6 +44,7 @@ int verify_and_load_elf_file(uintptr_t ptr, size_t file_size, bool is_eapp) {
 
   if (is_eapp) { // setup entry point
     uintptr_t entry = elf_getEntryPoint(&elf_file);
+    slottee_set_user_entry(entry);
     csr_write(sepc, entry);
   }
   return ret;
@@ -77,7 +79,7 @@ init_user_stack_and_env(ELF(Ehdr) *hdr)
   csr_write(sscratch, user_sp);
 }
 
-void
+uintptr_t
 eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
            uintptr_t dram_base,
            uintptr_t dram_size,
@@ -87,6 +89,9 @@ eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
            uintptr_t utm_vaddr,
            uintptr_t utm_size)
 {
+  uintptr_t slot_token = dummy;
+  uintptr_t slot_runtime_stack = 0;
+
   /* set initial values */
   load_pa_start = dram_base;
   root_page_table = (pte*) __va(csr_read(satp) << RISCV_PAGE_BITS);
@@ -137,7 +142,17 @@ eyrie_boot(uintptr_t dummy, // $a0 contains the return value from the SBI
   /* Enable the FPU */
   csr_write(sstatus, csr_read(sstatus) | 0x6000);
 
+  uintptr_t status = sbi_init_reentry_template();
+  if (slot_token != 0) {
+    printf("[slottee] init_reentry_template token=0x%lx status=%lu\r\n",
+        slot_token, status);
+  }
+
+  if (slot_token != 0) {
+    slot_runtime_stack = slottee_slot_trampoline(slot_token);
+  }
+
   debug("eyrie boot finished. drop to the user land ...");
   /* booting all finished, droping to the user land */
-  return;
+  return slot_runtime_stack;
 }

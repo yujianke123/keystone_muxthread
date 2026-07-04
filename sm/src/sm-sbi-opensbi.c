@@ -48,6 +48,18 @@ static int sbi_ecall_keystone_enclave_handler(unsigned long extid, unsigned long
       retval = sbi_sm_resume_enclave((struct sbi_trap_regs*) regs, regs->a0);
       __builtin_unreachable();
       break;
+    case SBI_SM_ENTER_SLOT:
+      retval = sbi_sm_enter_slot((struct sbi_trap_regs*) regs, out_val, regs->a0, regs->a1, regs->a2);
+      break;
+    case SBI_SM_MARK_REVOKE:
+      retval = sbi_sm_mark_revoke(out_val, regs->a0, regs->a1, regs->a2);
+      break;
+    case SBI_SM_SLOTTEE_DEBUG:
+      retval = sbi_sm_slottee_debug(out_val, regs->a0, regs->a1, regs->a2);
+      break;
+    case SBI_SM_LEASE_WATCHDOG_CHECK:
+      retval = sbi_sm_lease_watchdog_check(out_val, regs->a0);
+      break;
     case SBI_SM_RANDOM:
       *out_val = sbi_sm_random();
       retval = 0;
@@ -62,9 +74,25 @@ static int sbi_ecall_keystone_enclave_handler(unsigned long extid, unsigned long
       retval = sbi_sm_stop_enclave((struct sbi_trap_regs*) regs, regs->a0);
       __builtin_unreachable();
       break;
+    case SBI_SM_EXIT_SLOT:
+      retval = sbi_sm_exit_slot((struct sbi_trap_regs*) regs, regs->a0, regs->a1, regs->a2, regs->a3);
+      __builtin_unreachable();
+      break;
     case SBI_SM_EXIT_ENCLAVE:
       retval = sbi_sm_exit_enclave((struct sbi_trap_regs*) regs, regs->a0);
       __builtin_unreachable();
+      break;
+    case SBI_SM_LT_ECALL_PROBE:
+      retval = sbi_sm_lt_ecall_probe(out_val, regs->a0, regs->a1, regs->a2);
+      break;
+    case SBI_SM_INIT_REENTRY_TEMPLATE:
+      retval = sbi_sm_init_reentry_template((struct sbi_trap_regs*) regs);
+      break;
+    case SBI_SM_MINT_SLOT_CAP:
+      retval = sbi_sm_mint_slot_cap(out_val, regs->a0, regs->a1);
+      break;
+    case SBI_SM_CURRENT_HART:
+      retval = sbi_sm_current_hart(out_val);
       break;
     case SBI_SM_CALL_PLUGIN:
       retval = sbi_sm_call_plugin(regs->a0, regs->a1, regs->a2, regs->a3);

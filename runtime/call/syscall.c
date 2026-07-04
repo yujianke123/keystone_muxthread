@@ -5,11 +5,14 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/select.h>
+#include "call/sbi.h"
 #include "call/syscall.h"
+#include "sm_err.h"
 #include "util/string.h"
 #include "edge_call.h"
 #include "uaccess.h"
 #include "mm/mm.h"
+#include "sys/slottee.h"
 #include "util/rt_util.h"
 
 #include "call/syscall_nums.h"
@@ -28,49 +31,77 @@
 
 extern void exit_enclave(uintptr_t arg0);
 
+static volatile int slottee_edgecall_buffer_lock;
+
+static void
+slottee_edgecall_buffer_lock_acquire(void)
+{
+  while (__sync_lock_test_and_set(&slottee_edgecall_buffer_lock, 1))
+    __asm__ volatile("nop");
+  __sync_synchronize();
+}
+
+static void
+slottee_edgecall_buffer_lock_release(void)
+{
+  __sync_synchronize();
+  __sync_lock_release(&slottee_edgecall_buffer_lock);
+}
+
 uintptr_t dispatch_edgecall_syscall(struct edge_syscall* syscall_data_ptr, size_t data_len){
   int ret;
+  uintptr_t result = (uintptr_t)-1;
 
   // Syscall data should already be at the edge_call_data section
   /* For now we assume by convention that the start of the buffer is
    * the right place to put calls */
   struct edge_call* edge_call = (struct edge_call*)shared_buffer;
 
+  slottee_edgecall_buffer_lock_acquire();
+
   edge_call->call_id = EDGECALL_SYSCALL;
 
 
   if(edge_call_setup_call(edge_call, (void*)syscall_data_ptr, data_len) != 0){
-    return -1;
+    goto out;
   }
 
+  /*
+   * The stop SBI may return a non-zero continuation when the host resumes
+   * through an interrupt-aware path.  The edge-call completion status in the
+   * shared buffer is the authoritative result, so do not treat the continuation
+   * code itself as a syscall failure.
+   */
   ret = sbi_stop_enclave(STOP_EDGE_CALL_HOST);
-
-  if (ret != 0) {
-    return -1;
-  }
+  (void)ret;
 
   if(edge_call->return_data.call_status != CALL_STATUS_OK){
-    return -1;
+    goto out;
   }
 
   uintptr_t return_ptr;
   size_t return_len;
   if(edge_call_ret_ptr(edge_call, &return_ptr, &return_len) != 0){
-    return -1;
+    goto out;
   }
 
   if(return_len < sizeof(uintptr_t)){
-    return -1;
+    goto out;
   }
 
-  return *(uintptr_t*)return_ptr;
+  result = *(uintptr_t*)return_ptr;
+
+out:
+  slottee_edgecall_buffer_lock_release();
+  return result;
 }
 
 uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
 				   void* data, size_t data_len,
 				   void* return_buffer, size_t return_len){
 
-  uintptr_t ret;
+  uintptr_t result = 1;
+
   /* For now we assume by convention that the start of the buffer is
    * the right place to put calls */
   struct edge_call* edge_call = (struct edge_call*)shared_buffer;
@@ -79,38 +110,46 @@ uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
    * region, calculate the offsets to the argument data, and then
    * dispatch the ocall to host */
 
+  slottee_edgecall_buffer_lock_acquire();
+
   edge_call->call_id = call_id;
   uintptr_t buffer_data_start = edge_call_data_ptr();
 
   if(data_len > (shared_buffer_size - (buffer_data_start - shared_buffer))){
-    goto ocall_error;
+    goto out;
   }
   //TODO safety check on source
   copy_from_user((void*)buffer_data_start, (void*)data, data_len);
 
   if(edge_call_setup_call(edge_call, (void*)buffer_data_start, data_len) != 0){
-    goto ocall_error;
+    goto out;
   }
 
-  ret = sbi_stop_enclave(STOP_EDGE_CALL_HOST);
-
-  if (ret != 0) {
-    goto ocall_error;
-  }
+  /*
+   * This SBI returns only after the host resumes the enclave.  Slot-specific
+   * resume paths may leave a non-zero continuation value in a0; the edge-call
+   * return status below is the authoritative OCALL result.
+   */
+  /*
+   * Same as the syscall edge-call path above: treat the shared-buffer return
+   * status as authoritative and ignore the continuation code here.
+   */
+  (void)sbi_stop_enclave(STOP_EDGE_CALL_HOST);
 
   if(edge_call->return_data.call_status != CALL_STATUS_OK){
-    goto ocall_error;
+    goto out;
   }
 
   if( return_len == 0 ){
     /* Done, no return */
-    return (uintptr_t)NULL;
+    result = (uintptr_t)NULL;
+    goto out;
   }
 
   uintptr_t return_ptr;
   size_t ret_len_untrusted;
   if(edge_call_ret_ptr(edge_call, &return_ptr, &ret_len_untrusted) != 0){
-    goto ocall_error;
+    goto out;
   }
 
   /* Done, there was a return value to copy out of shared mem */
@@ -120,11 +159,12 @@ uintptr_t dispatch_edgecall_ocall( unsigned long call_id,
      almost certainly.*/
   copy_to_user(return_buffer, (void*)return_ptr, ret_len_untrusted > return_len ? return_len : ret_len_untrusted);
 
-  return 0;
+  result = 0;
 
- ocall_error:
+ out:
+  slottee_edgecall_buffer_lock_release();
   /* TODO In the future, this should fault */
-  return 1;
+  return result;
 }
 
 uintptr_t handle_copy_from_shared(void* dst, uintptr_t offset, size_t size){
@@ -141,6 +181,62 @@ uintptr_t handle_copy_from_shared(void* dst, uintptr_t offset, size_t size){
   }
 
   return copy_to_user(dst, (void*)src_ptr, size);
+}
+
+static uintptr_t
+slottee_rt_validate_mint_cap_req(const struct mint_slot_cap_req_t* req)
+{
+  if (!req || req->version != SLOTTEE_MINT_CAP_VERSION)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (req->slot_id == 0 || req->slot_id >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (req->rights != SLOTTEE_CAP_RIGHT_ENTER || req->cap_seq == 0 ||
+      req->max_lease_cycles == 0)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+static uintptr_t
+handle_slottee_mint_cap(uintptr_t user_req, uintptr_t user_resp)
+{
+  struct mint_slot_cap_req_t* req =
+      (struct mint_slot_cap_req_t*)rt_copy_buffer_1;
+  struct mint_slot_cap_resp_t* resp =
+      (struct mint_slot_cap_resp_t*)rt_copy_buffer_2;
+  uintptr_t ret;
+
+  memset(req, 0, sizeof(*req));
+  memset(resp, 0, sizeof(*resp));
+
+  if (!user_req || !user_resp) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  if (copy_from_user(req, (void*)user_req, sizeof(*req))) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  ret = slottee_rt_validate_mint_cap_req(req);
+  if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
+    goto out;
+
+  ret = sbi_mint_slot_cap((uintptr_t)req, (uintptr_t)resp);
+  if (resp->status)
+    ret = resp->status;
+
+out:
+  if (!resp->status)
+    resp->status = ret;
+
+  if (user_resp && copy_to_user((void*)user_resp, resp, sizeof(*resp)))
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  return resp->status;
 }
 
 void init_edge_internals(){
@@ -163,13 +259,18 @@ void handle_syscall(struct encl_ctx* ctx)
   uintptr_t ret = 0;
 
   ctx->regs.sepc += 4;
+  slottee_active_user_record_syscall(ctx, n);
 
   switch (n) {
   case(RUNTIME_SYSCALL_EXIT):
+    if (slottee_active_user_exit(ctx, arg0))
+      return; /* preempt worker exit already rewrote ctx; do not clobber a0 */
     sbi_exit_enclave(arg0);
     break;
   case(RUNTIME_SYSCALL_OCALL):
+    slottee_active_user_record_ocall(ctx);
     ret = dispatch_edgecall_ocall(arg0, (void*)arg1, arg2, (void*)arg3, arg4);
+    slottee_active_user_record_ocall_resume(ctx, ret);
     break;
   case(RUNTIME_SYSCALL_SHAREDCOPY):
     ret = handle_copy_from_shared((void*)arg0, arg1, arg2);
@@ -207,6 +308,41 @@ void handle_syscall(struct encl_ctx* ctx)
     /* Delete key from copy buffer */
     memset(rt_copy_buffer_1, 0x00, sizeof(rt_copy_buffer_1));
 
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_MINT_CAP):
+    ret = handle_slottee_mint_cap(arg0, arg1);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_SPAWN):
+    ret = slottee_lt_spawn(arg0, arg1, arg2);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_WAIT_VALUE):
+    ret = slottee_lt_wait_value(ctx, arg0, arg1, arg2);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_NOTIFY_VALUE):
+    ret = slottee_lt_notify_value(ctx, arg0);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_COLLECT_STATS):
+    ret = slottee_lt_collect_stats(ctx, arg0);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_SLOT_REQUEST):
+    ret = slottee_slot_request(arg0);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_SLOT_RELEASE):
+    ret = slottee_slot_release(arg0);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_RUN):
+    ret = slottee_preempt_run(ctx, arg0, arg1, arg2, arg3);
+    if (ret == SBI_ERR_SM_ENCLAVE_SUCCESS)
+      return; /* switched into a worker LT; preserve its frame and a0 */
+    break;    /* setup failed; report ret in a0 to the scheduler thread */
+  case(RUNTIME_SYSCALL_SLOTTEE_PREEMPT_STATS):
+    ret = slottee_preempt_collect_stats(ctx, arg0);
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_HOST_YIELD):
+    ret = slottee_lt_host_yield();
+    break;
+  case(RUNTIME_SYSCALL_SLOTTEE_LT_SPAWN_SEQ):
+    ret = slottee_lt_spawn_seq(arg0, arg1, arg2);
     break;
 
 

@@ -8,7 +8,7 @@
 #include "edge_syscall.h"
 #endif /*  IO_SYSCALL_WRAPPING */
 
-edgecallwrapper edge_call_table[MAX_EDGE_CALL];
+edgecallwrapper edge_call_table[MAX_EDGE_CALL + 1];
 
 /* Registered handler for incoming edge calls */
 void

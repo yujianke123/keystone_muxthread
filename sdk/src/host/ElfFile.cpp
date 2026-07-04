@@ -3,6 +3,7 @@
 // All Rights Reserved. See LICENSE for license details.
 //------------------------------------------------------------------------------
 #include "ElfFile.hpp"
+#include <cstring>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
@@ -54,6 +55,39 @@ ElfFile::ElfFile(std::string filename) {
 ElfFile::~ElfFile() {
   close(filep);
   munmap(ptr, fileSize);
+}
+
+uintptr_t
+ElfFile::getSymbolAddress(const char* symbolName) {
+  if (!symbolName) {
+    return 0;
+  }
+
+  size_t sections = elf_getNumSections(&elf);
+  for (size_t section = 1; section < sections; section++) {
+    uint32_t type = elf_getSectionType(&elf, section);
+    if (type != SHT_SYMTAB && type != SHT_DYNSYM) {
+      continue;
+    }
+
+    void* table = elf_getSection(&elf, section);
+    const char* strings = elf_getStringTable(&elf, elf_getSectionLink(&elf, section));
+    size_t entrySize = elf_getSectionEntrySize(&elf, section);
+    size_t tableSize = elf_getSectionSize(&elf, section);
+
+    if (!table || !strings || entrySize != sizeof(Elf64_Sym)) {
+      continue;
+    }
+
+    for (size_t offset = 0; offset + entrySize <= tableSize; offset += entrySize) {
+      Elf64_Sym* symbol = (Elf64_Sym*)((uintptr_t)table + offset);
+      if (std::strcmp(strings + symbol->st_name, symbolName) == 0) {
+        return symbol->st_value;
+      }
+    }
+  }
+
+  return 0;
 }
 
 }  // namespace Keystone

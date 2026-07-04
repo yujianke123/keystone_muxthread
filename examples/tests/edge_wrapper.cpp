@@ -12,6 +12,33 @@
 #define OCALL_PRINT_VALUE 2
 #define OCALL_COPY_REPORT 3
 #define OCALL_GET_STRING 4
+#define OCALL_COPY_SLOT_CAP 5
+#define OCALL_REPORT_MULTIHART_TICKET 6
+#define OCALL_GET_MULTIHART_TICKET_CONFIG 7
+#define OCALL_EDGECALL_STRESS_ECHO 8
+#define OCALL_EDGECALL_STRESS_REPORT 9
+#define OCALL_TIMER_PREEMPT_REPORT 10
+#define OCALL_PREEMPT_SCHED_REPORT 11
+#define OCALL_PREEMPT_MULTIHART_REPORT 12
+#define OCALL_PREEMPT_STEAL_FINAL 13
+#define OCALL_PREEMPT_BV_REPORT 14
+#define OCALL_LEDGER_REPORT 15
+#define OCALL_GET_MATMUL_CONFIG 16
+#define OCALL_MATMUL_REPORT 17
+
+static struct slottee_edgecall_stress_report copied_edgecall_stress_report;
+static struct slottee_edgecall_stress_payload copied_edgecall_stress_payload;
+static struct slottee_timer_preempt_report copied_timer_preempt_report;
+static struct slottee_preempt_sched_report copied_preempt_sched_report;
+static struct slottee_preempt_multihart_report
+    copied_preempt_multihart_reports[SLOTTEE_PREEMPT_MULTIHART_GROUPS];
+static struct slottee_preempt_steal_final copied_preempt_steal_final;
+static struct slottee_preempt_bestvictim_report
+    copied_preempt_bestvictim_reports[SLOTTEE_PREEMPT_BV_GROUPS];
+static struct slottee_ledger_report copied_ledger_report;
+static struct slottee_matmul_config matmul_config;
+static struct slottee_matmul_combo_report copied_matmul_report;
+static uintptr_t edgecall_stress_echo_count;
 
 void
 edge_init(Keystone::Enclave* enclave) {
@@ -20,10 +47,155 @@ edge_init(Keystone::Enclave* enclave) {
   register_call(OCALL_PRINT_VALUE, print_value_wrapper);
   register_call(OCALL_COPY_REPORT, copy_report_wrapper);
   register_call(OCALL_GET_STRING, get_host_string_wrapper);
+  register_call(OCALL_COPY_SLOT_CAP, copy_slot_cap_wrapper);
+  register_call(OCALL_REPORT_MULTIHART_TICKET,
+      copy_multihart_ticket_report_wrapper);
+  register_call(OCALL_GET_MULTIHART_TICKET_CONFIG,
+      get_multihart_ticket_config_wrapper);
+  register_call(OCALL_EDGECALL_STRESS_ECHO, copy_edgecall_stress_payload_wrapper);
+  register_call(OCALL_EDGECALL_STRESS_REPORT,
+      copy_edgecall_stress_report_wrapper);
+  register_call(OCALL_TIMER_PREEMPT_REPORT, copy_timer_preempt_report_wrapper);
+  register_call(OCALL_PREEMPT_SCHED_REPORT, copy_preempt_sched_report_wrapper);
+  register_call(OCALL_PREEMPT_MULTIHART_REPORT,
+      copy_preempt_multihart_report_wrapper);
+  register_call(OCALL_PREEMPT_STEAL_FINAL, copy_preempt_steal_final_wrapper);
+  register_call(OCALL_PREEMPT_BV_REPORT, copy_preempt_bestvictim_report_wrapper);
+  register_call(OCALL_LEDGER_REPORT, copy_ledger_report_wrapper);
+  register_call(OCALL_GET_MATMUL_CONFIG, get_matmul_config_wrapper);
+  register_call(OCALL_MATMUL_REPORT, copy_matmul_report_wrapper);
 
   edge_call_init_internals(
       (uintptr_t)enclave->getSharedBuffer(), enclave->getSharedBufferSize());
 }
+
+void
+reset_edgecall_stress_state(void)
+{
+  memset(&copied_edgecall_stress_report, 0, sizeof(copied_edgecall_stress_report));
+  memset(&copied_edgecall_stress_payload, 0, sizeof(copied_edgecall_stress_payload));
+  edgecall_stress_echo_count = 0;
+}
+
+uintptr_t
+get_edgecall_stress_echo_count(void)
+{
+  return edgecall_stress_echo_count;
+}
+
+void
+get_edgecall_stress_report(struct slottee_edgecall_stress_report* report)
+{
+  if (report)
+    *report = copied_edgecall_stress_report;
+}
+
+void
+reset_timer_preempt_state(void)
+{
+  memset(&copied_timer_preempt_report, 0, sizeof(copied_timer_preempt_report));
+}
+
+void
+get_timer_preempt_report(struct slottee_timer_preempt_report* report)
+{
+  if (report)
+    *report = copied_timer_preempt_report;
+}
+
+void
+reset_preempt_sched_state(void)
+{
+  memset(&copied_preempt_sched_report, 0, sizeof(copied_preempt_sched_report));
+}
+
+void
+get_preempt_sched_report(struct slottee_preempt_sched_report* report)
+{
+  if (report)
+    *report = copied_preempt_sched_report;
+}
+
+void
+reset_preempt_bestvictim_state(void)
+{
+  memset(copied_preempt_bestvictim_reports, 0,
+      sizeof(copied_preempt_bestvictim_reports));
+}
+
+void
+reset_ledger_state(void)
+{
+  memset(&copied_ledger_report, 0, sizeof(copied_ledger_report));
+}
+
+void
+set_matmul_config(long n, long groups)
+{
+  set_matmul_config_ex(n, groups, 0);
+}
+
+void
+set_matmul_config_ex(long n, long groups, long persistent)
+{
+  memset(&matmul_config, 0, sizeof(matmul_config));
+  matmul_config.magic = SLOTTEE_MATMUL_MAGIC;
+  matmul_config.n = n;
+  matmul_config.groups = groups;
+  matmul_config.persistent = (uintptr_t)persistent;
+}
+
+void
+reset_matmul_report(void)
+{
+  memset(&copied_matmul_report, 0, sizeof(copied_matmul_report));
+}
+
+void
+reset_preempt_multihart_state(void)
+{
+  memset(&copied_preempt_steal_final, 0, sizeof(copied_preempt_steal_final));
+  memset(copied_preempt_multihart_reports, 0,
+      sizeof(copied_preempt_multihart_reports));
+}
+
+void
+get_preempt_multihart_report(uintptr_t group_id,
+    struct slottee_preempt_multihart_report* report)
+{
+  if (report && group_id < SLOTTEE_PREEMPT_MULTIHART_GROUPS)
+    *report = copied_preempt_multihart_reports[group_id];
+}
+
+void
+get_preempt_steal_final(struct slottee_preempt_steal_final* final)
+{
+  if (final)
+    *final = copied_preempt_steal_final;
+}
+
+void
+get_preempt_bestvictim_report(uintptr_t group_id,
+    struct slottee_preempt_bestvictim_report* report)
+{
+  if (report && group_id < SLOTTEE_PREEMPT_BV_GROUPS)
+    *report = copied_preempt_bestvictim_reports[group_id];
+}
+
+void
+get_ledger_report(struct slottee_ledger_report* report)
+{
+  if (report)
+    *report = copied_ledger_report;
+}
+
+void
+get_matmul_report(struct slottee_matmul_combo_report* report)
+{
+  if (report)
+    *report = copied_matmul_report;
+}
+
 void
 print_buffer_wrapper(void* buffer) {
   /* For now we assume the call struct is at the front of the shared
@@ -96,6 +268,290 @@ copy_report_wrapper(void* buffer) {
   edge_call->return_data.call_status = CALL_STATUS_OK;
 
   return;
+}
+
+void
+copy_slot_cap_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  /* R4a 批量导出兼容：载荷为 k 个连续 slot_cap_t（k>=1），逐个登记。
+   * 单 cap 路径（既有 slottee_lt_spawn）= k==1，行为不变。 */
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len == 0 || args_len % sizeof(struct slot_cap_t) != 0 ||
+      args_len / sizeof(struct slot_cap_t) >= SLOTTEE_MAX_SLOTS) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  for (size_t off = 0; off < args_len; off += sizeof(struct slot_cap_t))
+    copy_slot_cap((void*)(call_args + off), sizeof(struct slot_cap_t));
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+void
+copy_multihart_ticket_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_multihart_ticket_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_multihart_ticket_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_edgecall_stress_payload(void* buffer, size_t size) {
+  if (size == sizeof(copied_edgecall_stress_payload)) {
+    memcpy(&copied_edgecall_stress_payload, buffer, size);
+    __sync_fetch_and_add(&edgecall_stress_echo_count, 1);
+  }
+}
+
+void
+copy_edgecall_stress_payload_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_edgecall_stress_payload)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_edgecall_stress_payload((void*)call_args, args_len);
+  if (edge_call_setup_ret(edge_call, (void*)call_args, args_len)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_PTR;
+  } else {
+    edge_call->return_data.call_status = CALL_STATUS_OK;
+  }
+}
+
+static void
+copy_edgecall_stress_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_edgecall_stress_report))
+    memcpy(&copied_edgecall_stress_report, buffer, size);
+}
+
+void
+copy_edgecall_stress_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_edgecall_stress_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_edgecall_stress_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_timer_preempt_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_timer_preempt_report))
+    memcpy(&copied_timer_preempt_report, buffer, size);
+}
+
+void
+copy_timer_preempt_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_timer_preempt_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_timer_preempt_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_preempt_sched_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_preempt_sched_report))
+    memcpy(&copied_preempt_sched_report, buffer, size);
+}
+
+void
+copy_preempt_sched_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_preempt_sched_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_preempt_sched_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_preempt_multihart_report(void* buffer, size_t size) {
+  if (size != sizeof(struct slottee_preempt_multihart_report))
+    return;
+  struct slottee_preempt_multihart_report* r =
+      (struct slottee_preempt_multihart_report*)buffer;
+  if (r->group_id < SLOTTEE_PREEMPT_MULTIHART_GROUPS)
+    memcpy(&copied_preempt_multihart_reports[r->group_id], buffer, size);
+}
+
+void
+copy_preempt_multihart_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_preempt_multihart_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_preempt_multihart_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_preempt_steal_final(void* buffer, size_t size) {
+  if (size == sizeof(copied_preempt_steal_final))
+    memcpy(&copied_preempt_steal_final, buffer, size);
+}
+
+void
+copy_preempt_steal_final_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_preempt_steal_final)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_preempt_steal_final((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_preempt_bestvictim_report(void* buffer, size_t size) {
+  if (size != sizeof(struct slottee_preempt_bestvictim_report))
+    return;
+  struct slottee_preempt_bestvictim_report* r =
+      (struct slottee_preempt_bestvictim_report*)buffer;
+  if (r->group_id < SLOTTEE_PREEMPT_BV_GROUPS)
+    memcpy(&copied_preempt_bestvictim_reports[r->group_id], buffer, size);
+}
+
+void
+copy_preempt_bestvictim_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_preempt_bestvictim_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_preempt_bestvictim_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+void
+get_matmul_config_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t data_section = edge_call_data_ptr();
+
+  memcpy((void*)data_section, &matmul_config, sizeof(matmul_config));
+  if (edge_call_setup_ret(edge_call, (void*)data_section, sizeof(matmul_config)))
+    edge_call->return_data.call_status = CALL_STATUS_BAD_PTR;
+  else
+    edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static int matmul_report_seq;   /* P2: persistent 模式 host 逐份收 report 的序号 */
+
+static void
+copy_matmul_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_matmul_report)) {
+    memcpy(&copied_matmul_report, buffer, size);
+    matmul_report_seq++;
+  }
+}
+
+int
+get_matmul_report_seq(void) {
+  return matmul_report_seq;
+}
+
+void
+copy_matmul_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_matmul_combo_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+  copy_matmul_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+static void
+copy_ledger_report(void* buffer, size_t size) {
+  if (size == sizeof(copied_ledger_report))
+    memcpy(&copied_ledger_report, buffer, size);
+}
+
+void
+copy_ledger_report_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t call_args;
+  size_t args_len;
+
+  if (edge_call_args_ptr(edge_call, &call_args, &args_len) != 0 ||
+      args_len != sizeof(struct slottee_ledger_report)) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_OFFSET;
+    return;
+  }
+
+  copy_ledger_report((void*)call_args, args_len);
+  edge_call->return_data.call_status = CALL_STATUS_OK;
+}
+
+void
+get_multihart_ticket_config_wrapper(void* buffer) {
+  struct edge_call* edge_call = (struct edge_call*)buffer;
+  uintptr_t data_section = edge_call_data_ptr();
+  struct slottee_multihart_ticket_config config;
+
+  get_multihart_ticket_config(&config);
+  memcpy((void*)data_section, &config, sizeof(config));
+
+  if (edge_call_setup_ret(edge_call, (void*)data_section, sizeof(config))) {
+    edge_call->return_data.call_status = CALL_STATUS_BAD_PTR;
+  } else {
+    edge_call->return_data.call_status = CALL_STATUS_OK;
+  }
 }
 
 void

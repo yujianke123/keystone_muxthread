@@ -19,7 +19,17 @@ sbi_stop_enclave(uint64_t request);
 void
 sbi_exit_enclave(uint64_t retval);
 uintptr_t
+sbi_exit_slot(uintptr_t slot_id, uintptr_t lease_id, uintptr_t exit_reason, uintptr_t value);
+uintptr_t
+sbi_init_reentry_template();
+uintptr_t
+sbi_current_hart();
+uintptr_t
 sbi_random();
+uintptr_t
+sbi_lt_ecall_probe(uintptr_t slot_id, uintptr_t lease_id, uintptr_t request, uintptr_t* reply);
+uintptr_t
+sbi_mint_slot_cap(uintptr_t mint_req, uintptr_t mint_resp);
 uintptr_t
 sbi_query_multimem(size_t *size);
 uintptr_t

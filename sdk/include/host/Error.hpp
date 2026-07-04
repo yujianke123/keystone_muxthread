@@ -17,6 +17,8 @@ enum class Error {
   IoctlErrorFinalize,
   IoctlErrorRun,
   IoctlErrorResume,
+  IoctlErrorEnterSlot,
+  IoctlErrorMarkRevoke,
   IoctlErrorUTMInit,
   DeviceMemoryMapError,
   ELFLoadFailure,
@@ -25,6 +27,10 @@ enum class Error {
   PageAllocationFailure,
   EdgeCallHost,
   EnclaveInterrupted,
+  EnclaveNotResumable,
+  EnclaveBadCap,
+  IoctlErrorSlotteeDebug,
+  IoctlErrorLeaseWatchdogCheck,
 };
 
 }  // namespace Keystone

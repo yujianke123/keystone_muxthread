@@ -26,6 +26,14 @@
   _IOR(KEYSTONE_IOC_MAGIC, 0x06, struct keystone_ioctl_create_enclave)
 #define KEYSTONE_IOC_UTM_INIT \
   _IOR(KEYSTONE_IOC_MAGIC, 0x07, struct keystone_ioctl_create_enclave)
+#define KEYSTONE_IOC_ENTER_SLOT \
+  _IOR(KEYSTONE_IOC_MAGIC, 0x08, struct keystone_ioctl_enter_slot)
+#define KEYSTONE_IOC_MARK_REVOKE \
+  _IOR(KEYSTONE_IOC_MAGIC, 0x09, struct keystone_ioctl_mark_revoke)
+#define KEYSTONE_IOC_SLOTTEE_DEBUG \
+  _IOR(KEYSTONE_IOC_MAGIC, 0x0a, struct keystone_ioctl_slottee_debug)
+#define KEYSTONE_IOC_LEASE_WATCHDOG_CHECK \
+  _IOR(KEYSTONE_IOC_MAGIC, 0x0b, struct keystone_ioctl_lease_watchdog_check)
 
 #define RT_NOEXEC 0
 #define USER_NOEXEC 1
@@ -45,6 +53,7 @@ struct keystone_ioctl_create_enclave {
   uintptr_t user_paddr;
   uintptr_t free_paddr;
   uintptr_t free_requested;
+  uintptr_t slot_entry;
 
   // driver -> host
   uintptr_t epm_paddr;
@@ -56,6 +65,30 @@ struct keystone_ioctl_run_enclave {
   uintptr_t eid;
   uintptr_t error;
   uintptr_t value;
+};
+
+struct keystone_ioctl_enter_slot {
+  uintptr_t eid;
+  struct enter_slot_req_t req;
+  struct enter_slot_resp_t resp;
+};
+
+struct keystone_ioctl_mark_revoke {
+  uintptr_t eid;
+  struct mark_revoke_req_t req;
+  struct mark_revoke_resp_t resp;
+};
+
+struct keystone_ioctl_slottee_debug {
+  uintptr_t eid;
+  struct slottee_debug_req_t req;
+  struct slottee_debug_resp_t resp;
+};
+
+struct keystone_ioctl_lease_watchdog_check {
+  uintptr_t eid;
+  uintptr_t status;
+  uintptr_t reclaimed;
 };
 
 #endif

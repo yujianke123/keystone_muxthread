@@ -116,7 +116,11 @@ _start:
   csrw sscratch, x0
 
   sfence.vma
+  mv a0, t6
   jal eyrie_boot
+  beqz a0, 1f
+  mv sp, a0
+1:
   sfence.vma
 
   /* set spp to user */
@@ -127,6 +131,80 @@ _start:
   csrrw sp, sscratch, sp
   li a0, 0 // passed as rtld_fini to entry point/ __libc_start_main
   sret
+
+.global slottee_runtime_reenter
+slottee_runtime_reenter:
+  /*
+   * Mask S-mode interrupts before computing or touching the slot-indexed stack.
+   * SM may resume this path with a pending timer and stale sscratch from the
+   * previous U-mode run; taking a trap before this point can mis-save the frame
+   * on the user LT stack.
+   */
+  li t0, 0x2
+  csrrc x0, sstatus, t0
+
+  /* Use a slot-indexed RT stack before touching memory on multihart reentry. */
+  andi t0, t6, 0xff
+  la t1, slottee_runtime_stacks
+  li t2, (8 * 4096)
+  mul t3, t0, t2
+  add t1, t1, t3
+  add sp, t1, t2
+  beqz t0, 1f
+  j 2f
+1:
+  la sp, kernel_stack_end
+2:
+  /*
+   * Reentry helpers run in S-mode, so keep sscratch zero until the final
+   * user-stack swap.  The trap handler uses sscratch == 0 to distinguish
+   * S-mode traps from U-mode traps and then saves on the current runtime stack.
+   */
+  csrw sscratch, x0
+  mv a0, t6
+  addi sp, sp, -(3*REGBYTES)
+  STORE zero, 0(sp)
+  STORE zero, 1*REGBYTES(sp)
+  mv a1, sp
+  addi a2, sp, REGBYTES
+  la t0, slottee_slot_trampoline_with_arg
+  jalr t0
+
+  /*
+   * Slot reentry bypasses eyrie_boot(), so arm the S-mode timer before
+   * dropping into a user LT.  Preserve the trampoline result in the spare
+   * stack slot reserved above because init_timer may clobber caller-saved regs.
+   */
+  STORE a0, 2*REGBYTES(sp)
+  la t0, init_timer
+  jalr t0
+  LOAD a0, 2*REGBYTES(sp)
+
+  LOAD a1, 0(sp)
+  LOAD t4, 1*REGBYTES(sp)
+  addi sp, sp, 3*REGBYTES
+  beqz a0, 1f
+  mv sp, a0
+
+  /*
+   * Mirror the first-boot drop from runtime S-mode into the eapp: enter the
+   * final swap with sp on the runtime stack and sscratch on the user LT stack.
+   * After csrrw, U-mode runs on the user stack and future traps save frames on
+   * supervisor runtime stack memory.
+   */
+  beqz t4, 3f
+  csrw sscratch, t4
+3:
+  /* Re-check after C helpers: keep the sscratch staging window non-preemptible. */
+  li t0, 0x2
+  csrrc x0, sstatus, t0
+  li t0, 0x100
+  csrrc x0, sstatus, t0
+  csrrw sp, sscratch, sp
+  mv a0, a1
+  sret
+1:
+  j 1b
 
 .align 6
 encl_trap_handler:

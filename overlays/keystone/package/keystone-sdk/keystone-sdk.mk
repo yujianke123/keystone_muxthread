@@ -13,8 +13,12 @@ endif
 # Export the variable below for any other keystone packages to use
 export KEYSTONE_SDK_DIR=$(HOST_DIR)/usr/share/keystone/sdk
 
+SLOTTEE_DEBUG_MINT_ENABLE ?= 0
+
 HOST_KEYSTONE_SDK_CONF_OPTS += -DKEYSTONE_SDK_DIR=$(KEYSTONE_SDK_DIR) \
-                                 -DKEYSTONE_BITS=${KEYSTONE_BITS}
+                                 -DKEYSTONE_BITS=${KEYSTONE_BITS} \
+                                 -DCMAKE_BUILD_TYPE=$(if $(filter 1 y yes true ON,$(SLOTTEE_DEBUG_MINT_ENABLE)),Debug,Release) \
+                                 -DSLOTTEE_DEBUG_MINT_ENABLE=$(if $(filter 1 y yes true ON,$(SLOTTEE_DEBUG_MINT_ENABLE)),ON,OFF)
 HOST_KEYSTONE_SDK_DEPENDENCIES += toolchain
 
 # Clean dependant packages if we clean this one

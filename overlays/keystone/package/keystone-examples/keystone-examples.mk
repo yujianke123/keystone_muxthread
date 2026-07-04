@@ -18,9 +18,13 @@ else
 KEYSTONE_EXAMPLES_DEPENDENCIES += opensbi
 endif
 
+SLOTTEE_DEBUG_MINT_ENABLE ?= 0
+
 KEYSTONE_EXAMPLES_CONF_OPTS += -DKEYSTONE_SDK_DIR=$(HOST_DIR)/usr/share/keystone/sdk \
                                 -DKEYSTONE_EYRIE_RUNTIME=$(KEYSTONE_RUNTIME_BUILDDIR) \
-                                -DKEYSTONE_BITS=${KEYSTONE_BITS}
+                                -DKEYSTONE_BITS=${KEYSTONE_BITS} \
+                                -DCMAKE_BUILD_TYPE=$(if $(filter 1 y yes true ON,$(SLOTTEE_DEBUG_MINT_ENABLE)),Debug,Release) \
+                                -DSLOTTEE_DEBUG_MINT_ENABLE=$(if $(filter 1 y yes true ON,$(SLOTTEE_DEBUG_MINT_ENABLE)),ON,OFF)
 ifeq ($(KEYSTONE_PLATFORM),cva6)
 KEYSTONE_EXAMPLES_CONF_OPTS += -Dfw_bin=$(BINARIES_DIR)/fw_payload.bin
 endif
@@ -36,4 +40,3 @@ endef
 
 $(eval $(keystone-package))
 $(eval $(cmake-package))
-

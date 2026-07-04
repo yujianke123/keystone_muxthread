@@ -12,18 +12,560 @@
 #include <sbi/riscv_asm.h>
 #include <sbi/riscv_locks.h>
 #include <sbi/sbi_console.h>
+#include <sbi/sbi_ipi.h>
+#include <sbi/sbi_scratch.h>
 
 struct enclave enclaves[ENCL_MAX];
+
+/*
+ * Cross-hart revoke rendezvous IPI.
+ *
+ * 安全关键路径优化：当 host 调用 mark_revoke 撤销一个正在**另一 hart 上 U-mode 运行**（未停在
+ * 任何 boundary）的 active slot 时，旧实现只置 revoke_pending、等目标 hart 下一次自然 boundary
+ * （timer-stop / resume / edge-call）才真正撤销——撤销延迟受目标 hart 的计算时长支配，最坏可被
+ * 一个忙循环 slot 拖很久。现在 SM 立即给目标 hart 发一个软件 IPI（MSIP）：目标 hart 陷入 M-mode
+ * 的 IRQ_M_SOFT，Keystone enclave trap handler 据此 stop_enclave，stop 路径完成
+ * complete_pending_revoke —— 即一次**强制 boundary / 跨 hart rendezvous**，把撤销延迟降到 IPI
+ * 投递级别，而非目标 hart 的下一次 timer。
+ *
+ * 注意：RT 内逻辑线程调度器的同步仍用 AMO 原子（不改），IPI 只用于 SM 安全关键路径上对其它 hart
+ * 的强制打断。process 回调为良性 no-op（IPI 真正效果是把目标 hart 踢进 M-mode；若目标在收到 IPI
+ * 前已离开 enclave，process 在 host 上下文消费该 IPI、无副作用）。发送为 fire-and-forget（无 sync
+ * 回调），且在释放 encl_lock 之后再发，避免目标 stop_enclave 抢 encl_lock 造成死锁。
+ */
+static int slottee_revoke_ipi_event = -1;
+
+static void slottee_revoke_ipi_process(struct sbi_scratch *scratch)
+{
+  (void)scratch;   /* 强制 boundary 的语义由 IRQ_M_SOFT→stop_enclave 完成；此处仅消费 IPI */
+}
+
+static struct sbi_ipi_event_ops slottee_revoke_ipi_ops = {
+  .name = "slottee_revoke",
+  .update = NULL,
+  .sync = NULL,                       /* fire-and-forget：不等目标，避免 encl_lock 死锁 */
+  .process = slottee_revoke_ipi_process,
+};
+
+void slottee_init_revoke_ipi(void)
+{
+  int id = sbi_ipi_event_create(&slottee_revoke_ipi_ops);
+
+  if (id >= 0)
+    slottee_revoke_ipi_event = id;
+  else
+    sbi_printf("[SM] slottee revoke IPI event create failed (%d)\n", id);
+}
+
+/* 给目标 hart 发跨 hart 撤销 rendezvous IPI。调用方必须**不**持有 encl_lock。 */
+static void slottee_send_revoke_ipi(uintptr_t target_hart)
+{
+  if (slottee_revoke_ipi_event < 0)
+    return;
+  if (target_hart == csr_read(mhartid))
+    return;
+  sbi_printf("[SM] slottee revoke rendezvous IPI -> hart %lu (from hart %lu)\n",
+      (unsigned long)target_hart, (unsigned long)csr_read(mhartid));
+  sbi_ipi_send_many((ulong)1, (ulong)target_hart,
+      (u32)slottee_revoke_ipi_event, NULL);
+}
 
 // Enclave IDs are unsigned ints, so we do not need to check if eid is
 // greater than or equal to 0
 #define ENCLAVE_EXISTS(eid) (eid < ENCL_MAX && enclaves[eid].state >= 0)
 
 static spinlock_t encl_lock = SPIN_LOCK_INITIALIZER;
+static uintptr_t next_cap_key_generation = 1;
 
 extern void save_host_regs(void);
 extern void restore_host_regs(void);
 extern byte dev_public_key[PUBLIC_KEY_SIZE];
+
+static int enclave_has_unactivatable_slot_leases(enclave_id eid);
+static struct slot_lease_t *find_active_slot_lease_by_thread_index(
+    enclave_id eid, uintptr_t thread_index);
+
+static uintptr_t read_cycle(void)
+{
+  uintptr_t cycle;
+
+  asm volatile ("rdcycle %0" : "=r" (cycle));
+  return cycle;
+}
+
+static int slottee_slot_mode_uses_rt_user_context(uintptr_t slot_mode)
+{
+  return slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_OCALL ||
+      slot_mode == SLOTTEE_SLOT_TOKEN_MODE_LT_USER_REVOKE_FAULT;
+}
+
+static void clear_enclave_cap_key(enclave_id eid)
+{
+  sbi_memset(enclaves[eid].cap_key, 0, sizeof(enclaves[eid].cap_key));
+  enclaves[eid].cap_key_ready = 0;
+  enclaves[eid].cap_key_generation = 0;
+}
+
+static uintptr_t allocate_cap_key_generation(void)
+{
+  uintptr_t generation = next_cap_key_generation++;
+
+  if (next_cap_key_generation == 0)
+    next_cap_key_generation = 1;
+
+  return generation;
+}
+
+static void derive_enclave_cap_key(enclave_id eid)
+{
+  static const char label[] = "slottee-cap-v2";
+  uintptr_t generation = allocate_cap_key_generation();
+  hash_ctx ctx;
+
+  enclaves[eid].cap_key_generation = generation;
+  hash_init(&ctx);
+  hash_extend(&ctx, sm_private_key, PRIVATE_KEY_SIZE);
+  hash_extend(&ctx, enclaves[eid].hash, MDSIZE);
+  hash_extend(&ctx, &eid, sizeof(eid));
+  hash_extend(&ctx, &generation, sizeof(generation));
+  hash_extend(&ctx, label, sizeof(label) - 1);
+  hash_finalize(enclaves[eid].cap_key, &ctx);
+  enclaves[eid].cap_key_ready = 1;
+}
+
+static void compute_slot_cap_mac(
+    enclave_id eid, const struct slot_cap_t *cap,
+    uintptr_t mac[SLOTTEE_CAP_MAC_WORDS])
+{
+  static const char label[] = "slottee-cap-mac-v1";
+  byte digest[MDSIZE];
+  uintptr_t fields[7];
+  hash_ctx ctx;
+
+  fields[0] = cap->version;
+  fields[1] = cap->eid;
+  fields[2] = cap->slot_id;
+  fields[3] = cap->epoch;
+  fields[4] = cap->cap_seq;
+  fields[5] = cap->rights;
+  fields[6] = cap->max_lease_cycles;
+
+  hash_init(&ctx);
+  hash_extend(&ctx, enclaves[eid].cap_key, sizeof(enclaves[eid].cap_key));
+  hash_extend(&ctx, label, sizeof(label) - 1);
+  hash_extend(&ctx, fields, sizeof(fields));
+  hash_finalize(digest, &ctx);
+
+  sbi_memcpy(mac, digest, SLOTTEE_CAP_MAC_WORDS * sizeof(uintptr_t));
+  sbi_memset(digest, 0, sizeof(digest));
+}
+
+static int slot_cap_mac_equal(
+    const uintptr_t lhs[SLOTTEE_CAP_MAC_WORDS],
+    const uintptr_t rhs[SLOTTEE_CAP_MAC_WORDS])
+{
+  uintptr_t diff = 0;
+  size_t word;
+
+  for (word = 0; word < SLOTTEE_CAP_MAC_WORDS; word++)
+    diff |= lhs[word] ^ rhs[word];
+
+  return diff == 0;
+}
+
+static int verify_slot_cap_mac(enclave_id eid, const struct slot_cap_t *cap)
+{
+  uintptr_t expected[SLOTTEE_CAP_MAC_WORDS];
+  int ok;
+
+  if (!enclaves[eid].cap_key_ready)
+    return 0;
+
+  compute_slot_cap_mac(eid, cap, expected);
+  ok = slot_cap_mac_equal(cap->cap_mac, expected);
+  sbi_memset(expected, 0, sizeof(expected));
+
+  return ok;
+}
+
+static void sign_slot_cap(enclave_id eid, struct slot_cap_t *cap)
+{
+  cap->version = SLOTTEE_ENTER_SLOT_VERSION;
+  cap->eid = eid;
+  cap->epoch = enclaves[eid].current_slot_epoch;
+  compute_slot_cap_mac(eid, cap, cap->cap_mac);
+}
+
+static uintptr_t slot_lease_expiry(uintptr_t now, uintptr_t ttl)
+{
+  if (((uintptr_t)-1) - now < ttl)
+    return (uintptr_t)-1;
+
+  return now + ttl;
+}
+
+static uintptr_t enclave_slot_thread_index(uintptr_t slot_id)
+{
+  if (slot_id < MAX_ENCL_THREADS)
+    return slot_id;
+
+  return 0;
+}
+
+static int enclave_slot_state_is_activatable(enclave_id eid)
+{
+  if (enclaves[eid].state == FRESH)
+    return 1;
+
+  if (!enclaves[eid].slot_reentry_ready ||
+      enclaves[eid].params.slot_entry == enclaves[eid].params.dram_base)
+    return 0;
+
+  if (enclaves[eid].state == STOPPED)
+    return enclaves[eid].n_thread < MAX_ENCL_THREADS &&
+      !enclave_has_unactivatable_slot_leases(eid);
+
+  return enclaves[eid].state == RUNNING &&
+      enclaves[eid].n_thread < MAX_ENCL_THREADS;
+}
+
+static void clear_enclave_slot_leases(enclave_id eid)
+{
+  size_t slot;
+
+  enclaves[eid].next_slot_lease_id = 1;
+  enclaves[eid].current_slot_epoch = SLOTTEE_INITIAL_EPOCH;
+  enclaves[eid].lease_expired_count = 0;
+  for(slot = 0; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    enclaves[eid].slot_leases[slot].slot_id = slot;
+    enclaves[eid].slot_leases[slot].lease_id = 0;
+    enclaves[eid].slot_leases[slot].epoch = 0;
+    enclaves[eid].slot_leases[slot].cap_seq = 0;
+    enclaves[eid].slot_leases[slot].rights = 0;
+    enclaves[eid].slot_leases[slot].max_lease_cycles = 0;
+    enclaves[eid].slot_leases[slot].bound_hart = 0;
+    enclaves[eid].slot_leases[slot].expiry_cycle = 0;
+    enclaves[eid].slot_leases[slot].entry_pc = 0;
+    enclaves[eid].slot_leases[slot].exit_reason = 0;
+    enclaves[eid].slot_leases[slot].active_hart = 0;
+    enclaves[eid].slot_leases[slot].thread_index = 0;
+    enclaves[eid].slot_leases[slot].slot_mode =
+        SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
+    enclaves[eid].slot_leases[slot].revoke_pending = 0;
+    enclaves[eid].slot_leases[slot].state = SLOT_LEASE_FREE;
+  }
+}
+
+static void revoke_enclave_slot_lease(struct slot_lease_t *lease)
+{
+  lease->rights = 0;
+  lease->max_lease_cycles = 0;
+  lease->expiry_cycle = 0;
+  lease->active_hart = 0;
+  lease->thread_index = 0;
+  lease->slot_mode = SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
+  lease->revoke_pending = 0;
+  lease->state = SLOT_LEASE_REVOKED;
+}
+
+static void expire_enclave_slot_lease(enclave_id eid, struct slot_lease_t *lease)
+{
+  uintptr_t thread_index;
+
+  if (!lease)
+    return;
+
+  thread_index = lease->thread_index;
+  if (thread_index < MAX_ENCL_THREADS)
+    enclaves[eid].stopped_threads[thread_index] = 0;
+  if (enclaves[eid].stopped_thread_index == thread_index)
+    enclaves[eid].stopped_thread_index = 0;
+
+  lease->rights = 0;
+  lease->max_lease_cycles = 0;
+  lease->expiry_cycle = 0;
+  lease->active_hart = 0;
+  lease->thread_index = 0;
+  lease->slot_mode = SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
+  lease->revoke_pending = 0;
+  lease->state = SLOT_LEASE_EXPIRED;
+  enclaves[eid].lease_expired_count++;
+
+  if (enclaves[eid].n_thread == 0 && enclaves[eid].state == RUNNING)
+    enclaves[eid].state = STOPPED;
+}
+
+static void free_enclave_slot_lease(struct slot_lease_t *lease)
+{
+  uintptr_t slot_id = lease->slot_id;
+
+  lease->slot_id = slot_id;
+  lease->lease_id = 0;
+  lease->epoch = 0;
+  lease->cap_seq = 0;
+  lease->rights = 0;
+  lease->max_lease_cycles = 0;
+  lease->bound_hart = 0;
+  lease->expiry_cycle = 0;
+  lease->entry_pc = 0;
+  lease->exit_reason = 0;
+  lease->active_hart = 0;
+  lease->thread_index = 0;
+  lease->slot_mode = SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
+  lease->revoke_pending = 0;
+  lease->state = SLOT_LEASE_FREE;
+}
+
+static int slot_lease_is_busy(const struct slot_lease_t *lease)
+{
+  return lease->state == SLOT_LEASE_RESERVED ||
+         lease->state == SLOT_LEASE_ACTIVE ||
+         lease->state == SLOT_LEASE_EXITING;
+}
+
+static int slot_lease_has_pending_revoke(const struct slot_lease_t *lease)
+{
+  return lease &&
+      lease->state == SLOT_LEASE_ACTIVE &&
+      lease->revoke_pending;
+}
+
+static int slot_lease_is_stopped(const struct slot_lease_t *lease)
+{
+  return lease &&
+      lease->state == SLOT_LEASE_ACTIVE &&
+      lease->active_hart == 0 &&
+      lease->thread_index > 0 &&
+      lease->thread_index < MAX_ENCL_THREADS;
+}
+
+int enclave_slot_timer_redirectable(enclave_id eid, uintptr_t thread_index)
+{
+  struct slot_lease_t *lease;
+  int redirectable = 0;
+
+  spin_lock(&encl_lock);
+  if (ENCLAVE_EXISTS(eid) && enclaves[eid].state == RUNNING) {
+    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+    redirectable = lease &&
+        lease->active_hart == csr_read(mhartid) &&
+        !slot_lease_has_pending_revoke(lease) &&
+        slottee_slot_mode_uses_rt_user_context(lease->slot_mode);
+  }
+  spin_unlock(&encl_lock);
+
+  return redirectable;
+}
+
+/*
+ * 跨 hart 撤销 rendezvous 同步等待上界：mark_revoke 发 IPI 后最多等这么多周期让目标 hart 完成撤销；
+ * 超时则回退到"等目标下一次自然 boundary"（旧语义）。取值远大于实测 IPI 撤销延迟(~3.4e6)。
+ */
+#define SLOTTEE_REVOKE_RENDEZVOUS_WAIT_CYCLES (64UL * 1024UL * 1024UL)
+
+/* 该 slot 的 lease 是否已不再 active-pending（撤销已完成或 lease 已变更）。 */
+static int slot_lease_revoke_settled(enclave_id eid, uintptr_t slot_id)
+{
+  struct slot_lease_t *lease;
+  int settled;
+
+  spin_lock(&encl_lock);
+  if (!ENCLAVE_EXISTS(eid)) {
+    spin_unlock(&encl_lock);
+    return 1;
+  }
+  lease = &enclaves[eid].slot_leases[slot_id];
+  settled = (lease->state != SLOT_LEASE_ACTIVE) || !lease->revoke_pending;
+  spin_unlock(&encl_lock);
+  return settled;
+}
+
+static void mark_slot_lease_revoke_pending(struct slot_lease_t *lease)
+{
+  if (lease && lease->state == SLOT_LEASE_ACTIVE)
+    lease->revoke_pending = 1;
+}
+
+static void complete_pending_revoke_enclave_slot(
+    enclave_id eid, struct slot_lease_t *lease)
+{
+  if (!slot_lease_has_pending_revoke(lease))
+    return;
+
+  lease->exit_reason = SLOTTEE_SLOT_EXIT_REVOKE;
+  revoke_enclave_slot_lease(lease);
+  enclaves[eid].current_slot_epoch++;
+}
+
+static int enclave_has_unactivatable_slot_leases(enclave_id eid)
+{
+  size_t slot;
+
+  for(slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    struct slot_lease_t *lease = &enclaves[eid].slot_leases[slot];
+
+    if (slot_lease_has_pending_revoke(lease))
+      return 1;
+    if (lease->state == SLOT_LEASE_RESERVED ||
+        lease->state == SLOT_LEASE_EXITING)
+      return 1;
+    if (lease->state == SLOT_LEASE_ACTIVE && !slot_lease_is_stopped(lease))
+      return 1;
+  }
+
+  return 0;
+}
+
+static uintptr_t count_busy_slot_leases(enclave_id eid)
+{
+  uintptr_t busy = 0;
+  size_t slot;
+
+  for(slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    if (slot_lease_is_busy(&enclaves[eid].slot_leases[slot]))
+      busy++;
+  }
+
+  return busy;
+}
+
+static void clear_enclave_slot_reentry_template(enclave_id eid)
+{
+  size_t thread;
+
+  enclaves[eid].slot_reentry_ready = 0;
+  enclaves[eid].slot_reentry_csrs = (struct csrs) {0};
+  enclaves[eid].slot_reentry_mstatus = 0;
+  for (thread = 0; thread < MAX_ENCL_THREADS; thread++)
+    enclaves[eid].stopped_threads[thread] = 0;
+}
+
+static void save_enclave_slot_reentry_template(enclave_id eid, uintptr_t thread_index)
+{
+  if (thread_index == 0 || thread_index >= MAX_ENCL_THREADS ||
+      enclaves[eid].params.slot_entry == enclaves[eid].params.dram_base)
+    return;
+
+  enclaves[eid].slot_reentry_csrs = enclaves[eid].threads[thread_index].prev_csrs;
+  enclaves[eid].slot_reentry_mstatus =
+      enclaves[eid].threads[thread_index].prev_mstatus;
+  enclaves[eid].slot_reentry_ready = 1;
+}
+
+static void save_current_enclave_slot_reentry_template(
+    enclave_id eid, struct sbi_trap_regs *regs)
+{
+  enclaves[eid].slot_reentry_csrs.sstatus = csr_read(sstatus);
+  enclaves[eid].slot_reentry_csrs.sedeleg = 0;
+  enclaves[eid].slot_reentry_csrs.sideleg = 0;
+  enclaves[eid].slot_reentry_csrs.sie = csr_read(sie);
+  enclaves[eid].slot_reentry_csrs.stvec = csr_read(stvec);
+  enclaves[eid].slot_reentry_csrs.scounteren = csr_read(scounteren);
+  enclaves[eid].slot_reentry_csrs.sscratch = csr_read(sscratch);
+  enclaves[eid].slot_reentry_csrs.sepc = csr_read(sepc);
+  enclaves[eid].slot_reentry_csrs.scause = csr_read(scause);
+  enclaves[eid].slot_reentry_csrs.sbadaddr = csr_read(sbadaddr);
+  enclaves[eid].slot_reentry_csrs.sip = csr_read(sip);
+  enclaves[eid].slot_reentry_csrs.satp = csr_read(satp);
+  enclaves[eid].slot_reentry_mstatus = regs->mstatus;
+  enclaves[eid].slot_reentry_ready = 1;
+}
+
+static int prepare_enclave_slot_reentry(
+    enclave_id eid, uintptr_t thread_index, uintptr_t slot_token)
+{
+  struct thread_state *thread;
+
+  if (!enclaves[eid].slot_reentry_ready ||
+      thread_index == 0 || thread_index >= MAX_ENCL_THREADS ||
+      enclaves[eid].params.slot_entry == enclaves[eid].params.dram_base)
+    return 0;
+
+  thread = &enclaves[eid].threads[thread_index];
+  clean_state(thread);
+  thread->prev_csrs = enclaves[eid].slot_reentry_csrs;
+  thread->prev_mstatus = enclaves[eid].slot_reentry_mstatus;
+  thread->prev_mepc = enclaves[eid].params.slot_entry - 4;
+  thread->prev_csrs.sscratch = 0;
+  /*
+   * LT user stack and TLS are staged by the Eyrie runtime reentry path.
+   * Clear the boot-time user sscratch from the SM-side reentry template so
+   * any S-mode trap before the final user swap is handled as a runtime trap.
+   */
+  thread->prev_state.t6 = slot_token;
+
+  return 1;
+}
+
+static struct slot_lease_t *find_active_slot_lease_by_thread_index(
+    enclave_id eid, uintptr_t thread_index)
+{
+  size_t slot;
+
+  for(slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    struct slot_lease_t *lease = &enclaves[eid].slot_leases[slot];
+
+    if (lease->state == SLOT_LEASE_ACTIVE &&
+        lease->thread_index == thread_index)
+      return lease;
+  }
+
+  return NULL;
+}
+
+static struct slot_lease_t *find_stopped_slot_lease(
+    enclave_id eid, uintptr_t slot_id, uintptr_t lease_id)
+{
+  struct slot_lease_t *lease;
+
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return NULL;
+
+  lease = &enclaves[eid].slot_leases[slot_id];
+  if (!slot_lease_is_stopped(lease) ||
+      lease->lease_id != lease_id)
+    return NULL;
+
+  return lease;
+}
+
+static void revoke_all_enclave_slot_leases(enclave_id eid)
+{
+  size_t slot;
+  int revoked = 0;
+
+  for(slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    if (slot_lease_is_busy(&enclaves[eid].slot_leases[slot])) {
+      revoke_enclave_slot_lease(&enclaves[eid].slot_leases[slot]);
+      revoked = 1;
+    }
+  }
+
+  if (revoked)
+    enclaves[eid].current_slot_epoch++;
+}
+
+static uintptr_t reclaim_expired_enclave_slot_leases(enclave_id eid, uintptr_t now)
+{
+  size_t slot;
+  uintptr_t reclaimed = 0;
+
+  for(slot = 1; slot < SLOTTEE_MAX_SLOTS; slot++) {
+    struct slot_lease_t *lease = &enclaves[eid].slot_leases[slot];
+
+    if ((lease->state == SLOT_LEASE_RESERVED ||
+         slot_lease_is_stopped(lease)) &&
+        lease->expiry_cycle && now >= lease->expiry_cycle) {
+      expire_enclave_slot_lease(eid, lease);
+      reclaimed++;
+    }
+  }
+
+  if (reclaimed)
+    enclaves[eid].current_slot_epoch++;
+
+  return reclaimed;
+}
 
 /****************************
  *
@@ -41,19 +583,28 @@ extern byte dev_public_key[PUBLIC_KEY_SIZE];
 */
 static inline void context_switch_to_enclave(struct sbi_trap_regs* regs,
                                                 enclave_id eid,
-                                                int load_parameters){
-  /* save host context */
-  swap_prev_state(&enclaves[eid].threads[0], regs, 1);
-  swap_prev_mepc(&enclaves[eid].threads[0], regs, regs->mepc);
-  swap_prev_mstatus(&enclaves[eid].threads[0], regs, regs->mstatus);
+                                                uintptr_t thread_index,
+                                                int load_parameters,
+                                                uintptr_t entry_arg){
+  struct thread_state *thread = &enclaves[eid].threads[thread_index];
 
-  uintptr_t interrupts = 0;
+  /* save host context */
+  swap_prev_state(thread, regs, 1);
+  swap_prev_mepc(thread, regs, regs->mepc);
+  swap_prev_mstatus(thread, regs, regs->mstatus);
+
+  uintptr_t interrupts = enclave_slot_timer_redirectable(eid, thread_index) ?
+      MIP_STIP : 0;
   csr_write(mideleg, interrupts);
 
   if(load_parameters) {
     // passing parameters for a first run
-    regs->mepc = (uintptr_t) enclaves[eid].params.dram_base - 4; // regs->mepc will be +4 before sbi_ecall_handler return
+    uintptr_t entry_pc = enclaves[eid].params.dram_base;
+    regs->mepc = entry_pc - 4; // regs->mepc will be +4 before sbi_ecall_handler return
     regs->mstatus = (1 << MSTATUS_MPP_SHIFT);
+    // $a0: SlotTEE slot token. Zero preserves the original slot 0 run path.
+    regs->a0 = entry_arg;
+    regs->t6 = entry_arg;
     // $a1: (PA) DRAM base,
     regs->a1 = (uintptr_t) enclaves[eid].params.dram_base;
     // $a2: DRAM size,
@@ -86,12 +637,14 @@ static inline void context_switch_to_enclave(struct sbi_trap_regs* regs,
 
   // Setup any platform specific defenses
   platform_switch_to_enclave(&(enclaves[eid]));
-  cpu_enter_enclave_context(eid);
+  cpu_enter_enclave_context(eid, thread_index);
 }
 
 static inline void context_switch_to_host(struct sbi_trap_regs *regs,
     enclave_id eid,
+    uintptr_t thread_index,
     int return_on_resume){
+  struct thread_state *thread = &enclaves[eid].threads[thread_index];
 
   // set PMP
   int memid;
@@ -106,9 +659,9 @@ static inline void context_switch_to_host(struct sbi_trap_regs *regs,
   csr_write(mideleg, interrupts);
 
   /* restore host context */
-  swap_prev_state(&enclaves[eid].threads[0], regs, return_on_resume);
-  swap_prev_mepc(&enclaves[eid].threads[0], regs, regs->mepc);
-  swap_prev_mstatus(&enclaves[eid].threads[0], regs, regs->mstatus);
+  swap_prev_state(thread, regs, return_on_resume);
+  swap_prev_mepc(thread, regs, regs->mepc);
+  swap_prev_mstatus(thread, regs, regs->mstatus);
 
   switch_vector_host();
 
@@ -154,6 +707,8 @@ void enclave_init_metadata(void){
     for(i=0; i < ENCLAVE_REGIONS_MAX; i++){
       enclaves[eid].regions[i].type = REGION_INVALID;
     }
+    clear_enclave_slot_leases(eid);
+    clear_enclave_cap_key(eid);
     /* Fire all platform specific init for each enclave */
     platform_init_enclave(&(enclaves[eid]));
   }
@@ -346,6 +901,7 @@ unsigned long create_enclave(unsigned long *eidptr, struct keystone_sbi_create_t
   enclave_id eid;
   unsigned long ret;
   int region, shared_region;
+  size_t thread;
 
   /* Runtime parameters */
   if(!is_create_args_valid(&create_args))
@@ -361,6 +917,7 @@ unsigned long create_enclave(unsigned long *eidptr, struct keystone_sbi_create_t
   params.untrusted_base = utbase;
   params.untrusted_size = utsize;
   params.free_requested = create_args.free_requested;
+  params.slot_entry = create_args.slot_entry ? create_args.slot_entry : base;
 
 
   // allocate eid
@@ -398,10 +955,14 @@ unsigned long create_enclave(unsigned long *eidptr, struct keystone_sbi_create_t
   enclaves[eid].encl_satp = ((base >> RISCV_PGSHIFT) | (SATP_MODE_SV39 << HGATP_MODE_SHIFT));
 #endif
   enclaves[eid].n_thread = 0;
+  enclaves[eid].stopped_thread_index = 0;
+  clear_enclave_slot_reentry_template(eid);
   enclaves[eid].params = params;
+  clear_enclave_slot_leases(eid);
 
   /* Init enclave state (regs etc) */
-  clean_state(&enclaves[eid].threads[0]);
+  for (thread = 0; thread < MAX_ENCL_THREADS; thread++)
+    clean_state(&enclaves[eid].threads[thread]);
 
   /* Platform create happens as the last thing before hashing/etc since
      it may modify the enclave struct */
@@ -417,6 +978,7 @@ unsigned long create_enclave(unsigned long *eidptr, struct keystone_sbi_create_t
   if (ret)
     goto unlock;
 
+  derive_enclave_cap_key(eid);
   enclaves[eid].state = FRESH;
   /* EIDs are unsigned int in size, copy via simple copy */
   *eidptr = eid;
@@ -461,6 +1023,9 @@ unsigned long destroy_enclave(enclave_id eid)
   if(!destroyable)
     return SBI_ERR_SM_ENCLAVE_NOT_DESTROYABLE;
 
+  spin_lock(&encl_lock);
+  revoke_all_enclave_slot_leases(eid);
+  spin_unlock(&encl_lock);
 
   // 0. Let the platform specifics do cleanup/modifications
   platform_destroy_enclave(&enclaves[eid]);
@@ -494,15 +1059,402 @@ unsigned long destroy_enclave(enclave_id eid)
 
   enclaves[eid].encl_satp = 0;
   enclaves[eid].n_thread = 0;
+  enclaves[eid].stopped_thread_index = 0;
+  clear_enclave_slot_reentry_template(eid);
   enclaves[eid].params = (struct runtime_params_t) {0};
+  clear_enclave_slot_leases(eid);
+  clear_enclave_cap_key(eid);
   for(i=0; i < ENCLAVE_REGIONS_MAX; i++){
     enclaves[eid].regions[i].type = REGION_INVALID;
+  }
+  for(i=0; i < MAX_ENCL_THREADS; i++){
+    clean_state(&enclaves[eid].threads[i]);
   }
 
   // 3. release eid
   encl_free_eid(eid);
 
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+unsigned long mint_enclave_slot_cap(
+    enclave_id eid, const struct mint_slot_cap_req_t *req, struct mint_slot_cap_resp_t *resp)
+{
+  unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
+  struct slot_cap_t cap = {0};
+
+  if (!req || req->version != SLOTTEE_MINT_CAP_VERSION)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+
+  if (!ENCLAVE_EXISTS(eid) || enclaves[eid].state < FRESH) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+    goto out;
+  }
+
+  if (req->slot_id == 0 || req->slot_id >= SLOTTEE_MAX_SLOTS ||
+      !enclaves[eid].cap_key_ready) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  cap.version = SLOTTEE_ENTER_SLOT_VERSION;
+  cap.eid = eid;
+  cap.slot_id = req->slot_id;
+  cap.epoch = enclaves[eid].current_slot_epoch;
+  cap.cap_seq = req->cap_seq ? req->cap_seq : SLOTTEE_DEFAULT_CAP_SEQ;
+  cap.rights = req->rights ? req->rights : SLOTTEE_CAP_RIGHT_ENTER;
+  cap.max_lease_cycles = req->max_lease_cycles ?
+      req->max_lease_cycles : SLOTTEE_DEFAULT_MAX_LEASE_CYCLES;
+
+  if (cap.rights != SLOTTEE_CAP_RIGHT_ENTER ||
+      cap.max_lease_cycles == 0) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  sign_slot_cap(eid, &cap);
+
+out:
+  if (resp) {
+    resp->status = ret;
+    resp->cap = ret == SBI_ERR_SM_ENCLAVE_SUCCESS ?
+        cap : (struct slot_cap_t) {0};
+  }
+  spin_unlock(&encl_lock);
+  return ret;
+}
+
+unsigned long reserve_enclave_slot(
+    enclave_id eid, const struct slot_cap_t *cap, struct enter_slot_resp_t *resp)
+{
+  unsigned long ret = SBI_ERR_SM_NOT_IMPLEMENTED;
+  struct slot_lease_t *lease;
+  uintptr_t now;
+
+  if (!cap)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (cap->slot_id == 0 || cap->slot_id >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+
+  if (!ENCLAVE_EXISTS(eid) || enclaves[eid].state < FRESH) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+    goto out;
+  }
+
+  now = read_cycle();
+  reclaim_expired_enclave_slot_leases(eid, now);
+
+  if (!verify_slot_cap_mac(eid, cap)) {
+    ret = SBI_ERR_SM_ENCLAVE_BAD_CAP;
+    goto out;
+  }
+
+  if (cap->eid != eid || cap->epoch != enclaves[eid].current_slot_epoch) {
+    ret = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
+    goto out;
+  }
+
+  if (cap->rights != SLOTTEE_CAP_RIGHT_ENTER || cap->cap_seq == 0 ||
+      cap->max_lease_cycles == 0) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  lease = &enclaves[eid].slot_leases[cap->slot_id];
+  if (slot_lease_is_busy(lease)) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  lease->slot_id = cap->slot_id;
+  lease->lease_id = enclaves[eid].next_slot_lease_id++;
+  lease->epoch = cap->epoch;
+  lease->cap_seq = cap->cap_seq;
+  lease->rights = cap->rights;
+  lease->max_lease_cycles = cap->max_lease_cycles;
+  lease->bound_hart = csr_read(mhartid);
+  lease->expiry_cycle = slot_lease_expiry(now, cap->max_lease_cycles);
+  lease->entry_pc = enclaves[eid].params.slot_entry;
+  lease->exit_reason = 0;
+  lease->active_hart = 0;
+  lease->thread_index = enclave_slot_thread_index(cap->slot_id);
+  lease->slot_mode = SLOTTEE_SLOT_TOKEN_MODE_TRAMPOLINE;
+  lease->state = SLOT_LEASE_RESERVED;
+
+  if (resp) {
+    resp->value = lease->lease_id;
+    resp->lease_id = lease->lease_id;
+    resp->bound_hart = lease->bound_hart;
+    resp->expiry_cycle = lease->expiry_cycle;
+  }
+
+out:
+  if (resp)
+    resp->status = ret;
+  spin_unlock(&encl_lock);
+  return ret;
+}
+
+unsigned long activate_enclave_slot(
+    enclave_id eid, const struct slot_cap_t *cap, uintptr_t slot_mode,
+    struct enter_slot_resp_t *resp)
+{
+  unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
+  struct slot_lease_t *lease;
+  uintptr_t now;
+
+  if (!cap)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  if (cap->slot_id == 0 || cap->slot_id >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+
+  if (!ENCLAVE_EXISTS(eid) || !enclave_slot_state_is_activatable(eid)) {
+    ret = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
+    goto out;
+  }
+
+  now = read_cycle();
+  reclaim_expired_enclave_slot_leases(eid, now);
+
+  if (!verify_slot_cap_mac(eid, cap)) {
+    ret = SBI_ERR_SM_ENCLAVE_BAD_CAP;
+    goto out;
+  }
+
+  if (cap->eid != eid || cap->epoch != enclaves[eid].current_slot_epoch) {
+    ret = SBI_ERR_SM_ENCLAVE_NOT_FRESH;
+    goto out;
+  }
+
+  if (cap->rights != SLOTTEE_CAP_RIGHT_ENTER || cap->cap_seq == 0 ||
+      cap->max_lease_cycles == 0) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  lease = &enclaves[eid].slot_leases[cap->slot_id];
+  if (slot_lease_is_busy(lease)) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+    goto out;
+  }
+
+  lease->slot_id = cap->slot_id;
+  lease->lease_id = enclaves[eid].next_slot_lease_id++;
+  lease->epoch = cap->epoch;
+  lease->cap_seq = cap->cap_seq;
+  lease->rights = cap->rights;
+  lease->max_lease_cycles = cap->max_lease_cycles;
+  lease->bound_hart = csr_read(mhartid);
+  lease->expiry_cycle = slot_lease_expiry(now, cap->max_lease_cycles);
+  lease->entry_pc = enclaves[eid].params.slot_entry;
+  lease->exit_reason = 0;
+  lease->active_hart = csr_read(mhartid);
+  lease->thread_index = enclave_slot_thread_index(cap->slot_id);
+  lease->slot_mode = slot_mode;
+  lease->state = SLOT_LEASE_ACTIVE;
+  enclaves[eid].state = RUNNING;
+  enclaves[eid].n_thread++;
+  clean_state(&enclaves[eid].threads[lease->thread_index]);
+
+  if (resp) {
+    resp->status = SBI_ERR_SM_ENCLAVE_SUCCESS;
+    resp->value = lease->lease_id;
+    resp->lease_id = lease->lease_id;
+    resp->bound_hart = lease->bound_hart;
+    resp->expiry_cycle = lease->expiry_cycle;
+  }
+
+out:
+  if (resp)
+    resp->status = ret;
+  spin_unlock(&encl_lock);
+  return ret;
+}
+
+unsigned long mark_revoke_enclave_slot(
+    enclave_id eid, const struct mark_revoke_req_t *req, struct mark_revoke_resp_t *resp)
+{
+  unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
+  struct slot_lease_t *lease;
+  uintptr_t kick_hart = 0;   /* != 0 → 撤销时该 slot 正活在另一 hart，需发 rendezvous IPI */
+
+  if (!req || req->version != SLOTTEE_ENTER_SLOT_VERSION ||
+      req->slot_id == 0 || req->slot_id >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+
+  if (!ENCLAVE_EXISTS(eid) || enclaves[eid].state < FRESH) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+    goto out;
+  }
+
+  lease = &enclaves[eid].slot_leases[req->slot_id];
+  if (lease->state == SLOT_LEASE_ACTIVE) {
+    mark_slot_lease_revoke_pending(lease);
+    /* 若该 slot 正在另一 hart 上 U-mode 运行：记录目标 hart，待解锁后发强制 rendezvous IPI，
+     * 把撤销从"等目标下一次自然 boundary"提前到 IPI 投递级别。 */
+    if (lease->active_hart != 0 && lease->active_hart != csr_read(mhartid)) {
+      kick_hart = lease->active_hart;
+      enclaves[eid].revoke_ipi_count++;
+    }
+    if (resp)
+      resp->epoch = enclaves[eid].current_slot_epoch + 1;
+    goto out;
+  }
+
+  if (slot_lease_is_busy(lease))
+    revoke_enclave_slot_lease(lease);
+
+  enclaves[eid].current_slot_epoch++;
+  if (resp)
+    resp->epoch = enclaves[eid].current_slot_epoch;
+
+out:
+  if (resp) {
+    resp->status = ret;
+    if (ret != SBI_ERR_SM_ENCLAVE_SUCCESS)
+      resp->epoch = 0;
+    resp->ipi_sent = (kick_hart != 0) ? 1 : 0;
+  }
+  spin_unlock(&encl_lock);
+  /* IPI 必须在释放 encl_lock 之后发：目标 hart 收到后会进 stop_enclave 抢 encl_lock，
+   * 若我们仍持锁则死锁。发完**同步等待**撤销完成——这样 IPI 在 mark 期间即被目标消费、撤销即时
+   * 生效，且不会有迟到的 IPI 落到下一次 entry（避免误中断）。超时则回退到自然 boundary 完成。 */
+  if (kick_hart != 0) {
+    uintptr_t start, now;
+
+    slottee_send_revoke_ipi(kick_hart);
+    asm volatile("rdcycle %0" : "=r"(start));
+    while (!slot_lease_revoke_settled(eid, req->slot_id)) {
+      asm volatile("rdcycle %0" : "=r"(now));
+      if ((now - start) > SLOTTEE_REVOKE_RENDEZVOUS_WAIT_CYCLES)
+        break;   /* 超时回退：撤销仍 pending，将在目标下一次 boundary 完成（旧语义） */
+    }
+  }
+  return ret;
+}
+
+unsigned long debug_enclave_slot_state(
+    enclave_id eid, const struct slottee_debug_req_t *req, struct slottee_debug_resp_t *resp)
+{
+  unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
+
+  if (!req || req->version != SLOTTEE_DEBUG_VERSION)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+#ifndef SLOTTEE_DEBUG_MINT_ENABLE
+  if (req->op == 4) {
+    if (resp)
+      resp->status = SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED;
+    return SBI_ERR_SM_ENCLAVE_SBI_PROHIBITED;
+  }
+#endif
+
+  if (req->op != SLOTTEE_DEBUG_OP_REENTRY_STATUS &&
+      req->op != SLOTTEE_DEBUG_OP_REENTRY_CLEAR &&
+      req->op != SLOTTEE_DEBUG_OP_CAP_KEY_STATUS
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
+      && req->op != SLOTTEE_DEBUG_OP_MINT_CAP
+#endif
+      )
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+  if (!ENCLAVE_EXISTS(eid) || enclaves[eid].state < FRESH) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+    goto out;
+  }
+
+  if (req->op == SLOTTEE_DEBUG_OP_REENTRY_CLEAR)
+    clear_enclave_slot_reentry_template(eid);
+
+#ifdef SLOTTEE_DEBUG_MINT_ENABLE
+  if (req->op == SLOTTEE_DEBUG_OP_MINT_CAP) {
+    struct slot_cap_t cap = req->cap;
+
+    if (cap.slot_id == 0 || cap.slot_id >= SLOTTEE_MAX_SLOTS ||
+        !enclaves[eid].cap_key_ready) {
+      ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+      goto out;
+    }
+
+    if (cap.cap_seq == 0)
+      cap.cap_seq = SLOTTEE_DEFAULT_CAP_SEQ;
+    if (cap.rights == 0)
+      cap.rights = SLOTTEE_CAP_RIGHT_ENTER;
+    if (cap.max_lease_cycles == 0)
+      cap.max_lease_cycles = SLOTTEE_DEFAULT_MAX_LEASE_CYCLES;
+
+    if (cap.rights != SLOTTEE_CAP_RIGHT_ENTER ||
+        cap.max_lease_cycles == 0) {
+      ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+      goto out;
+    }
+
+    sign_slot_cap(eid, &cap);
+    if (resp)
+      resp->cap = cap;
+  }
+#endif
+
+out:
+  if (resp) {
+    resp->status = ret;
+    if (ret == SBI_ERR_SM_ENCLAVE_SUCCESS) {
+      resp->reentry_ready = enclaves[eid].slot_reentry_ready;
+      resp->epoch = enclaves[eid].current_slot_epoch;
+      resp->n_thread = enclaves[eid].n_thread;
+      resp->busy_slots = count_busy_slot_leases(eid);
+      resp->lease_expired_count = enclaves[eid].lease_expired_count;
+      resp->cap_key_ready = enclaves[eid].cap_key_ready;
+      resp->cap_key_generation = enclaves[eid].cap_key_generation;
+    } else {
+      resp->reentry_ready = 0;
+      resp->epoch = 0;
+      resp->n_thread = 0;
+      resp->busy_slots = 0;
+      resp->lease_expired_count = 0;
+      resp->cap_key_ready = 0;
+      resp->cap_key_generation = 0;
+      resp->cap = (struct slot_cap_t) {0};
+    }
+  }
+  spin_unlock(&encl_lock);
+  return ret;
+}
+
+unsigned long lease_watchdog_check(enclave_id eid)
+{
+  unsigned long reclaimed = 0;
+
+  spin_lock(&encl_lock);
+  if (ENCLAVE_EXISTS(eid) && enclaves[eid].state >= FRESH)
+    reclaimed = reclaim_expired_enclave_slot_leases(eid, read_cycle());
+  spin_unlock(&encl_lock);
+
+  return reclaimed;
+}
+
+void enter_activated_enclave_slot(
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
+    uintptr_t slot_mode)
+{
+  uintptr_t thread_index = enclave_slot_thread_index(slot_id);
+  uintptr_t slot_token = SLOTTEE_MAKE_SLOT_TOKEN(slot_id, lease_id, slot_mode);
+
+  if (prepare_enclave_slot_reentry(eid, thread_index, slot_token))
+    context_switch_to_enclave(regs, eid, thread_index, 0, 0);
+  else
+    context_switch_to_enclave(regs, eid, thread_index, 1, slot_token);
 }
 
 unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid)
@@ -523,7 +1475,7 @@ unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid)
   }
 
   // Enclave is OK to run, context switch to it
-  context_switch_to_enclave(regs, eid, 1);
+  context_switch_to_enclave(regs, eid, 0, 1, 0);
 
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
 }
@@ -531,11 +1483,14 @@ unsigned long run_enclave(struct sbi_trap_regs *regs, enclave_id eid)
 unsigned long exit_enclave(struct sbi_trap_regs *regs, enclave_id eid)
 {
   int exitable;
+  uintptr_t thread_index = cpu_get_enclave_thread_index();
 
   spin_lock(&encl_lock);
-  exitable = enclaves[eid].state == RUNNING;
+  exitable = enclaves[eid].state == RUNNING && thread_index < MAX_ENCL_THREADS;
   if (exitable) {
     enclaves[eid].n_thread--;
+    if (thread_index < MAX_ENCL_THREADS)
+      enclaves[eid].stopped_threads[thread_index] = 0;
     if(enclaves[eid].n_thread == 0)
       enclaves[eid].state = STOPPED;
   }
@@ -544,28 +1499,129 @@ unsigned long exit_enclave(struct sbi_trap_regs *regs, enclave_id eid)
   if(!exitable)
     return SBI_ERR_SM_ENCLAVE_NOT_RUNNING;
 
-  context_switch_to_host(regs, eid, 0);
+  context_switch_to_host(regs, eid, thread_index, 0);
 
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+unsigned long exit_enclave_slot(
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id,
+    uintptr_t exit_reason, uintptr_t value)
+{
+  int exitable;
+  struct slot_lease_t *lease;
+  uintptr_t thread_index;
+
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+  exitable = ENCLAVE_EXISTS(eid) && enclaves[eid].state == RUNNING;
+  if (!exitable) {
+    spin_unlock(&encl_lock);
+    return SBI_ERR_SM_ENCLAVE_NOT_RUNNING;
+  }
+
+  lease = &enclaves[eid].slot_leases[slot_id];
+  if (lease->state != SLOT_LEASE_ACTIVE ||
+      lease->lease_id != lease_id ||
+      lease->active_hart != csr_read(mhartid)) {
+    spin_unlock(&encl_lock);
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  }
+
+  thread_index = lease->thread_index;
+  lease->exit_reason = exit_reason;
+  lease->state = SLOT_LEASE_EXITING;
+  enclaves[eid].n_thread--;
+  if (thread_index < MAX_ENCL_THREADS)
+    enclaves[eid].stopped_threads[thread_index] = 0;
+  if(enclaves[eid].n_thread == 0)
+    enclaves[eid].state = STOPPED;
+  spin_unlock(&encl_lock);
+
+  context_switch_to_host(regs, eid, thread_index, 0);
+
+  spin_lock(&encl_lock);
+  save_enclave_slot_reentry_template(eid, thread_index);
+  free_enclave_slot_lease(lease);
+  if (exit_reason == SLOTTEE_SLOT_EXIT_REVOKE)
+    enclaves[eid].current_slot_epoch++;
+  spin_unlock(&encl_lock);
+
+  (void)value;
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+unsigned long init_enclave_slot_reentry_template(
+    struct sbi_trap_regs *regs, enclave_id eid)
+{
+  unsigned long ret = SBI_ERR_SM_ENCLAVE_SUCCESS;
+  uintptr_t thread_index = cpu_get_enclave_thread_index();
+
+  if (!regs)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+  if (!ENCLAVE_EXISTS(eid)) {
+    ret = SBI_ERR_SM_ENCLAVE_INVALID_ID;
+  } else if (enclaves[eid].state != RUNNING) {
+    ret = SBI_ERR_SM_ENCLAVE_NOT_RUNNING;
+  /* Thread 0 seeds the RT template during normal boot; slot threads reuse it. */
+  } else if (thread_index >= MAX_ENCL_THREADS ||
+      enclaves[eid].params.slot_entry == enclaves[eid].params.dram_base) {
+    ret = SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+  } else {
+    save_current_enclave_slot_reentry_template(eid, regs);
+  }
+  spin_unlock(&encl_lock);
+
+  return ret;
 }
 
 unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave_id eid)
 {
   int stoppable;
+  int complete_timer_revoke = 0;
+  uintptr_t thread_index = cpu_get_enclave_thread_index();
+  struct slot_lease_t *lease = NULL;
 
   spin_lock(&encl_lock);
-  stoppable = enclaves[eid].state == RUNNING;
+  stoppable = enclaves[eid].state == RUNNING && thread_index < MAX_ENCL_THREADS;
   if (stoppable) {
+    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+    complete_timer_revoke =
+        request == STOP_TIMER_INTERRUPT && slot_lease_has_pending_revoke(lease);
+    if (!(request == STOP_TIMER_INTERRUPT && thread_index > 0 &&
+          enclaves[eid].stopped_threads[0]))
+      enclaves[eid].stopped_thread_index = thread_index;
+    if (thread_index < MAX_ENCL_THREADS)
+      enclaves[eid].stopped_threads[thread_index] = 1;
+    if (lease)
+      lease->active_hart = 0;
     enclaves[eid].n_thread--;
     if(enclaves[eid].n_thread == 0)
       enclaves[eid].state = STOPPED;
+    reclaim_expired_enclave_slot_leases(eid, read_cycle());
   }
   spin_unlock(&encl_lock);
 
   if(!stoppable)
     return SBI_ERR_SM_ENCLAVE_NOT_RUNNING;
 
-  context_switch_to_host(regs, eid, request == STOP_EDGE_CALL_HOST);
+  context_switch_to_host(regs, eid, thread_index, request == STOP_EDGE_CALL_HOST);
+
+  if (complete_timer_revoke) {
+    spin_lock(&encl_lock);
+    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+    if (slot_lease_has_pending_revoke(lease)) {
+      /* Timer stops may trap out of U-mode; keep the last safe runtime template. */
+      complete_pending_revoke_enclave_slot(eid, lease);
+      if (thread_index < MAX_ENCL_THREADS)
+        enclaves[eid].stopped_threads[thread_index] = 0;
+    }
+    spin_unlock(&encl_lock);
+  }
 
   switch(request) {
     case(STOP_TIMER_INTERRUPT):
@@ -580,23 +1636,115 @@ unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave
 unsigned long resume_enclave(struct sbi_trap_regs *regs, enclave_id eid)
 {
   int resumable;
+  uintptr_t thread_index;
+  struct slot_lease_t *lease = NULL;
 
   spin_lock(&encl_lock);
+  /*
+   * KEYSTONE_IOC_RESUME_ENCLAVE has no slot id, so keep it bound to the
+   * canonical thread-0 path when thread 0 is stopped.  Slot threads are resumed
+   * through resume_enclave_slot(), which carries slot_id + lease_id.
+   */
+  thread_index = enclaves[eid].stopped_threads[0] ?
+      0 : enclaves[eid].stopped_thread_index;
+  if (thread_index != 0)
+    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+
+  reclaim_expired_enclave_slot_leases(eid, read_cycle());
+  if (thread_index != 0)
+    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+
+  if (slot_lease_has_pending_revoke(lease)) {
+    save_enclave_slot_reentry_template(eid, thread_index);
+    complete_pending_revoke_enclave_slot(eid, lease);
+    spin_unlock(&encl_lock);
+    return SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE;
+  }
+
   resumable = (ENCLAVE_EXISTS(eid)
                && (enclaves[eid].state == RUNNING || enclaves[eid].state == STOPPED)
-               && enclaves[eid].n_thread < MAX_ENCL_THREADS);
+               && enclaves[eid].n_thread < MAX_ENCL_THREADS
+               && thread_index < MAX_ENCL_THREADS
+               && enclaves[eid].stopped_threads[thread_index]
+               && (thread_index == 0 || lease));
 
   if(!resumable) {
     spin_unlock(&encl_lock);
     return SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE;
   } else {
+    if (lease)
+      lease->active_hart = csr_read(mhartid);
+    if (thread_index < MAX_ENCL_THREADS)
+      enclaves[eid].stopped_threads[thread_index] = 0;
+    if (enclaves[eid].stopped_thread_index == thread_index)
+      enclaves[eid].stopped_thread_index = 0;
     enclaves[eid].n_thread++;
     enclaves[eid].state = RUNNING;
   }
   spin_unlock(&encl_lock);
 
   // Enclave is OK to resume, context switch to it
-  context_switch_to_enclave(regs, eid, 0);
+  context_switch_to_enclave(regs, eid, thread_index, 0, 0);
+
+  return SBI_ERR_SM_ENCLAVE_SUCCESS;
+}
+
+unsigned long resume_enclave_slot(
+    struct sbi_trap_regs *regs, enclave_id eid, uintptr_t slot_id, uintptr_t lease_id)
+{
+  int resumable;
+  uintptr_t thread_index = 0;
+  struct slot_lease_t *lease = NULL;
+
+  if (slot_id == 0 || slot_id >= SLOTTEE_MAX_SLOTS || lease_id == 0)
+    return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
+
+  spin_lock(&encl_lock);
+  if (ENCLAVE_EXISTS(eid)) {
+    lease = find_stopped_slot_lease(eid, slot_id, lease_id);
+    if (lease)
+      thread_index = lease->thread_index;
+  }
+
+  if (slot_lease_has_pending_revoke(lease)) {
+    save_enclave_slot_reentry_template(eid, thread_index);
+    complete_pending_revoke_enclave_slot(eid, lease);
+    if (thread_index < MAX_ENCL_THREADS)
+      enclaves[eid].stopped_threads[thread_index] = 0;
+    spin_unlock(&encl_lock);
+    return SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE;
+  }
+
+  if (lease && lease->expiry_cycle && read_cycle() >= lease->expiry_cycle) {
+    save_enclave_slot_reentry_template(eid, thread_index);
+    expire_enclave_slot_lease(eid, lease);
+    enclaves[eid].current_slot_epoch++;
+    spin_unlock(&encl_lock);
+    return SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE;
+  }
+
+  resumable = ENCLAVE_EXISTS(eid) &&
+      (enclaves[eid].state == RUNNING || enclaves[eid].state == STOPPED) &&
+      enclaves[eid].n_thread < MAX_ENCL_THREADS &&
+      lease &&
+      thread_index > 0 &&
+      thread_index < MAX_ENCL_THREADS &&
+      enclaves[eid].stopped_threads[thread_index];
+
+  if (!resumable) {
+    spin_unlock(&encl_lock);
+    return SBI_ERR_SM_ENCLAVE_NOT_RESUMABLE;
+  }
+
+  lease->active_hart = csr_read(mhartid);
+  enclaves[eid].stopped_threads[thread_index] = 0;
+  if (enclaves[eid].stopped_thread_index == thread_index)
+    enclaves[eid].stopped_thread_index = 0;
+  enclaves[eid].n_thread++;
+  enclaves[eid].state = RUNNING;
+  spin_unlock(&encl_lock);
+
+  context_switch_to_enclave(regs, eid, thread_index, 0, 0);
 
   return SBI_ERR_SM_ENCLAVE_SUCCESS;
 }

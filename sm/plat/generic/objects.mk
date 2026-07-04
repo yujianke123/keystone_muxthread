@@ -13,6 +13,7 @@ platform-genflags-y += "-DBOARD_VISIONFIVE2"
 else
 platform-genflags-y += "-DTARGET_PLATFORM_HEADER=\"platform/$(PLATFORM)/platform.h\""
 endif
+platform-genflags-y += $(SLOTTEE_SM_CFLAGS)
 
 include $(KEYSTONE_SM)/src/objects.mk
 platform-objs-y += $(addprefix ../../src/,$(subst .c,.o,$(keystone-sm-sources)))

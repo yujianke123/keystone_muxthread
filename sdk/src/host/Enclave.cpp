@@ -15,7 +15,7 @@ extern "C" {
 
 namespace Keystone {
 
-Enclave::Enclave() {
+Enclave::Enclave() : pDevice(NULL) {
 }
 
 Enclave::~Enclave() {
@@ -189,9 +189,11 @@ Enclave::init(
 
   pMemory->startFreeMem();
 
+  uintptr_t slotEntry = runtimeFile->getSymbolAddress("slottee_runtime_reenter");
   if (pDevice->finalize(
           pMemory->getRuntimePhysAddr(), pMemory->getEappPhysAddr(),
-          pMemory->getFreePhysAddr(), params.getFreeMemSize()) != Error::Success) {
+          pMemory->getFreePhysAddr(), params.getFreeMemSize(), slotEntry) !=
+      Error::Success) {
     destroy();
     return Error::DeviceError;
   }
@@ -229,7 +231,15 @@ Enclave::mapUntrusted(size_t size) {
 
 Error
 Enclave::destroy() {
+  if (pDevice == NULL) {
+    return Error::Success;
+  }
   return pDevice->destroy();
+}
+
+Error
+Enclave::runRaw(uintptr_t* retval) {
+  return pDevice->run(retval);
 }
 
 Error
@@ -250,6 +260,61 @@ Enclave::run(uintptr_t* retval) {
   }
 
   return Error::Success;
+}
+
+Error
+Enclave::resume(uintptr_t* retval) {
+  return pDevice->resume(retval);
+}
+
+Error
+Enclave::enterSlot(uintptr_t slotId, uintptr_t* status, uintptr_t* value) {
+  return pDevice->enterSlot(slotId, status, value);
+}
+
+Error
+Enclave::enterSlot(uintptr_t slotId, uintptr_t flags, uintptr_t* status, uintptr_t* value) {
+  return pDevice->enterSlot(slotId, flags, status, value);
+}
+
+Error
+Enclave::enterSlotWithEpoch(
+    uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+    uintptr_t* value) {
+  return pDevice->enterSlotWithEpoch(epoch, slotId, flags, status, value);
+}
+
+Error
+Enclave::enterSlotWithVersion(
+    uintptr_t version, uintptr_t epoch, uintptr_t slotId, uintptr_t flags, uintptr_t* status,
+    uintptr_t* value) {
+  return pDevice->enterSlotWithVersion(version, epoch, slotId, flags, status, value);
+}
+
+Error
+Enclave::enterSlotWithCap(
+    const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value) {
+  return pDevice->enterSlotWithCap(cap, flags, status, value);
+}
+
+Error
+Enclave::enterSlotWithRequest(const enter_slot_req_t& req, enter_slot_resp_t* resp) {
+  return pDevice->enterSlotWithRequest(req, resp);
+}
+
+Error
+Enclave::markRevoke(uintptr_t slotId, uintptr_t* status, uintptr_t* epoch) {
+  return pDevice->markRevoke(slotId, status, epoch);
+}
+
+Error
+Enclave::slotteeDebug(const slottee_debug_req_t& req, slottee_debug_resp_t* resp) {
+  return pDevice->slotteeDebug(req, resp);
+}
+
+Error
+Enclave::leaseWatchdogCheck(uintptr_t* status, uintptr_t* reclaimed) {
+  return pDevice->leaseWatchdogCheck(status, reclaimed);
 }
 
 void*
