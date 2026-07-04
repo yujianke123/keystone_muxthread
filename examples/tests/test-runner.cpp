@@ -211,9 +211,9 @@ wait_for_enter_slot_ttl(uintptr_t cycles) {
   uintptr_t start = 0;
   uintptr_t now = 0;
 
-  asm volatile("rdcycle %0" : "=r"(start));
+  asm volatile("rdtime %0" : "=r"(start));
   do {
-    asm volatile("rdcycle %0" : "=r"(now));
+    asm volatile("rdtime %0" : "=r"(now));
   } while ((now - start) < cycles);
 }
 
@@ -224,7 +224,7 @@ wait_until_enter_slot_expiry(uintptr_t expiry_cycle)
   uintptr_t target = expiry_cycle + SLOTTEE_TEST_MAX_LEASE_CYCLES;
 
   do {
-    asm volatile("rdcycle %0" : "=r"(now));
+    asm volatile("rdtime %0" : "=r"(now));
   } while (now < target);
 }
 
@@ -232,7 +232,7 @@ static uintptr_t
 read_cycle_counter() {
   uintptr_t cycles = 0;
 
-  asm volatile("rdcycle %0" : "=r"(cycles));
+  asm volatile("rdtime %0" : "=r"(cycles));
   return cycles;
 }
 
