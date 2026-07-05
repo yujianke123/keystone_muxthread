@@ -7203,31 +7203,110 @@ lu_host_checksum(long n)
   return acc;
 }
 
+/* G>0 多线程 in-enclave LU：持久 worker 进入（克隆 run_persistent_matmul_test 的进入循环，
+ * 但只收一个 report）。thread0 spawn_seq 导出 G worker cap → host pthread 进入 → thread0 逐
+ * 块列串行对角+并行尾部(barrier via ptask_done)→ 报告。G=0 走 run_matmul_combo。 */
+static int
+run_lu_combo(const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params, long N, long G, struct slottee_matmul_combo_report* out)
+{
+  if (G == 0)
+    return run_matmul_combo(eapp_file, rt_file, ld_file, params, N, 0, out);
+  Keystone::Enclave enclave;
+  pthread_t th[SLOTTEE_MATMUL_WORKERS];
+  slottee_multihart_worker_arg args[SLOTTEE_MATMUL_WORKERS];
+  int started[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t sched_slot[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t value = 0;
+  Keystone::Error ret;
+  int collected = 0, last_seq = 0;  /* last_seq 下面 reset 后重设 */
+  params.setFreeMemSize(24 * 1024 * 1024);
+  params.setUntrustedSize(256 * 1024);
+  set_matmul_config_ex(N, G, 1 /*persistent enter*/);
+  reset_matmul_report();
+  last_seq = get_matmul_report_seq();  /* reset 不清全局seq→从当前起,只收本combo新report */
+  reset_copied_slot_caps();
+  memset(th, 0, sizeof(th));
+  memset(args, 0, sizeof(args));
+  memset(started, 0, sizeof(started));
+  for (long g = 0; g < G; g++)
+    sched_slot[g] = SLOTTEE_MATMUL_FIRST_WORKER_SLOT + g;
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] lu persistent init N=%ld G=%ld\n", N, G);
+    return 1;
+  }
+  edge_init(&enclave);
+  ret = enclave.runRaw(&value);
+  uintptr_t idle = 0;
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost || ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < (uintptr_t)100000000; retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      idle = 0;
+      int seq = get_matmul_report_seq();
+      if (seq > last_seq && collected < 1) { get_matmul_report(out); collected++; last_seq = seq; }
+    } else {
+      idle++;
+      if (idle > 4096) usleep(50);
+      else if (idle > 256) usleep(5);
+    }
+    for (long g = 0; g < G; g++) {
+      if (!started[g] && copied_slot_cap_ready_by_slot[sched_slot[g]]) {
+        memset(&args[g], 0, sizeof(args[g]));
+        args[g].enclave = &enclave;
+        args[g].cap = copied_slot_caps[sched_slot[g]];
+        args[g].slot_id = sched_slot[g];
+        args[g].resume_limit = (uintptr_t)100000000;
+        args[g].ret = Keystone::Error::DeviceError;
+        if (pthread_create(&th[g], NULL, slottee_multihart_worker, &args[g]) != 0) {
+          slottee_trace_destroy(enclave);
+          return 1;
+        }
+        started[g] = 1; idle = 257; sched_yield();
+      }
+    }
+    sched_yield();
+    ret = enclave.resume(&value);
+    if (ret == Keystone::Error::Success && value == SLOTTEE_LT_USER_OCALL_MAGIC) break;
+  }
+  for (long g = 0; g < G; g++)
+    if (started[g]) pthread_join(th[g], NULL);
+  slottee_trace_destroy(enclave);
+  return (collected == 1) ? 0 : 1;
+}
+
 static int
 run_slottee_lu_test(const char* eapp_file, const char* rt_file, const char* ld_file,
     Keystone::Params params)
 {
   long sizes[] = {64, 128, 256};
+  long Gs[4] = {0, 1, 2, 4};
   int ok_all = 1;
-  /* 第一阶段：仅 G=0（单线程 in-enclave LU，验 FP 支持）；多线程(LT FP 上下文)后续。 */
-  printf("lu,setup,in-enclave SLOTTEE LU(no-pivot blocked block=16 double-FP),sizes=64/128/256,threads=0(single),metric=rdtime_in_enclave_compute\n");
-  printf("lu,result,N,slottee_single_compute,csum,csum_ok\n");
+  printf("lu,setup,in-enclave SLOTTEE LU(no-pivot blocked block=16 double-FP),sizes=64/128/256,threads=0/1/2/4,metric=rdtime_in_enclave_compute\n");
+  printf("lu,result,N,g0,slottee1,s2,s4,speedup2,speedup4,csum,csum_ok\n");
   for (int si = 0; si < 3; si++) {
     long N = sizes[si];
     uintptr_t expect = lu_host_checksum(N);
-    struct slottee_matmul_combo_report r;
-    memset(&r, 0, sizeof(r));
-    int rc = run_matmul_combo(eapp_file, rt_file, ld_file, params, N, 0, &r);
-    int csok = (rc == 0 && r.checksum == expect);
-    if (!csok) {
-      ok_all = 0;
-      printf("[FAIL] lu combo N=%ld G=0 rc=%d csum_ok=%d (got=0x%lx expect=0x%lx)\n",
-          N, rc, (int)(r.checksum == expect), r.checksum, expect);
+    struct slottee_matmul_combo_report r[4];
+    int csok = 1;
+    for (int gi = 0; gi < 4; gi++) {
+      memset(&r[gi], 0, sizeof(r[gi]));
+      int rc = run_lu_combo(eapp_file, rt_file, ld_file, params, N, Gs[gi], &r[gi]);
+      if (rc != 0 || r[gi].checksum != expect) {
+        csok = 0; ok_all = 0;
+        printf("[FAIL] lu combo N=%ld G=%ld rc=%d csum_ok=%d (got=0x%lx expect=0x%lx)\n",
+            N, Gs[gi], rc, (int)(r[gi].checksum == expect), r[gi].checksum, expect);
+      }
     }
-    printf("lu,result,%ld,%lu,0x%lx,%d\n", N, r.max_compute, r.checksum, csok);
+    double sp2 = r[2].max_compute ? (double)r[1].max_compute / (double)r[2].max_compute : 0.0;
+    double sp4 = r[3].max_compute ? (double)r[1].max_compute / (double)r[3].max_compute : 0.0;
+    printf("lu,result,%ld,%lu,%lu,%lu,%lu,%.3f,%.3f,0x%lx,%d\n",
+        N, r[0].max_compute, r[1].max_compute, r[2].max_compute, r[3].max_compute,
+        sp2, sp4, r[1].checksum, csok);
     fflush(stdout);
   }
-  printf("[slottee] lu in-enclave (single-thread FP) done ok=%d\n", ok_all);
+  printf("[slottee] lu in-enclave (multi-thread FP) done ok=%d\n", ok_all);
   return ok_all ? 0 : 1;
 }
 

@@ -107,7 +107,7 @@ static void lu_worker(void* opaque) {
   __sync_synchronize();
   for (;;) {
     while (slottee_atomic_load(&ptask_epoch) == seen)
-      ;
+      (void)slottee_lt_host_yield();   /* 并发FP: 自旋让出,避免hart独占+减少FP-save churn */
     seen = slottee_atomic_load(&ptask_epoch);
     __sync_synchronize();                       /* acquire: 对角块(driver)就绪 */
     long k = slottee_atomic_load(&ptask_k);
