@@ -160,6 +160,10 @@ static void compute_slot_cap_mac(
   sbi_memset(digest, 0, sizeof(digest));
 }
 
+/* __attribute__((unused))：SLOTTEE_NO_MAC_BENCH 下 verify 跳过比对，此函数无调用者。 */
+static int slot_cap_mac_equal(
+    const uintptr_t lhs[SLOTTEE_CAP_MAC_WORDS],
+    const uintptr_t rhs[SLOTTEE_CAP_MAC_WORDS]) __attribute__((unused));
 static int slot_cap_mac_equal(
     const uintptr_t lhs[SLOTTEE_CAP_MAC_WORDS],
     const uintptr_t rhs[SLOTTEE_CAP_MAC_WORDS])
@@ -181,9 +185,17 @@ static int verify_slot_cap_mac(enclave_id eid, const struct slot_cap_t *cap)
   if (!enclaves[eid].cap_key_ready)
     return 0;
 
+#ifdef SLOTTEE_NO_MAC_BENCH
+  /* B2 消融基线：跳过 cap MAC 计算+比对以隔离校验成本（**仅性能测量镜像，禁止生产**）。
+   * with-MAC 减去本基线 = ENTER_SLOT 路径的 cap MAC 校验开销。 */
+  (void)cap;
+  (void)expected;
+  ok = 1;
+#else
   compute_slot_cap_mac(eid, cap, expected);
   ok = slot_cap_mac_equal(cap->cap_mac, expected);
   sbi_memset(expected, 0, sizeof(expected));
+#endif
 
   return ok;
 }
