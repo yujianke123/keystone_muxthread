@@ -70,6 +70,9 @@ static const uintptr_t slottee_null_enter_baseline_max = 2520128;
 static const unsigned long long slottee_null_enter_baseline_total = 3891424ULL;
 static const uintptr_t enter_slot_pool_workers = 1;
 static const uintptr_t enter_slot_resume_limit = 8;
+/* VF2: seed/ocall-round eapp 在真机会被 CLINT timer 多次 INTERRUPTED，需要比
+ * enter_slot_resume_limit 大得多的 resume 预算才能跑完（seed 一次性，非 perf 路径）。 */
+static const uintptr_t seed_resume_retry_limit = 4096;
 static const uintptr_t enter_slot_revoke_stress_rounds = 3;
 static const uintptr_t enter_slot_active_revoke_timer_rounds = 3;
 /* Bumped (Phase43) to widen the cross-hart race window under load so the
@@ -300,7 +303,10 @@ slottee_multihart_harts_valid(
     return 0;
 
   for (uintptr_t window = 0; window < windows; window++) {
-    if (report->hart_id[window] >= online_harts)
+    /* VF2: JH7110 有 5 个物理 hart（hart0=S7 监控核不跑 Linux，hart1-4=U74 应用核），
+     * 物理 mhartid 可达 online_harts(=4)，而 QEMU virt 是 hart0..N-1。用 inclusive 上界
+     * (> 而非 >=) 兼容两者：拒绝真正越界的 garbage，但不把真机的 hart==online_harts 误判非法。 */
+    if (report->hart_id[window] > online_harts)
       return 0;
   }
 
@@ -3809,11 +3815,16 @@ run_enclave_ocall_round(Keystone::Enclave& enclave, uintptr_t* value,
     *resumes = 0;
 
   ret = enclave.run(value);
-  for (uintptr_t retry = 0; ret == Keystone::Error::EdgeCallHost &&
-       retry < enter_slot_resume_limit; retry++) {
-    incoming_call_dispatch(enclave.getSharedBuffer());
-    if (ocalls)
-      (*ocalls)++;
+  for (uintptr_t retry = 0; (ret == Keystone::Error::EdgeCallHost ||
+       ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < seed_resume_retry_limit; retry++) {
+    /* VF2: 真机 timer 会在 seed/ocall eapp 途中把 ret 变 INTERRUPTED；只在 EdgeCall
+     * 时派发 ocall，但 INTERRUPTED 也要 resume，否则 eapp 未跑完→caps 未导出→DeviceError。 */
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      if (ocalls)
+        (*ocalls)++;
+    }
     ret = enclave.resume(value);
     if (resumes)
       (*resumes)++;
@@ -4091,11 +4102,16 @@ seed_rt_authorized_caps(Keystone::Enclave& enclave, uintptr_t max_slot,
   suppress_enclave_prints = 1;
   start = read_cycle_counter();
   ret = enclave.runRaw(value);
-  for (uintptr_t retry = 0; ret == Keystone::Error::EdgeCallHost &&
-       retry < enter_slot_resume_limit; retry++) {
-    incoming_call_dispatch(enclave.getSharedBuffer());
-    if (ocalls)
-      (*ocalls)++;
+  for (uintptr_t retry = 0; (ret == Keystone::Error::EdgeCallHost ||
+       ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < seed_resume_retry_limit; retry++) {
+    /* VF2: 真机 timer 会在 seed/ocall eapp 途中把 ret 变 INTERRUPTED；只在 EdgeCall
+     * 时派发 ocall，但 INTERRUPTED 也要 resume，否则 eapp 未跑完→caps 未导出→DeviceError。 */
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      if (ocalls)
+        (*ocalls)++;
+    }
     ret = enclave.resume(value);
     if (resumes)
       (*resumes)++;
@@ -4140,11 +4156,16 @@ resume_rt_authorized_caps(Keystone::Enclave& enclave, uintptr_t max_slot,
   suppress_enclave_prints = 1;
   start = read_cycle_counter();
   ret = enclave.resume(value);
-  for (uintptr_t retry = 0; ret == Keystone::Error::EdgeCallHost &&
-       retry < enter_slot_resume_limit; retry++) {
-    incoming_call_dispatch(enclave.getSharedBuffer());
-    if (ocalls)
-      (*ocalls)++;
+  for (uintptr_t retry = 0; (ret == Keystone::Error::EdgeCallHost ||
+       ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < seed_resume_retry_limit; retry++) {
+    /* VF2: 真机 timer 会在 seed/ocall eapp 途中把 ret 变 INTERRUPTED；只在 EdgeCall
+     * 时派发 ocall，但 INTERRUPTED 也要 resume，否则 eapp 未跑完→caps 未导出→DeviceError。 */
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      if (ocalls)
+        (*ocalls)++;
+    }
     ret = enclave.resume(value);
     if (resumes)
       (*resumes)++;
