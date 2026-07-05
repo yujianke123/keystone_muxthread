@@ -99,8 +99,12 @@ preempt_sched_entry(void* opaque)
   /* Blocks here (in the eapp's view): the RT switches away to the workers and
    * only returns once every worker has exited, with a0 = completed count.
    * switch_budget=0 keeps the Phase-41 behavior (pure in-runtime, host_yields=0). */
+  /* D3 消融：switch_budget 可经编译宏覆盖（默认 0=纯 in-runtime, host_yields=0）。 */
+#ifndef SLOTTEE_PREEMPT_SWITCH_BUDGET
+#define SLOTTEE_PREEMPT_SWITCH_BUDGET 0
+#endif
   completed = (uintptr_t)slottee_preempt_run(specs,
-      SLOTTEE_PREEMPT_SCHED_WORKERS, 0, 0);
+      SLOTTEE_PREEMPT_SCHED_WORKERS, SLOTTEE_PREEMPT_SWITCH_BUDGET, 0);
 
   memset(&stats, 0, sizeof(stats));
   slottee_preempt_collect_stats(&stats);
