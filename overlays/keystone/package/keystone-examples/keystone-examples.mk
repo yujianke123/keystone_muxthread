@@ -28,6 +28,10 @@ KEYSTONE_EXAMPLES_CONF_OPTS += -DKEYSTONE_SDK_DIR=$(HOST_DIR)/usr/share/keystone
 ifeq ($(KEYSTONE_PLATFORM),cva6)
 KEYSTONE_EXAMPLES_CONF_OPTS += -Dfw_bin=$(BINARIES_DIR)/fw_payload.bin
 endif
+# VF2 U74 的 U/S-mode rdcycle 触发不可处理中断 → benchmark 周期读改 rdtime；QEMU/generic 保 rdcycle。
+ifeq ($(KEYSTONE_PLATFORM),starfive/visionfive2)
+KEYSTONE_EXAMPLES_CONF_OPTS += -DSLOTTEE_BENCH_RDTIME=ON
+endif
 
 KEYSTONE_EXAMPLES_MAKE_ENV += KEYSTONE_SDK_DIR=$(HOST_DIR)/usr/share/keystone/sdk
 KEYSTONE_EXAMPLES_MAKE_OPTS += examples

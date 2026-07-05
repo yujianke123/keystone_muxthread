@@ -31,6 +31,12 @@ if (SLOTTEE_DEBUG_MINT_ENABLE)
   add_definitions(-DSLOTTEE_DEBUG_MINT_ENABLE)
 endif()
 
+# VF2 及其它真机 U74 上 U/S-mode rdcycle 触发不可处理中断，benchmark 周期读需改 rdtime；
+# QEMU/generic 保留 rdcycle 取真实周期。由平台经 keystone-examples.mk 传入 SLOTTEE_BENCH_RDTIME。
+if (SLOTTEE_BENCH_RDTIME)
+  add_definitions(-DSLOTTEE_BENCH_RDTIME)
+endif()
+
 use_riscv_toolchain(${KEYSTONE_BITS})
 
 # export include directory

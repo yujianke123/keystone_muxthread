@@ -16,6 +16,14 @@
 #include "verifier/report.h"
 #include "verifier/test_dev_key.h"
 
+/* benchmark 周期读：VF2(U74) host/U/S-mode rdcycle 触发不可处理中断→rdtime；QEMU/generic→rdcycle。
+ * SLOTTEE_BENCH_RDTIME 由平台经 keystone-examples.mk 注入。 */
+#ifdef SLOTTEE_BENCH_RDTIME
+#define SLOTTEE_RDCYCLE_INSN "rdtime %0"
+#else
+#define SLOTTEE_RDCYCLE_INSN "rdcycle %0"
+#endif
+
 const char* longstr = "hellohellohellohellohellohellohellohellohellohello";
 static int suppress_enclave_prints;
 static uintptr_t copied_print_value;
@@ -214,9 +222,9 @@ wait_for_enter_slot_ttl(uintptr_t cycles) {
   uintptr_t start = 0;
   uintptr_t now = 0;
 
-  asm volatile("rdtime %0" : "=r"(start));
+  asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(start));
   do {
-    asm volatile("rdtime %0" : "=r"(now));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(now));
   } while ((now - start) < cycles);
 }
 
@@ -227,7 +235,7 @@ wait_until_enter_slot_expiry(uintptr_t expiry_cycle)
   uintptr_t target = expiry_cycle + SLOTTEE_TEST_MAX_LEASE_CYCLES;
 
   do {
-    asm volatile("rdtime %0" : "=r"(now));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(now));
   } while (now < target);
 }
 
@@ -235,7 +243,7 @@ static uintptr_t
 read_cycle_counter() {
   uintptr_t cycles = 0;
 
-  asm volatile("rdtime %0" : "=r"(cycles));
+  asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles));
   return cycles;
 }
 
@@ -7736,7 +7744,7 @@ main(int argc, char** argv) {
   Keystone::Enclave enclave;
 
   if (self_timing) {
-    asm volatile("rdtime %0" : "=r"(cycles1));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles1));
   }
 
   enclave.init(eapp_file, rt_file, ld_file, params);
@@ -8018,13 +8026,13 @@ main(int argc, char** argv) {
   }
 
   if (self_timing) {
-    asm volatile("rdtime %0" : "=r"(cycles2));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles2));
   }
 
   edge_init(&enclave);
 
   if (self_timing) {
-    asm volatile("rdtime %0" : "=r"(cycles3));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles3));
   }
 
   uintptr_t encl_ret;
@@ -8035,7 +8043,7 @@ main(int argc, char** argv) {
   }
 
   if (self_timing) {
-    asm volatile("rdtime %0" : "=r"(cycles4));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles4));
     printf("[keystone-test] Init: %lu cycles\r\n", cycles2 - cycles1);
     printf("[keystone-test] Runtime: %lu cycles\r\n", cycles4 - cycles3);
   }

@@ -6,6 +6,14 @@
 #include "shared/sm_err.h"
 #include <string.h>
 
+/* benchmark 周期读：VF2(U74) U/S-mode rdcycle 触发不可处理中断→rdtime；QEMU/generic→rdcycle。
+ * SLOTTEE_BENCH_RDTIME 由平台经 keystone-examples.mk 注入。 */
+#ifdef SLOTTEE_BENCH_RDTIME
+#define SLOTTEE_RDCYCLE_INSN "rdtime %0"
+#else
+#define SLOTTEE_RDCYCLE_INSN "rdcycle %0"
+#endif
+
 /*
  * ParTEE 式单/多线程矩阵乘法对比基准（--enter-slot-matmul）。一次 enclave run 测一个
  * (N, groups) 组合（host 经 config OCALL 指定）：
@@ -48,7 +56,7 @@ read_cycles(void)
 {
   unsigned long c;
 
-  asm volatile("rdtime %0" : "=r"(c));
+  asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(c));
   return c;
 }
 
