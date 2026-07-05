@@ -7251,6 +7251,36 @@ run_slottee_paper_eval(const char* eapp_file,
   return run_slottee_ticket_demo(eapp_file, rt_file, ld_file, params);
 }
 
+/* B1 生命周期微基准：host 侧精确计时 enclave.init()(create,含 SM 度量哈希) 与
+ * enclave.destroy()(destroy)。计数用 read_cycle_counter（VF2 经 SLOTTEE_BENCH_RDTIME
+ * 走 rdtime@4MHz；QEMU rdcycle）。不依赖 debug-mint。 */
+static const uintptr_t slottee_lifecycle_bench_iters = 12;
+static int
+run_slottee_lifecycle_bench(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  printf("lifecycle_bench,iter,create_cycles,destroy_cycles\n");
+  fflush(stdout);
+  for (uintptr_t iter = 0; iter < slottee_lifecycle_bench_iters; iter++) {
+    Keystone::Enclave enclave;
+    uintptr_t t0 = read_cycle_counter();
+    Keystone::Error ret = enclave.init(eapp_file, rt_file, ld_file, params);
+    uintptr_t create_cycles = read_cycle_counter() - t0;
+    if (ret != Keystone::Error::Success) {
+      printf("[FAIL] lifecycle_bench init failed iter %lu ret=%d\n", iter, (int)ret);
+      return 1;
+    }
+    uintptr_t t2 = read_cycle_counter();
+    enclave.destroy();
+    uintptr_t destroy_cycles = read_cycle_counter() - t2;
+    printf("lifecycle_bench,%lu,%lu,%lu\n", iter, create_cycles, destroy_cycles);
+    fflush(stdout);
+  }
+  printf("[slottee] lifecycle_bench iters=%lu ok=1\n", slottee_lifecycle_bench_iters);
+  return 0;
+}
+
 int
 main(int argc, char** argv) {
   if (argc < 4 || argc > 32) {
@@ -7368,6 +7398,7 @@ main(int argc, char** argv) {
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
+  int slottee_lifecycle_bench = 0;
   int slottee_multihart_ticket = 0;
   int slottee_multihart_ticket_max = 0;
   int slottee_edgecall_interference_stress = 0;
@@ -7457,6 +7488,7 @@ main(int argc, char** argv) {
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
       {"slottee-ticket-demo", no_argument, &slottee_ticket_demo, 1},
+      {"slottee-lifecycle-bench", no_argument, &slottee_lifecycle_bench, 1},
       {"slottee-multihart-ticket", no_argument, &slottee_multihart_ticket, 1},
       {"slottee-multihart-ticket-max", no_argument,
        &slottee_multihart_ticket_max, 1},
@@ -7713,6 +7745,10 @@ main(int argc, char** argv) {
 
   if (slottee_ticket_demo) {
     return run_slottee_ticket_demo(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_lifecycle_bench) {
+    return run_slottee_lifecycle_bench(eapp_file, rt_file, ld_file, params);
   }
 
   if (slottee_multihart_ticket) {
