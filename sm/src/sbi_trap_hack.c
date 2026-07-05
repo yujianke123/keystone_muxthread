@@ -23,7 +23,26 @@ static int slottee_redirect_timer_to_enclave(struct sbi_trap_regs *regs)
 	        cpu_get_enclave_id(), cpu_get_enclave_thread_index()))
 		return 0;
 
+	/*
+	 * Ack the M-timer and set mip.STIP (pending S-timer for the enclave).
+	 * sbi_timer_process() clears MTIP and sets STIP.
+	 */
 	sbi_timer_process();
+
+	/*
+	 * VF2 fix: never FORCE-inject the S-timer while the enclave's S-mode
+	 * runtime has interrupts masked (SIE==0).  The Eyrie LT reentry/context-
+	 * switch paths clear sstatus.SIE to make the save/restore window non-
+	 * preemptible; sbi_trap_redirect ignores S-mode SIE and would land a
+	 * nested timer trap in the middle of that window, corrupting the frame
+	 * (observed as sret-to-0 / scause 0xc PC=0 on real hardware).  When the
+	 * enclave is in S-mode with SIE clear, leave the timer PENDING (STIP was
+	 * just set); it delivers naturally once the runtime re-enables SIE.
+	 * From U-mode, S-interrupts are always deliverable, so redirect as usual.
+	 */
+	if (prev_mode == PRV_S && !(regs->mstatus & MSTATUS_SIE))
+		return 1; /* handled: pending, fires when the enclave re-enables SIE */
+
 	trap.epc = regs->mepc;
 	trap.cause = IRQ_S_TIMER | (1UL << (__riscv_xlen - 1));
 	trap.tval = 0;

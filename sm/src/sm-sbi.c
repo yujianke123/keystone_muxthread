@@ -90,18 +90,25 @@ unsigned long sbi_sm_enter_slot(
   if (req.flags == SLOTTEE_ENTER_SLOT_FLAG_RESUME_LT_USER_OCALL) {
     ret = resume_enclave_slot((struct sbi_trap_regs*)regs, (enclave_id)eid,
         req.cap.slot_id, req.host_nonce);
-    if (out_val)
-      *out_val = ret;
-    resp.status = ret;
-    if (ret == SBI_ERR_SM_ENCLAVE_SUCCESS)
-      resp.value = 0;
-    if (enter_slot_resp && copy_from_sm(enter_slot_resp, &resp, sizeof(resp)))
-      return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     if (ret == SBI_ERR_SM_ENCLAVE_SUCCESS) {
+      /* regs now hold the resumed enclave thread's frame (satp/PMP already
+       * switched).  Touching host memory here fails under MPRV translation,
+       * and returning through the OpenSBI ecall path would apply mepc+=4 /
+       * a0=error / a1=value to the ENCLAVE frame — clobbering registers at
+       * the enclave's stop-ecall resume point (a1 is not in the runtime's
+       * SBI clobber set, so this corrupted live state and caused PC=0 jumps
+       * on real hardware).  Bump mepc past the enclave's stop ecall and
+       * exit the trap directly, leaving every other register as saved. */
       regs->mepc += 4;
       sbi_trap_exit(regs);
       return 0;
     }
+    /* Failure: still on the host frame; writing the response is safe. */
+    if (out_val)
+      *out_val = ret;
+    resp.status = ret;
+    if (enter_slot_resp && copy_from_sm(enter_slot_resp, &resp, sizeof(resp)))
+      return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
     goto out;
   }
 

@@ -1122,6 +1122,26 @@ slottee_preempt_try_steal(struct slottee_preempt_group* thief,
 }
 
 /*
+ * VF2 guard: a worker's saved_ctx must never be restored with a zero PC.
+ * On real multi-hart hardware a race left saved_ctx_valid set while sepc==0,
+ * so return_to_encl sret'd to 0 (scause 0xc, PC=0).  Treat such a context as
+ * NOT restorable and log the site so the offending path is visible.
+ */
+static int
+slottee_ctx_restorable(const struct slottee_active_user_context* w, int site)
+{
+  if (!w || !w->saved_ctx_valid)
+    return 0;
+  if (w->saved_ctx.regs.sepc == 0) {
+    printf("[slottee] BADCTX site=%d slot=%lu state=%lu alloc=%lu sp=0x%lx\r\n",
+        site, w->slot_id, w->scheduler_state, w->user_alloc_ok,
+        w->saved_ctx.regs.sp);
+    return 0;
+  }
+  return 1;
+}
+
+/*
  * Timer-driven context switch for the OS-level preemptive scheduler.  Called
  * from the redirected S-mode timer ISR with the preempted worker's full frame in
  * *ctx.  Saving *ctx into the current worker and copying the next runnable
@@ -1164,7 +1184,7 @@ slottee_preempt_timer_switch(struct slottee_preempt_group* group,
         SLOTTEE_USER_LT_QUEUE_RUNNABLE, cur);
 
   next = slottee_preempt_pick_next(group);
-  if (next && next != cur && next->saved_ctx_valid) {
+  if (next && next != cur && slottee_ctx_restorable(next, 1)) {
     cur->preempt_count++;
     cur->preempt_yield_count++;
     next->scheduler_state = SLOTTEE_USER_LT_RUNNING;
@@ -1240,7 +1260,7 @@ slottee_preempt_worker_exit(struct slottee_active_user_context* user,
   (void)value;
 
   next = slottee_preempt_pick_next(group);
-  if (next && next->saved_ctx_valid) {
+  if (next && slottee_ctx_restorable(next, 2)) {
     group->exit_switches++;
     next->scheduler_state = SLOTTEE_USER_LT_RUNNING;
     next->preempt_dispatch_count++;
@@ -1258,7 +1278,8 @@ slottee_preempt_worker_exit(struct slottee_active_user_context* user,
    * here and counts toward this group's completed total.
    */
   if (group->enable_steal &&
-      (stolen = slottee_preempt_try_steal(group, 1)) != 0) {
+      (stolen = slottee_preempt_try_steal(group, 1)) != 0 &&
+      slottee_ctx_restorable(stolen, 3)) {
     group->exit_switches++;
     stolen->scheduler_state = SLOTTEE_USER_LT_RUNNING;
     stolen->preempt_dispatch_count++;
@@ -1271,10 +1292,18 @@ slottee_preempt_worker_exit(struct slottee_active_user_context* user,
 
   group->sched_active = 0;
   group->current_slot = 0;
-  if (group->scheduler_ctx_valid) {
+  if (group->scheduler_ctx_valid && group->scheduler_ctx.regs.sepc != 0) {
     *ctx = group->scheduler_ctx;
     ctx->regs.a0 = group->completed;
     group->scheduler_ctx_valid = 0;
+  } else {
+    /* VF2 guard: never sret into a zero PC.  Cleanly exit to the host instead
+     * of jumping to 0. */
+    uintptr_t done = group->completed;
+    group->scheduler_ctx_valid = 0;
+    slottee_preempt_group_lock_release(group);
+    while (1)
+      sbi_exit_enclave(done);
   }
   slottee_preempt_group_lock_release(group);
   printf("[slottee] preempt_all_done group=%lu completed=%lu switches=%lu exit_switches=%lu ticks=%lu host_yields=%lu steals=%lu\r\n",
@@ -1971,6 +2000,12 @@ slottee_preempt_run(struct encl_ctx* ctx, uintptr_t specs_ptr, uintptr_t count,
   first = slottee_preempt_pick_next(group);
   if (!first) {
     group->scheduler_ctx_valid = 0;
+    slottee_preempt_group_lock_release(group);
+    return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
+  }
+  if (!slottee_ctx_restorable(first, 4)) {
+    group->scheduler_ctx_valid = 0;
+    group->sched_active = 0;
     slottee_preempt_group_lock_release(group);
     return SBI_ERR_SM_ENCLAVE_NO_FREE_RESOURCE;
   }

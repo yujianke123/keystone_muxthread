@@ -48,7 +48,7 @@ read_cycles(void)
 {
   unsigned long c;
 
-  asm volatile("rdcycle %0" : "=r"(c));
+  asm volatile("rdtime %0" : "=r"(c));
   return c;
 }
 
