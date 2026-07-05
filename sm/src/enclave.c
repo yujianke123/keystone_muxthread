@@ -613,7 +613,9 @@ static inline void context_switch_to_enclave(struct sbi_trap_regs* regs,
     // passing parameters for a first run
     uintptr_t entry_pc = enclaves[eid].params.dram_base;
     regs->mepc = entry_pc - 4; // regs->mepc will be +4 before sbi_ecall_handler return
-    regs->mstatus = (1 << MSTATUS_MPP_SHIFT);
+    /* FP 支持：启用 mstatus.FS（Dirty）使 enclave 可执行硬浮点指令（否则 FS=Off→FP 陷阱）。
+     * 单线程 enclave 内 FP 由此可用；多线程(LT 切换)FP 上下文保存见 runtime 侧。 */
+    regs->mstatus = (1 << MSTATUS_MPP_SHIFT) | MSTATUS_FS;
     // $a0: SlotTEE slot token. Zero preserves the original slot 0 run path.
     regs->a0 = entry_arg;
     regs->t6 = entry_arg;

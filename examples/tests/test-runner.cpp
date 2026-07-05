@@ -7175,6 +7175,62 @@ run_revoke_ipi_scenario(const char* eapp_file, const char* rt_file, const char* 
   return 0;
 }
 
+/* C3 in-enclave LU：host 侧重算 LU checksum（与 lt-user-lu.c 的 fill/kernel 逐位一致）。 */
+static uintptr_t
+lu_host_checksum(long n)
+{
+  static double hA[256][256];
+  const long B = 16;
+  for (long i = 0; i < n; i++)
+    for (long j = 0; j < n; j++)
+      hA[i][j] = (double)(((i * 7 + j * 3 + 1) & 0x1f) + 1);
+  for (long i = 0; i < n; i++)
+    hA[i][i] += (double)(n * 32);
+  for (long k = 0; k < n; k += B) {
+    long kk = (k + B > n) ? n : k + B;
+    for (long i = k; i < kk; i++) {
+      for (long j = k; j < i; j++) { double s = hA[i][j]; for (long p = k; p < j; p++) s -= hA[i][p] * hA[p][j]; hA[i][j] = s / hA[j][j]; }
+      for (long j = i; j < kk; j++) { double s = hA[i][j]; for (long p = k; p < i; p++) s -= hA[i][p] * hA[p][j]; hA[i][j] = s; }
+    }
+    for (long i = kk; i < n; i++) {
+      for (long j = k; j < kk; j++) { double s = hA[i][j]; for (long p = k; p < j; p++) s -= hA[i][p] * hA[p][j]; hA[i][j] = s / hA[j][j]; }
+      for (long j = kk; j < n; j++) { double s = hA[i][j]; for (long p = k; p < kk; p++) s -= hA[i][p] * hA[p][j]; hA[i][j] = s; }
+    }
+  }
+  uintptr_t acc = 1469598103u;
+  for (long i = 0; i < n; i++)
+    for (long j = 0; j < n; j++) { long v = (long)(hA[i][j] * 1000.0); acc ^= (uintptr_t)(unsigned long)v; acc *= 1099511628211u; }
+  return acc;
+}
+
+static int
+run_slottee_lu_test(const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params)
+{
+  long sizes[] = {64, 128, 256};
+  int ok_all = 1;
+  /* 第一阶段：仅 G=0（单线程 in-enclave LU，验 FP 支持）；多线程(LT FP 上下文)后续。 */
+  printf("lu,setup,in-enclave SLOTTEE LU(no-pivot blocked block=16 double-FP),sizes=64/128/256,threads=0(single),metric=rdtime_in_enclave_compute\n");
+  printf("lu,result,N,slottee_single_compute,csum,csum_ok\n");
+  for (int si = 0; si < 3; si++) {
+    long N = sizes[si];
+    uintptr_t expect = lu_host_checksum(N);
+    struct slottee_matmul_combo_report r;
+    memset(&r, 0, sizeof(r));
+    int rc = run_matmul_combo(eapp_file, rt_file, ld_file, params, N, 0, &r);
+    int csok = (rc == 0 && r.checksum == expect);
+    if (!csok) {
+      ok_all = 0;
+      printf("[FAIL] lu combo N=%ld G=0 rc=%d csum_ok=%d (got=0x%lx expect=0x%lx)\n",
+          N, rc, (int)(r.checksum == expect), r.checksum, expect);
+    }
+    printf("lu,result,%ld,%lu,0x%lx,%d\n", N, r.max_compute, r.checksum, csok);
+    fflush(stdout);
+  }
+  printf("[slottee] lu in-enclave (single-thread FP) done ok=%d\n", ok_all);
+  return ok_all ? 0 : 1;
+}
+
 static int
 run_slottee_revoke_ipi_test(const char* eapp_file, const char* rt_file,
     const char* ld_file, Keystone::Params params)
@@ -7394,6 +7450,7 @@ main(int argc, char** argv) {
   int enter_slot_preempt_bestvictim = 0;
   int enter_slot_ledger = 0;
   int enter_slot_matmul = 0;
+  int enter_slot_lu = 0;
   int enter_slot_revoke_ipi = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
@@ -7483,6 +7540,7 @@ main(int argc, char** argv) {
           &enter_slot_preempt_bestvictim, 1},
       {"enter-slot-ledger", no_argument, &enter_slot_ledger, 1},
       {"enter-slot-matmul", no_argument, &enter_slot_matmul, 1},
+      {"enter-slot-lu", no_argument, &enter_slot_lu, 1},
       {"enter-slot-revoke-ipi", no_argument, &enter_slot_revoke_ipi, 1},
       {"slottee-trace-log", no_argument, &slottee_trace_log, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
@@ -7724,6 +7782,9 @@ main(int argc, char** argv) {
   }
   if (enter_slot_matmul) {
     return run_slottee_matmul_test(eapp_file, rt_file, ld_file, params);
+  }
+  if (enter_slot_lu) {
+    return run_slottee_lu_test(eapp_file, rt_file, ld_file, params);
   }
   if (enter_slot_revoke_ipi) {
     return run_slottee_revoke_ipi_test(eapp_file, rt_file, ld_file, params);

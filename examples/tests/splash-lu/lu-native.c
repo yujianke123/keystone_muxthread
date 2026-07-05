@@ -88,10 +88,23 @@ static uintptr_t checksum(long n) {
   return acc;
 }
 
+/* nt==0：直接单线程(无 pthread)，与 in-enclave G=0 同结构，供公平 TEE 开销对比。 */
+static void lu_update_rows_direct(long k, long b, long n) {
+  long kk = (k + b > n) ? n : k + b;
+  for (long i = kk; i < n; i++) {
+    for (long j = k; j < kk; j++) { double s2 = A[i][j]; for (long p = k; p < j; p++) s2 -= A[i][p]*A[p][j]; A[i][j] = s2/A[j][j]; }
+    for (long j = kk; j < n; j++) { double s2 = A[i][j]; for (long p = k; p < kk; p++) s2 -= A[i][p]*A[p][j]; A[i][j] = s2; }
+  }
+}
+
 static unsigned long lu_factor(long n, long b, long nt) {
   pthread_t tid[4];
   struct targ ta[4];
   unsigned long s = rdtime_now();
+  if (nt == 0) {
+    for (long k = 0; k < n; k += b) { lu_diag(k, b, n); lu_update_rows_direct(k, b, n); }
+    return rdtime_now() - s;
+  }
   for (long k = 0; k < n; k += b) {
     lu_diag(k, b, n);
     for (long t = 0; t < nt; t++) { ta[t]=(struct targ){k,b,n,t,nt}; pthread_create(&tid[t],NULL,update_worker,&ta[t]); }
@@ -104,9 +117,9 @@ static unsigned long lu_factor(long n, long b, long nt) {
 
 int main(void) {
   long sizes[] = {64, 128, 256, 512};
-  int threadset[] = {1, 2, 4};
+  int threadset[] = {0, 1, 2, 4};   /* 0=直接单线程(无pthread,对标in-enclave G=0) */
   long B = 16;
-  printf("lu_native,setup,metric=rdtime_native_4mhz,block=%ld,sizes=64/128/256/512,threads=1/2/4\n", B);
+  printf("lu_native,setup,metric=rdtime_native_4mhz,block=%ld,sizes=64/128/256/512,threads=0(direct)/1/2/4\n", B);
   printf("lu_native,result,N,threads,cycles,csum\n");
   for (int si = 0; si < 4; si++) {
     long n = sizes[si];
