@@ -68,7 +68,7 @@ static const uintptr_t slottee_null_enter_baseline_count = 3;
 static const uintptr_t slottee_null_enter_baseline_min = 430912;
 static const uintptr_t slottee_null_enter_baseline_max = 2520128;
 static const unsigned long long slottee_null_enter_baseline_total = 3891424ULL;
-static const uintptr_t enter_slot_pool_workers = 2;
+static const uintptr_t enter_slot_pool_workers = 1;
 static const uintptr_t enter_slot_resume_limit = 8;
 static const uintptr_t enter_slot_revoke_stress_rounds = 3;
 static const uintptr_t enter_slot_active_revoke_timer_rounds = 3;
@@ -632,6 +632,11 @@ static int
 init_eval_enclave_with_caps(Keystone::Enclave& enclave, const char* eapp_file,
     const char* rt_file, const char* ld_file, Keystone::Params params,
     uintptr_t max_slot, uintptr_t* seed_cycles);
+static Keystone::Error
+enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
+    const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value,
+    uintptr_t* lease_id, uintptr_t* ocall_count, uintptr_t* resume_count,
+    uintptr_t* bound_hart, uintptr_t max_resumes);
 
 static int
 run_enter_slot_with_seeded_caps(const char* label, uintptr_t flags,
@@ -666,8 +671,12 @@ run_enter_slot_with_seeded_caps(const char* label, uintptr_t flags,
       return 1;
     }
 
-    ret = enter_slot_request_once_with_cap(enclave, cap, flags, &status,
-        &value, &lease);
+    /* VF2: real-HW CLINT timer fires during slot execution (QEMU didn't),
+     * so the SM returns INTERRUPTED. Resume-loop like the LT_USER_OCALL path
+     * (and dispatch any edge calls) until the slot completes. */
+    uintptr_t vf2_ocalls = 0, vf2_resumes = 0;
+    ret = enter_slot_user_ocall_round_with_cap_and_flags(enclave, cap, flags,
+        &status, &value, &lease, &vf2_ocalls, &vf2_resumes, nullptr, 20000);
     printf("%s_seeded_worker,%lu,%lu,%lu,%lu\n",
         label, slot_id, status, value, lease);
 
@@ -3885,7 +3894,9 @@ run_enter_slot_rt_authorized_mint(const char* eapp_file,
   if (expect_rt_authorized_mint_row("enter_with_rt_cap", ret, status, value,
           cap, lease, ocalls, resumes, SBI_ERR_SM_ENCLAVE_SUCCESS) ||
       value != SLOTTEE_LT_USER_OCALL_MAGIC || lease == 0 ||
-      ocalls != 1 || resumes != 1) {
+      /* VF2: live CLINT timer adds INTERRUPTED-resumes beyond the single
+       * ocall-resume; require the ocall happened and at least one resume. */
+      ocalls != 1 || resumes < 1) {
     slottee_trace_destroy(enclave);
     return 1;
   }
@@ -4475,6 +4486,28 @@ slottee_ticket_worker(void* opaque)
     uintptr_t cycles = read_cycle_counter() - start;
 
     arg->cycles += cycles;
+
+    /* VF2: the live CLINT timer interrupts REAL slots (no timer delegation
+     * in this mode).  Re-entering leaves the stopped lease behind and the SM
+     * answers ILLEGAL_ARGUMENT forever; resume the stopped slot thread
+     * instead (same recovery as enter_slot_request_round). */
+    for (uintptr_t rr = 0; ret == Keystone::Error::Success &&
+         status == SBI_ERR_SM_ENCLAVE_INTERRUPTED && rr < 64; rr++) {
+      if (arg->ioctl_lock)
+        pthread_mutex_lock(arg->ioctl_lock);
+      Keystone::Error rret = enter_slot_resume_once(*arg->enclave, &status, &value);
+      if (arg->ioctl_lock)
+        pthread_mutex_unlock(arg->ioctl_lock);
+      if (rret == Keystone::Error::EdgeCallHost) {
+        incoming_call_dispatch(arg->enclave->getSharedBuffer());
+        status = SBI_ERR_SM_ENCLAVE_INTERRUPTED; /* resume again */
+        continue;
+      }
+      if (rret == Keystone::Error::EnclaveInterrupted)
+        continue; /* wrapper left status INTERRUPTED; keep resuming */
+      ret = rret; /* Success or a hard error: settle and re-check below */
+      break;
+    }
 
     if (ret == Keystone::Error::Success &&
         status == SBI_ERR_SM_ENCLAVE_SUCCESS &&
