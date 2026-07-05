@@ -48,5 +48,10 @@ struct encl_ctx {
 	uintptr_t sstatus;//32
 	uintptr_t sbadaddr;//33
 	uintptr_t scause;//34
+	/* FP 上下文（多线程 in-enclave 浮点）：f0-f31 + fcsr。offset 35..67。
+	 * entry.S 在 trap save/restore 条件保存(sstatus.FS!=Off)，随 encl_ctx 一起被
+	 * slottee LT 切换(*ctx=next->saved_ctx)搬运，从而每逻辑线程独立 FP 状态。 */
+	uint64_t fpr[32];//35..66
+	uint64_t fcsr;//67
 };
 #endif /* _REGS_H_ */

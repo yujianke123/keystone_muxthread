@@ -17,7 +17,8 @@
 
 #define LWU lwu
 #define REGBYTES (1<<LOG_REGBYTES)
-#define ENCL_CONTEXT_SIZE (REGBYTES*35)
+/* 35 = regs(32) + sstatus/sbadaddr/scause(3)；+33 = fpr[32]+fcsr(FP 上下文, offset 35..67)。 */
+#define ENCL_CONTEXT_SIZE (REGBYTES*68)
 #define HOST_CONTEXT_SIZE (REGBYTES*32)
 
 #define ENCL_STACK_SIZE (8*1024)
