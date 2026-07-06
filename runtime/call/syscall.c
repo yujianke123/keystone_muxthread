@@ -344,6 +344,10 @@ void handle_syscall(struct encl_ctx* ctx)
   case(RUNTIME_SYSCALL_SLOTTEE_LT_SPAWN_SEQ):
     ret = slottee_lt_spawn_seq(arg0, arg1, arg2);
     break;
+  case(1016): /* 诊断: DBG_MARK——eapp 直打串口(绕开 host/ssh/文件,板崩前可见) */
+    printf("[slottee] DBGMARK 0x%lx\r\n", (unsigned long) arg0);
+    ret = 0;
+    break;
 
 
 #ifdef USE_LINUX_SYSCALL

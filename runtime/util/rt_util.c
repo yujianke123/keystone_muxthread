@@ -8,6 +8,7 @@
 #include "uaccess.h"
 #include "mm/vm.h"
 #include "sys/slottee.h"
+#include <asm/csr.h>
 
 // Statically allocated copy-buffer
 unsigned char rt_copy_buffer_1[RISCV_PAGE_SIZE];
@@ -39,6 +40,13 @@ void rt_util_misc_fatal(){
 }
 
 void not_implemented_fatal(struct encl_ctx* ctx){
+    /* 诊断: 指数节流(1,2,4,8,...)——静默故障吞掉循环可见化 */
+    static unsigned long nif_count;
+    nif_count++;
+    if ((nif_count & (nif_count - 1)) == 0)
+      printf("[slottee] NIF count=%lu pc=0x%lx addr=0x%lx scause=0x%lx spp=%lu\r\n",
+          nif_count, ctx->regs.sepc, ctx->sbadaddr, ctx->scause,
+          (unsigned long)((ctx->sstatus & SR_SPP) ? 1 : 0));
 #ifdef FATAL_DEBUG
     unsigned long addr, cause, pc;
     pc = ctx->regs.sepc;
@@ -58,6 +66,13 @@ void not_implemented_fatal(struct encl_ctx* ctx){
 
 void rt_page_fault(struct encl_ctx* ctx)
 {
+  /* 诊断: 指数节流页故障可见化 */
+  static unsigned long pf_count;
+  pf_count++;
+  if ((pf_count & (pf_count - 1)) == 0)
+    printf("[slottee] PF count=%lu pc=0x%lx addr=0x%lx scause=0x%lx spp=%lu\r\n",
+        pf_count, ctx->regs.sepc, ctx->sbadaddr, ctx->scause,
+        (unsigned long)((ctx->sstatus & SR_SPP) ? 1 : 0));
 #ifdef FATAL_DEBUG
   unsigned long addr, cause, pc;
   pc = ctx->regs.sepc;

@@ -4,6 +4,7 @@
 #include "mm/mm.h"
 #include "mm/vm.h"
 #include "sys/slottee.h"
+#include "sys/timex.h"
 #include "slottee_sched.h"
 #include "sm_err.h"
 #include "util/printf.h"
@@ -240,16 +241,26 @@ slottee_user_memory_lock_release(void)
 static void
 slottee_lt_scheduler_lock_acquire(void)
 {
-  while (__sync_lock_test_and_set(&slottee_lt_scheduler_lock, 1))
+  /* 诊断: 无界自旋锁若 holder 被 SM 级 stop 带出 enclave(锁跨停出),其它 hart
+   * 在 S-mode(SIE清)死自旋且不可中断=俘获 hart。~1s 未获锁即打印一次(节流)。 */
+  unsigned long spins = 0;
+  while (__sync_lock_test_and_set(&slottee_lt_scheduler_lock, 1)) {
+    if (++spins == 500000000UL)
+      printf("[slottee] LOCKSTUCK sched hart-spin ~1s\r\n");
     __asm__ volatile("nop");
+  }
   __sync_synchronize();
 }
 
 static void
 slottee_preempt_group_lock_acquire(struct slottee_preempt_group* g)
 {
-  while (__sync_lock_test_and_set(&g->lock, 1))
+  unsigned long spins = 0;
+  while (__sync_lock_test_and_set(&g->lock, 1)) {
+    if (++spins == 500000000UL)
+      printf("[slottee] LOCKSTUCK group=%lu hart-spin ~1s\r\n", g->scheduler_slot);
     __asm__ volatile("nop");
+  }
   __sync_synchronize();
 }
 
@@ -421,6 +432,16 @@ slottee_user_lt_save_frame(
     return;
 
   user->saved_ctx = *ctx;
+  /*
+   * Release fence: publish ALL of saved_ctx (GP regs, sepc, and the FP regs
+   * fpr[32]+fcsr appended for in-enclave FP) BEFORE flagging it valid.  A
+   * stealing/dispatching peer hart that observes saved_ctx_valid==1 (paired
+   * with the acquire in slottee_ctx_restorable) is then guaranteed to see the
+   * complete frame.  Without this, weak memory let a peer see valid==1 while
+   * FP regs (-> wrong csum) or sepc (-> sret to a bad PC crash) were still
+   * stale; the zero-PC guard only caught sepc==0, not nonzero-stale FP/regs.
+   */
+  __sync_synchronize();
   user->saved_ctx_valid = 1;
 }
 
@@ -882,9 +903,11 @@ slottee_active_user_prepare_user_entry(
       !user->user_alloc_ok || !entry)
     return 0;
 
-  printf("[slottee] lt_user_entry slot=%lu sepc=0x%lx arg=0x%lx sscratch=0x%lx tp=0x%lx lt=%lu\r\n",
+  printf("[slottee] lt_user_entry slot=%lu sepc=0x%lx arg=0x%lx sscratch=0x%lx tp=0x%lx lt=%lu fs=0x%lx\r\n",
       user->slot_id, entry, arg, user->user_stack_top, user->user_tls_base,
-      user->lt_entry_active);
+      user->lt_entry_active, (csr_read(sstatus) & SR_FS) >> 13);
+  /* FP 修复: slot 直入路径同样强制 FS 开启(S-mode 可写 sstatus.FS,免改 SM) */
+  csr_set(sstatus, SR_FS);
 
   user->entry_tls_base = user->user_tls_base;
   user->tls_entry_ok = slottee_user_addr_in_range(user->entry_tls_base,
@@ -1006,6 +1029,18 @@ slottee_preempt_init_worker(struct slottee_active_user_context* user,
   user->saved_ctx.regs.tp = user->user_tls_base;
   user->saved_ctx.regs.a0 = arg;
   user->saved_ctx.regs.ra = 0;
+  /*
+   * FP 修复(VF2 真机): worker 帧 sstatus 抄自模板(sched-LT 帧),其 FS 源头是
+   * SM slot-reentry 模板的 boot 期快照,真机上为 Off——worker 首条 FP 指令即
+   * 非法指令陷阱挂死(hart 俘获/timer 停摆,G≥1 FP LU 卡死的根因)。这里强制
+   * FS=Dirty,entry.S 的条件 FP save/restore 随 FS!=Off 正常工作。
+   */
+  printf("[slottee] init_worker slot=%lu tmpl_fs=0x%lx -> forced dirty\r\n",
+      slot_id, (user->saved_ctx.sstatus & SR_FS) >> 13);
+  user->saved_ctx.sstatus |= SR_FS;
+  /* Release: same as save_frame — the freshly built frame (incl. FP regs from
+   * *tmpl) must be fully visible before a peer hart can dispatch this worker. */
+  __sync_synchronize();
   user->saved_ctx_valid = user->user_alloc_ok;
 }
 
@@ -1132,6 +1167,15 @@ slottee_ctx_restorable(const struct slottee_active_user_context* w, int site)
 {
   if (!w || !w->saved_ctx_valid)
     return 0;
+  /*
+   * Acquire fence paired with the release in save_frame/bootstrap: once we have
+   * observed saved_ctx_valid==1, this fence guarantees the ENTIRE saved_ctx
+   * (all GP regs, sepc, and fpr[32]+fcsr) is visible on this hart before any
+   * field is read here or copied into the live frame at the gated restore
+   * sites (*ctx = w->saved_ctx).  Fixes cross-hart stale-FP (wrong csum) and
+   * stale-reg (crash) that the sepc==0 guard alone could not catch.
+   */
+  __sync_synchronize();
   if (w->saved_ctx.regs.sepc == 0) {
     printf("[slottee] BADCTX site=%d slot=%lu state=%lu alloc=%lu sp=0x%lx\r\n",
         site, w->slot_id, w->scheduler_state, w->user_alloc_ok,
@@ -1332,6 +1376,11 @@ slottee_lt_timer_preempt(struct encl_ctx* ctx)
       if (group->fast_single) {
         /* 单 worker/无窃取/无安全阀: 无可切换对象, tick 即返回(免锁; ticks 仅本 hart 写) */
         group->ticks++;
+        /* 诊断: 俘获 hart PC 采样器——每 4096 tick(约10s@2.5ms)打一次被抢帧 sepc */
+        if ((group->ticks & 0xfff) == 1)
+          printf("[slottee] ticksample group=%lu ticks=%lu sepc=0x%lx spp=%lu\r\n",
+              group->scheduler_slot, group->ticks, ctx->regs.sepc,
+              (uintptr_t)((ctx->sstatus & SR_SPP) ? 1 : 0));
         return 1;
       }
       slottee_record_trap_frame(user, ctx, STOP_TIMER_INTERRUPT);
@@ -1342,6 +1391,14 @@ slottee_lt_timer_preempt(struct encl_ctx* ctx)
   if (!user || !slottee_mode_is_user_ocall(user->mode))
     return 0;
 
+  /* 诊断: user-ocall LT 被 RT 级 timer 抢占的指数节流打印 */
+  {
+    static unsigned long up_count;
+    up_count++;
+    if ((up_count & (up_count - 1)) == 0)
+      printf("[slottee] UPREEMPT count=%lu slot=%lu sepc=0x%lx\r\n",
+          up_count, user->slot_id, ctx->regs.sepc);
+  }
   slottee_record_trap_frame(user, ctx, STOP_TIMER_INTERRUPT);
   user->preempt_count++;
   slottee_user_lt_preempt_current(user, ctx);
@@ -1807,6 +1864,13 @@ slottee_lt_notify_value(struct encl_ctx* ctx, uintptr_t user_ptr)
 uintptr_t
 slottee_lt_host_yield(void)
 {
+  /* 诊断: yield 存活计数(指数节流 1,2,4,8,...早期活动可见) */
+  static unsigned long yield_count;
+  yield_count++;
+  if ((yield_count & (yield_count - 1)) == 0)
+    printf("[slottee] host_yield alive count=%lu\r\n", yield_count);
+  /* 重臂已移除(单变量实验): 疑为 worker 俘获竞态的凶手——stop 返回与 sret 间
+   * 的 set_timer 恰在死亡窗口内;worker k=0 全流水(FP+屏障)已证可通。 */
   (void)sbi_stop_enclave(STOP_TIMER_INTERRUPT);
   return 0;
 }

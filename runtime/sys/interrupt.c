@@ -23,6 +23,13 @@ void init_timer(void)
 
 void handle_timer_interrupt(struct encl_ctx* regs)
 {
+  /* 诊断: RT 收到的 timer 心跳(指数节流)——RT 级 timer 可见性 */
+  static unsigned long th_count;
+  th_count++;
+  if ((th_count & (th_count - 1)) == 0)
+    printf("[slottee] TIMERHB count=%lu sepc=0x%lx spp=%lu\r\n",
+        th_count, regs->regs.sepc,
+        (unsigned long)((regs->sstatus & SR_SPP) ? 1 : 0));
   if (!slottee_lt_timer_preempt(regs))
     sbi_stop_enclave(STOP_TIMER_INTERRUPT);
   unsigned long next_cycle = get_cycles64() + SLOTTEE_LT_QUANTUM_CYCLES;
@@ -47,8 +54,15 @@ void handle_interrupts(struct encl_ctx* regs)
     /* ignore other interrupts */
     case INTERRUPT_CAUSE_SOFTWARE:
     case INTERRUPT_CAUSE_EXTERNAL:
-    default:
+    default: {
+      /* 诊断: 非 timer 中断进 RT(指数节流) */
+      static unsigned long oi_count;
+      oi_count++;
+      if ((oi_count & (oi_count - 1)) == 0)
+        printf("[slottee] OTHERIRQ count=%lu cause=0x%lx sepc=0x%lx\r\n",
+            oi_count, cause, regs->regs.sepc);
       sbi_stop_enclave(0);
       return;
+    }
   }
 }
