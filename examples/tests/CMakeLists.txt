@@ -39,6 +39,9 @@ set(slottee_stress_test_bins
   test-lt-user-ledger
   test-lt-user-matmul
   test-lt-user-lu
+  test-lt-user-fft
+  test-lt-user-radix
+  test-lt-user-mlp
   test-lt-user-revoke-ipi)
 
 set(slottee_explicit_test_bins
@@ -174,6 +177,18 @@ target_link_libraries(test-lt-user-matmul ${KEYSTONE_LIB_EAPP})
 add_executable(test-lt-user-lu
   lt-user-lu/lt-user-lu.c)
 target_link_libraries(test-lt-user-lu ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-fft
+  lt-user-fft/lt-user-fft.c)
+target_link_libraries(test-lt-user-fft ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-radix
+  lt-user-radix/lt-user-radix.c)
+target_link_libraries(test-lt-user-radix ${KEYSTONE_LIB_EAPP})
+
+add_executable(test-lt-user-mlp
+  lt-user-mlp/lt-user-mlp.c)
+target_link_libraries(test-lt-user-mlp ${KEYSTONE_LIB_EAPP})
 
 add_executable(test-lt-user-revoke-ipi
   lt-user-revoke-ipi/lt-user-revoke-ipi.c)
@@ -412,6 +427,9 @@ file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "fi\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-lu\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-lu eyrie-rt loader.bin --enter-slot-lu\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-fft eyrie-rt loader.bin --enter-slot-fft\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-radix eyrie-rt loader.bin --enter-slot-radix\n")
+file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-mlp eyrie-rt loader.bin --enter-slot-mlp\n")
 file(APPEND ${test_script_tmp} "  exit $?\n")
 file(APPEND ${test_script_tmp} "if [ \"$1\" = \"--enter-slot-revoke-ipi\" ]; then\n")
 file(APPEND ${test_script_tmp} "  ./test-runner test-lt-user-revoke-ipi eyrie-rt loader.bin --enter-slot-revoke-ipi\n")

@@ -4,6 +4,7 @@
 #include "mm/mm.h"
 #include "mm/vm.h"
 #include "sys/slottee.h"
+#include "sys/timex.h"
 #include "slottee_sched.h"
 #include "sm_err.h"
 #include "util/printf.h"
@@ -421,6 +422,16 @@ slottee_user_lt_save_frame(
     return;
 
   user->saved_ctx = *ctx;
+  /*
+   * Release fence: publish ALL of saved_ctx (GP regs, sepc, and the FP regs
+   * fpr[32]+fcsr appended for in-enclave FP) BEFORE flagging it valid.  A
+   * stealing/dispatching peer hart that observes saved_ctx_valid==1 (paired
+   * with the acquire in slottee_ctx_restorable) is then guaranteed to see the
+   * complete frame.  Without this, weak memory let a peer see valid==1 while
+   * FP regs (-> wrong csum) or sepc (-> sret to a bad PC crash) were still
+   * stale; the zero-PC guard only caught sepc==0, not nonzero-stale FP/regs.
+   */
+  __sync_synchronize();
   user->saved_ctx_valid = 1;
 }
 
@@ -1006,6 +1017,9 @@ slottee_preempt_init_worker(struct slottee_active_user_context* user,
   user->saved_ctx.regs.tp = user->user_tls_base;
   user->saved_ctx.regs.a0 = arg;
   user->saved_ctx.regs.ra = 0;
+  /* Release: same as save_frame — the freshly built frame (incl. FP regs from
+   * *tmpl) must be fully visible before a peer hart can dispatch this worker. */
+  __sync_synchronize();
   user->saved_ctx_valid = user->user_alloc_ok;
 }
 
@@ -1132,6 +1146,15 @@ slottee_ctx_restorable(const struct slottee_active_user_context* w, int site)
 {
   if (!w || !w->saved_ctx_valid)
     return 0;
+  /*
+   * Acquire fence paired with the release in save_frame/bootstrap: once we have
+   * observed saved_ctx_valid==1, this fence guarantees the ENTIRE saved_ctx
+   * (all GP regs, sepc, and fpr[32]+fcsr) is visible on this hart before any
+   * field is read here or copied into the live frame at the gated restore
+   * sites (*ctx = w->saved_ctx).  Fixes cross-hart stale-FP (wrong csum) and
+   * stale-reg (crash) that the sepc==0 guard alone could not catch.
+   */
+  __sync_synchronize();
   if (w->saved_ctx.regs.sepc == 0) {
     printf("[slottee] BADCTX site=%d slot=%lu state=%lu alloc=%lu sp=0x%lx\r\n",
         site, w->slot_id, w->scheduler_state, w->user_alloc_ok,
@@ -1808,6 +1831,13 @@ uintptr_t
 slottee_lt_host_yield(void)
 {
   (void)sbi_stop_enclave(STOP_TIMER_INTERRUPT);
+  /*
+   * resume 后重臂 quantum(仅此 idle-yield 热路径;其余 stop 点保持原时序)。
+   * host 调度睡眠常超过剩余 quantum,mtimer 在停出期间过期→STIP 悬挂→sret 回
+   * U-mode 第一条指令立即再陷再 stop:真机上 idle 自旋循环彻底零进展且每个
+   * 有效 quantum 付双倍往返。SBI set_timer 语义顺带清 pending STIP。
+   */
+  sbi_set_timer(get_cycles64() + SLOTTEE_LT_QUANTUM_CYCLES);
   return 0;
 }
 
