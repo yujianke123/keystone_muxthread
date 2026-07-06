@@ -5,6 +5,7 @@
 #include <getopt.h>
 #include <pthread.h>
 #include <sched.h>
+#include <time.h>
 #include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
@@ -1015,6 +1016,41 @@ struct enter_slot_ocall_worker_arg {
 
 static pthread_mutex_t enter_slot_ocall_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* 方案A: idle-resume 自适应 backoff(VF2 host-mediated yield 饱和对策)。
+ * INTERRUPTED 的 resume 往返 dt < fast 阈值 = enclave 在 barrier 忙自旋 host_yield(idle,
+ * enclave 内只转一圈就 stop),连续发生时睡眠指数增长,把 idle resume 频率降到 ~20/s,
+ * 免 VF2 上 5 线程 tight-resume 占满 4 hart 饿死 host OS;dt ≥ 阈值 = 跑满 quantum
+ * (10000tick=2.5ms@4MHz)被定时器抢占(compute),保持原 1ms 并复位——worker 的 wdur 按任务
+ * span 计 rdtime,compute 中长睡会灌进计量毁 speedup。阈值/上限 env 可调免重建。 */
+static long
+slottee_idle_backoff_env_us(const char* name, long defval)
+{
+  const char* s = getenv(name);
+  return (s && *s) ? atol(s) : defval;
+}
+
+static long
+slottee_idle_backoff_fast_us(void)
+{
+  static long v = -1;
+  if (v < 0) v = slottee_idle_backoff_env_us("SLOTTEE_IDLE_BACKOFF_FAST_US", 2000);
+  return v;
+}
+
+static long
+slottee_idle_backoff_max_us(void)
+{
+  static long v = -1;
+  if (v < 0) v = slottee_idle_backoff_env_us("SLOTTEE_IDLE_BACKOFF_MAX_US", 50000);
+  return v;
+}
+
+static long
+slottee_elapsed_us(const struct timespec* a, const struct timespec* b)
+{
+  return (b->tv_sec - a->tv_sec) * 1000000L + (b->tv_nsec - a->tv_nsec) / 1000L;
+}
+
 static Keystone::Error
 enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
     const slot_cap_t& cap, uintptr_t flags, uintptr_t* status, uintptr_t* value,
@@ -1024,6 +1060,8 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
     uintptr_t max_resumes = enter_slot_resume_limit)
 {
   Keystone::Error ret;
+  long idle_backoff_us = 0;
+  struct timespec rt0, rt1;
 
   if (ocall_count)
     *ocall_count = 0;
@@ -1041,6 +1079,7 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
        retry < max_resumes; retry++) {
     if (*status == SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST) {
       incoming_call_dispatch(enclave.getSharedBuffer());
+      idle_backoff_us = 0;                    /* 有进展(ocall),复位 backoff */
       if (ocall_count)
         (*ocall_count)++;
       ret = enter_slot_resume_once_with_cap(enclave, cap,
@@ -1059,8 +1098,10 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
     }
 
     if (*status == SBI_ERR_SM_ENCLAVE_INTERRUPTED) {
+      clock_gettime(CLOCK_MONOTONIC, &rt0);
       ret = enter_slot_resume_once_with_cap(enclave, cap,
           lease_id ? *lease_id : 0, status, value);
+      clock_gettime(CLOCK_MONOTONIC, &rt1);
       if (resume_count)
         (*resume_count)++;
       if (ret != Keystone::Error::Success)
@@ -1071,8 +1112,20 @@ enter_slot_user_ocall_round_with_cap_and_flags(Keystone::Enclave& enclave,
       if (*status != SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST &&
           *status != SBI_ERR_SM_ENCLAVE_INTERRUPTED)
         break;
+      if (*status == SBI_ERR_SM_ENCLAVE_EDGE_CALL_HOST) {
+        idle_backoff_us = 0;                  /* 即将处理 ocall,不睡 */
+        continue;
+      }
       sched_yield();
-      usleep(1000);
+      if (slottee_elapsed_us(&rt0, &rt1) >= slottee_idle_backoff_fast_us()) {
+        idle_backoff_us = 0;                  /* compute 被抢:保持原 1ms */
+        usleep(1000);
+      } else {
+        idle_backoff_us = idle_backoff_us ? idle_backoff_us * 2 : 1000;
+        if (idle_backoff_us > slottee_idle_backoff_max_us())
+          idle_backoff_us = slottee_idle_backoff_max_us();
+        usleep(idle_backoff_us);
+      }
       continue;
     }
 
@@ -7179,7 +7232,7 @@ run_revoke_ipi_scenario(const char* eapp_file, const char* rt_file, const char* 
 static uintptr_t
 lu_host_checksum(long n)
 {
-  static double hA[256][256];
+  static double hA[512][512];  /* 须≥sweep最大N,行距与eapp LU_MAXN=512一致 */
   const long B = 16;
   for (long i = 0; i < n; i++)
     for (long j = 0; j < n; j++)
@@ -7237,19 +7290,44 @@ run_lu_combo(const char* eapp_file, const char* rt_file, const char* ld_file,
   }
   edge_init(&enclave);
   ret = enclave.runRaw(&value);
-  uintptr_t idle = 0;
+  printf("host,runRaw_ret=%d,N=%ld,G=%ld\n", (int)ret, N, G); fflush(stdout);
+  /* driver 侧同款 idle backoff:barrier 等 ptask_done 的 host_yield(快往返)指数退避,
+   * 对角块 compute 被抢(dt≥quantum)不睡保持热路径。 */
+  long drv_backoff_us = 0;
+  long drv_dt_us = 1L << 30;   /* 首轮(runRaw 含 boot)视为长往返 */
+  struct timespec dt0, dt1;
+  /* 诊断: resume 往返 dt 分布(区分零进展 ping-pong vs 短 quantum) */
+  long dt_min = 1L << 30, dt_max = 0, dt_sum = 0, dt_cnt = 0, edge_cnt = 0;
   for (uintptr_t retry = 0;
        (ret == Keystone::Error::EdgeCallHost || ret == Keystone::Error::EnclaveInterrupted) &&
        retry < (uintptr_t)100000000; retry++) {
+    if (retry && (retry % 256) == 0) {
+      printf("host,dt,retry=%lu,edges=%ld,intr=%ld,dt_us_min=%ld,avg=%ld,max=%ld,backoff=%ld\n",
+          (unsigned long)retry, edge_cnt, dt_cnt,
+          dt_cnt ? dt_min : -1, dt_cnt ? dt_sum / dt_cnt : -1, dt_max,
+          drv_backoff_us);
+      fflush(stdout);
+      dt_min = 1L << 30; dt_max = 0; dt_sum = 0; dt_cnt = 0; edge_cnt = 0;
+    }
+    if ((retry % 100000) == 0) {
+      int st = 0, cr = 0;
+      for (long g = 0; g < G; g++) { st += started[g] ? 1 : 0; cr += copied_slot_cap_ready_by_slot[sched_slot[g]] ? 1 : 0; }
+      printf("host,retry=%lu,ret=%d,workers_started=%d/%ld,caps_ready=%d/%ld,collected=%d\n",
+          (unsigned long)retry, (int)ret, st, G, cr, G, collected); fflush(stdout);
+    }
     if (ret == Keystone::Error::EdgeCallHost) {
       incoming_call_dispatch(enclave.getSharedBuffer());
-      idle = 0;
+      drv_backoff_us = 0;
+      edge_cnt++;
       int seq = get_matmul_report_seq();
       if (seq > last_seq && collected < 1) { get_matmul_report(out); collected++; last_seq = seq; }
+    } else if (drv_dt_us < slottee_idle_backoff_fast_us()) {
+      drv_backoff_us = drv_backoff_us ? drv_backoff_us * 2 : 1000;
+      if (drv_backoff_us > slottee_idle_backoff_max_us())
+        drv_backoff_us = slottee_idle_backoff_max_us();
+      usleep(drv_backoff_us);
     } else {
-      idle++;
-      if (idle > 4096) usleep(50);
-      else if (idle > 256) usleep(5);
+      drv_backoff_us = 0;
     }
     for (long g = 0; g < G; g++) {
       if (!started[g] && copied_slot_cap_ready_by_slot[sched_slot[g]]) {
@@ -7263,11 +7341,19 @@ run_lu_combo(const char* eapp_file, const char* rt_file, const char* ld_file,
           slottee_trace_destroy(enclave);
           return 1;
         }
-        started[g] = 1; idle = 257; sched_yield();
+        started[g] = 1; sched_yield();
       }
     }
     sched_yield();
+    clock_gettime(CLOCK_MONOTONIC, &dt0);
     ret = enclave.resume(&value);
+    clock_gettime(CLOCK_MONOTONIC, &dt1);
+    drv_dt_us = slottee_elapsed_us(&dt0, &dt1);
+    if (ret == Keystone::Error::EnclaveInterrupted) {
+      if (drv_dt_us < dt_min) dt_min = drv_dt_us;
+      if (drv_dt_us > dt_max) dt_max = drv_dt_us;
+      dt_sum += drv_dt_us; dt_cnt++;
+    }
     if (ret == Keystone::Error::Success && value == SLOTTEE_LT_USER_OCALL_MAGIC) break;
   }
   for (long g = 0; g < G; g++)
@@ -7280,20 +7366,57 @@ static int
 run_slottee_lu_test(const char* eapp_file, const char* rt_file, const char* ld_file,
     Keystone::Params params)
 {
-  long sizes[] = {64, 128, 256};
+  long sizes[] = {64, 128, 256, 512};
   long Gs[4] = {0, 1, 2, 4};
   int ok_all = 1;
+  /* Optional combo gating for root-cause isolation: LU_GS="0,1" runs only those
+   * G values; LU_SIZES="256" runs only that size.  Unset => full sweep. */
+  const char* gs_env = getenv("LU_GS");
+  const char* sz_env = getenv("LU_SIZES");
+  /* FP 保存探针模式：LU_FPTEST=1 只跑 cfg_groups==99 的哨兵，判定 FP 跨定时器抢占是否保存。 */
+  if (getenv("LU_FPTEST")) {
+    int fails = 0;
+    int iters = getenv("LU_FPITERS") ? atoi(getenv("LU_FPITERS")) : 8;
+    printf("fptest,setup,sentinel f0-f31 across ~50M-cycle int spin (many preemptions), iters=%d\n", iters);
+    for (int it = 0; it < iters; it++) {
+      struct slottee_matmul_combo_report r; memset(&r, 0, sizeof(r));
+      int rc = run_lu_combo(eapp_file, rt_file, ld_file, params, 999, 0, &r);
+      long bad_act = (long)r.checksum, bad_idle = (long)r.max_compute;
+      long fb_act = (long)(r.failures >> 8), fb_idle = (long)(r.failures & 0xff);
+      printf("fptest,iter=%d,rc=%d,active_bad=%ld(fb=%ld),idle_bad=%ld(fb=%ld),elapsed_rdtime=%lu,bad_val_bits=0x%lx\n",
+          it, rc, bad_act, fb_act, bad_idle, fb_idle,
+          (unsigned long)r.sum_compute, (unsigned long)r.wall_cycles);
+      fflush(stdout);
+      if (rc != 0 || bad_act != 0 || bad_idle != 0) fails++;
+    }
+    printf("[fptest] done fails=%d/%d (bad_regs>0 => FP NOT preserved across preemption)\n", fails, iters);
+    return fails ? 1 : 0;
+  }
   printf("lu,setup,in-enclave SLOTTEE LU(no-pivot blocked block=16 double-FP),sizes=64/128/256,threads=0/1/2/4,metric=rdtime_in_enclave_compute\n");
   printf("lu,result,N,g0,slottee1,s2,s4,speedup2,speedup4,csum,csum_ok\n");
-  for (int si = 0; si < 3; si++) {
+  for (int si = 0; si < 4; si++) {
     long N = sizes[si];
+    if (sz_env) { char b[16]; snprintf(b, sizeof(b), "%ld", N);
+      if (!strstr(sz_env, b)) continue; }
     uintptr_t expect = lu_host_checksum(N);
     struct slottee_matmul_combo_report r[4];
     int csok = 1;
     for (int gi = 0; gi < 4; gi++) {
       memset(&r[gi], 0, sizeof(r[gi]));
+      if (gs_env) { char b[8]; snprintf(b, sizeof(b), "%ld", Gs[gi]);
+        if (!strstr(gs_env, b)) continue; }
+      printf("lu,trying,N=%ld,G=%ld\n", N, Gs[gi]); fflush(stdout);
       int rc = run_lu_combo(eapp_file, rt_file, ld_file, params, N, Gs[gi], &r[gi]);
-      if (rc != 0 || r[gi].checksum != expect) {
+      printf("lu,returned,N=%ld,G=%ld,rc=%d,failures=0x%lx\n", N, Gs[gi], rc, (unsigned long)r[gi].failures); fflush(stdout);
+      if ((r[gi].failures & 0xFF00) == 0x0D00) {   /* enclave 自检到死锁 */
+        long side = r[gi].failures & 0xff;
+        long k_gv = (long)(r[gi].wall_cycles >> 20), ep_gv = (long)(r[gi].wall_cycles & 0xfffff);
+        printf("[DEADLOCK] lu N=%ld G=%ld side=%ld(1=driver屏障 2=worker等epoch 3=sched收敛) worker_entered=%lu worker_ran=%lu done_at_giveup=%lu k=%ld epoch=%ld stage=%lu(1入口2原子3见epoch4FP前5FP后6done)\n",
+            N, Gs[gi], side, (unsigned long)r[gi].worker_compute[0], (unsigned long)r[gi].max_compute,
+            (unsigned long)r[gi].sum_compute, k_gv, ep_gv,
+            (unsigned long)r[gi].worker_compute[1]);
+        csok = 0; ok_all = 0;
+      } else if (rc != 0 || r[gi].checksum != expect) {
         csok = 0; ok_all = 0;
         printf("[FAIL] lu combo N=%ld G=%ld rc=%d csum_ok=%d (got=0x%lx expect=0x%lx)\n",
             N, Gs[gi], rc, (int)(r[gi].checksum == expect), r[gi].checksum, expect);
@@ -7304,6 +7427,14 @@ run_slottee_lu_test(const char* eapp_file, const char* rt_file, const char* ld_f
     printf("lu,result,%ld,%lu,%lu,%lu,%lu,%.3f,%.3f,0x%lx,%d\n",
         N, r[0].max_compute, r[1].max_compute, r[2].max_compute, r[3].max_compute,
         sp2, sp4, r[1].checksum, csok);
+    /* wall 口径(VF2 真机主口径): 并行段 t0..t1 墙钟(rdtime),worker span 在
+     * host-mediated 抢占下会把停出等待灌进 wdur,speedup 失真;wall 含屏障延迟
+     * (受 SLOTTEE_IDLE_BACKOFF_MAX_US 影响,测量时建议调小)但跨 G 口径一致。 */
+    double wsp2 = r[2].wall_cycles ? (double)r[1].wall_cycles / (double)r[2].wall_cycles : 0.0;
+    double wsp4 = r[3].wall_cycles ? (double)r[1].wall_cycles / (double)r[3].wall_cycles : 0.0;
+    printf("lu,wall,%ld,%lu,%lu,%lu,%lu,%.3f,%.3f\n",
+        N, r[0].wall_cycles, r[1].wall_cycles, r[2].wall_cycles, r[3].wall_cycles,
+        wsp2, wsp4);
     fflush(stdout);
   }
   printf("[slottee] lu in-enclave (multi-thread FP) done ok=%d\n", ok_all);
@@ -7418,6 +7549,7 @@ run_slottee_lifecycle_bench(const char* eapp_file, const char* rt_file,
 
 int
 main(int argc, char** argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);   /* 诊断: 无缓冲, 实时看输出(ssh管道下不丢) */
   if (argc < 4 || argc > 32) {
     printf(
         "Usage: %s <eapp> <runtime> [--utm-size SIZE(K)] [--freemem-size "
