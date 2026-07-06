@@ -160,6 +160,10 @@ static void compute_slot_cap_mac(
   sbi_memset(digest, 0, sizeof(digest));
 }
 
+/* __attribute__((unused))：SLOTTEE_NO_MAC_BENCH 下 verify 跳过比对，此函数无调用者。 */
+static int slot_cap_mac_equal(
+    const uintptr_t lhs[SLOTTEE_CAP_MAC_WORDS],
+    const uintptr_t rhs[SLOTTEE_CAP_MAC_WORDS]) __attribute__((unused));
 static int slot_cap_mac_equal(
     const uintptr_t lhs[SLOTTEE_CAP_MAC_WORDS],
     const uintptr_t rhs[SLOTTEE_CAP_MAC_WORDS])
@@ -181,9 +185,17 @@ static int verify_slot_cap_mac(enclave_id eid, const struct slot_cap_t *cap)
   if (!enclaves[eid].cap_key_ready)
     return 0;
 
+#ifdef SLOTTEE_NO_MAC_BENCH
+  /* B2 消融基线：跳过 cap MAC 计算+比对以隔离校验成本（**仅性能测量镜像，禁止生产**）。
+   * with-MAC 减去本基线 = ENTER_SLOT 路径的 cap MAC 校验开销。 */
+  (void)cap;
+  (void)expected;
+  ok = 1;
+#else
   compute_slot_cap_mac(eid, cap, expected);
   ok = slot_cap_mac_equal(cap->cap_mac, expected);
   sbi_memset(expected, 0, sizeof(expected));
+#endif
 
   return ok;
 }
@@ -346,11 +358,24 @@ int enclave_slot_timer_redirectable(enclave_id eid, uintptr_t thread_index)
 
   spin_lock(&encl_lock);
   if (ENCLAVE_EXISTS(eid) && enclaves[eid].state == RUNNING) {
-    lease = find_active_slot_lease_by_thread_index(eid, thread_index);
-    redirectable = lease &&
-        lease->active_hart == csr_read(mhartid) &&
-        !slot_lease_has_pending_revoke(lease) &&
-        slottee_slot_mode_uses_rt_user_context(lease->slot_mode);
+    if (thread_index == 0) {
+      /*
+       * thread-0(主上下文)的 timer 也重定向给 RT:SM 直停不经 RT,FP 寄存器
+       * 得不到保存(entry.S 的条件 FP save 只在 RT trap 路径跑),真机上 host
+       * 侧 FP 使用会腐蚀 enclave FP → G=0 FP 负载偶发错 csum。重定向后与
+       * slot 线程同走 RT 停出(RT 内 handle_timer_interrupt→sbi_stop),FP 被
+       * entry.S 保存;且 resume 后 interrupt.c 重臂 quantum,顺带消除 thread-0
+       * 陈旧 mtimecmp 的即刻再陷。SIE=0 的 RT 临界区仍由 sbi_trap_hack 的
+       * SIE 门保护(留 pending 不注入)。
+       */
+      redirectable = 1;
+    } else {
+      lease = find_active_slot_lease_by_thread_index(eid, thread_index);
+      redirectable = lease &&
+          lease->active_hart == csr_read(mhartid) &&
+          !slot_lease_has_pending_revoke(lease) &&
+          slottee_slot_mode_uses_rt_user_context(lease->slot_mode);
+    }
   }
   spin_unlock(&encl_lock);
 
@@ -592,6 +617,7 @@ static inline void context_switch_to_enclave(struct sbi_trap_regs* regs,
   swap_prev_state(thread, regs, 1);
   swap_prev_mepc(thread, regs, regs->mepc);
   swap_prev_mstatus(thread, regs, regs->mstatus);
+  swap_prev_fp_state(thread);   /* FP 堆随线程走(SM 直停不经 RT 的 FP 保护) */
 
   uintptr_t interrupts = enclave_slot_timer_redirectable(eid, thread_index) ?
       MIP_STIP : 0;
@@ -601,7 +627,9 @@ static inline void context_switch_to_enclave(struct sbi_trap_regs* regs,
     // passing parameters for a first run
     uintptr_t entry_pc = enclaves[eid].params.dram_base;
     regs->mepc = entry_pc - 4; // regs->mepc will be +4 before sbi_ecall_handler return
-    regs->mstatus = (1 << MSTATUS_MPP_SHIFT);
+    /* FP 支持：启用 mstatus.FS（Dirty）使 enclave 可执行硬浮点指令（否则 FS=Off→FP 陷阱）。
+     * 单线程 enclave 内 FP 由此可用；多线程(LT 切换)FP 上下文保存见 runtime 侧。 */
+    regs->mstatus = (1 << MSTATUS_MPP_SHIFT) | MSTATUS_FS;
     // $a0: SlotTEE slot token. Zero preserves the original slot 0 run path.
     regs->a0 = entry_arg;
     regs->t6 = entry_arg;
@@ -662,6 +690,7 @@ static inline void context_switch_to_host(struct sbi_trap_regs *regs,
   swap_prev_state(thread, regs, return_on_resume);
   swap_prev_mepc(thread, regs, regs->mepc);
   swap_prev_mstatus(thread, regs, regs->mstatus);
+  swap_prev_fp_state(thread);   /* 还 host 原 FP 堆,enclave FP 存入 thread */
 
   switch_vector_host();
 
@@ -1526,6 +1555,10 @@ unsigned long exit_enclave_slot(
   if (lease->state != SLOT_LEASE_ACTIVE ||
       lease->lease_id != lease_id ||
       lease->active_hart != csr_read(mhartid)) {
+    /* 诊断: slot exit 被拒(RT 侧会掉进 exit_enclave 重试环=俘获) */
+    sbi_printf("[SM] slot-exit REFUSED slot=%lu state=%d lease=%lu/%lu hart=%lu/%lu\n",
+        slot_id, (int)lease->state, lease->lease_id, lease_id,
+        (unsigned long)lease->active_hart, csr_read(mhartid));
     spin_unlock(&encl_lock);
     return SBI_ERR_SM_ENCLAVE_ILLEGAL_ARGUMENT;
   }
@@ -1586,6 +1619,14 @@ unsigned long stop_enclave(struct sbi_trap_regs *regs, uint64_t request, enclave
   uintptr_t thread_index = cpu_get_enclave_thread_index();
   struct slot_lease_t *lease = NULL;
 
+  /* 诊断: slot 线程(thread>0)的 stop(指数节流) */
+  if (thread_index > 0) {
+    static unsigned long slot_stops;
+    slot_stops++;
+    if ((slot_stops & (slot_stops - 1)) == 0)
+      sbi_printf("[SM] slot-stop n=%lu req=%lu thr=%lu mepc=0x%lx\n",
+          slot_stops, (unsigned long)request, thread_index, regs->mepc);
+  }
   spin_lock(&encl_lock);
   stoppable = enclaves[eid].state == RUNNING && thread_index < MAX_ENCL_THREADS;
   if (stoppable) {
@@ -1743,6 +1784,16 @@ unsigned long resume_enclave_slot(
   enclaves[eid].n_thread++;
   enclaves[eid].state = RUNNING;
   spin_unlock(&encl_lock);
+
+  /* 诊断: slot resume 成功(指数节流) */
+  {
+    static unsigned long slot_resumes;
+    slot_resumes++;
+    if ((slot_resumes & (slot_resumes - 1)) == 0)
+      sbi_printf("[SM] slot-resume n=%lu thr=%lu prev_mepc=0x%lx\n",
+          slot_resumes, thread_index,
+          enclaves[eid].threads[thread_index].prev_mepc);
+  }
 
   context_switch_to_enclave(regs, eid, thread_index, 0, 0);
 

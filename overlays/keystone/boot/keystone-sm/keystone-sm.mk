@@ -24,6 +24,12 @@ else
 SLOTTEE_SM_CFLAGS := -DSLOTTEE_DEBUG_MINT_ENABLE
 endif
 
+# B2 消融基线：跳过 SM 侧 cap MAC 校验以隔离其开销（仅性能测量镜像，禁止生产）。
+SLOTTEE_NO_MAC_BENCH ?= 0
+ifneq ($(filter 1 y yes true ON,$(SLOTTEE_NO_MAC_BENCH)),)
+SLOTTEE_SM_CFLAGS += -DSLOTTEE_NO_MAC_BENCH
+endif
+
 ifeq ($(KEYSTONE_PLATFORM),mpfs)
 HSS_DEPENDENCIES += keystone-sm
 $(HSS_TARGET_CONFIGURE): keystone-sm-install

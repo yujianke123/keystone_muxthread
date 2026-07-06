@@ -137,8 +137,25 @@ void sbi_trap_handler_keystone_enclave(struct sbi_trap_regs *regs)
 		mcause &= ~(1UL << (__riscv_xlen - 1));
 		switch (mcause) {
 		case IRQ_M_TIMER: {
-      if (slottee_redirect_timer_to_enclave(regs))
+      if (slottee_redirect_timer_to_enclave(regs)) {
+        /* 诊断: M-timer 重定向进 enclave RT(指数节流) */
+        static unsigned long mt_redir;
+        mt_redir++;
+        if ((mt_redir & (mt_redir - 1)) == 0)
+          sbi_printf("[SM] MTIMER-redir n=%lu mepc=0x%lx mpp=%lu mideleg=0x%lx mie=0x%lx mip=0x%lx\n",
+              mt_redir, regs->mepc,
+              (regs->mstatus & MSTATUS_MPP) >> MSTATUS_MPP_SHIFT,
+              csr_read(CSR_MIDELEG), csr_read(CSR_MIE), csr_read(CSR_MIP));
         return;
+      }
+      {
+        /* 诊断: M-timer 非重定向 → SM 级 stop(指数节流) */
+        static unsigned long mt_stop;
+        mt_stop++;
+        if ((mt_stop & (mt_stop - 1)) == 0)
+          sbi_printf("[SM] MTIMER-stop n=%lu mepc=0x%lx thr=%lu\n",
+              mt_stop, regs->mepc, cpu_get_enclave_thread_index());
+      }
       regs->mepc -= 4;
       sbi_sm_stop_enclave(regs, STOP_TIMER_INTERRUPT);
       regs->a0 = SBI_ERR_SM_ENCLAVE_INTERRUPTED;
@@ -146,6 +163,14 @@ void sbi_trap_handler_keystone_enclave(struct sbi_trap_regs *regs)
 			break;
                       }
 		case IRQ_M_SOFT: {
+      /* 诊断: M-soft(IPI) → SM 级 stop(指数节流) */
+      {
+        static unsigned long ms_stop;
+        ms_stop++;
+        if ((ms_stop & (ms_stop - 1)) == 0)
+          sbi_printf("[SM] MSOFT-stop n=%lu mepc=0x%lx thr=%lu\n",
+              ms_stop, regs->mepc, cpu_get_enclave_thread_index());
+      }
       /*
        * 软件 IPI（含跨 hart 撤销 rendezvous IPI 与其它 M_SOFT）：统一 stop_enclave 把本 hart 带回
        * host —— 这是 Keystone 原有的安全语义（对未知来源的 M_SOFT 一律安全退出 host 处理；绝不在

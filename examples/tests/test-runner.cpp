@@ -16,6 +16,14 @@
 #include "verifier/report.h"
 #include "verifier/test_dev_key.h"
 
+/* benchmark 周期读：VF2(U74) host/U/S-mode rdcycle 触发不可处理中断→rdtime；QEMU/generic→rdcycle。
+ * SLOTTEE_BENCH_RDTIME 由平台经 keystone-examples.mk 注入。 */
+#ifdef SLOTTEE_BENCH_RDTIME
+#define SLOTTEE_RDCYCLE_INSN "rdtime %0"
+#else
+#define SLOTTEE_RDCYCLE_INSN "rdcycle %0"
+#endif
+
 const char* longstr = "hellohellohellohellohellohellohellohellohellohello";
 static int suppress_enclave_prints;
 static uintptr_t copied_print_value;
@@ -214,9 +222,9 @@ wait_for_enter_slot_ttl(uintptr_t cycles) {
   uintptr_t start = 0;
   uintptr_t now = 0;
 
-  asm volatile("rdtime %0" : "=r"(start));
+  asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(start));
   do {
-    asm volatile("rdtime %0" : "=r"(now));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(now));
   } while ((now - start) < cycles);
 }
 
@@ -227,7 +235,7 @@ wait_until_enter_slot_expiry(uintptr_t expiry_cycle)
   uintptr_t target = expiry_cycle + SLOTTEE_TEST_MAX_LEASE_CYCLES;
 
   do {
-    asm volatile("rdtime %0" : "=r"(now));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(now));
   } while (now < target);
 }
 
@@ -235,7 +243,7 @@ static uintptr_t
 read_cycle_counter() {
   uintptr_t cycles = 0;
 
-  asm volatile("rdtime %0" : "=r"(cycles));
+  asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles));
   return cycles;
 }
 
@@ -7167,6 +7175,141 @@ run_revoke_ipi_scenario(const char* eapp_file, const char* rt_file, const char* 
   return 0;
 }
 
+/* C3 in-enclave LU：host 侧重算 LU checksum（与 lt-user-lu.c 的 fill/kernel 逐位一致）。 */
+static uintptr_t
+lu_host_checksum(long n)
+{
+  static double hA[256][256];
+  const long B = 16;
+  for (long i = 0; i < n; i++)
+    for (long j = 0; j < n; j++)
+      hA[i][j] = (double)(((i * 7 + j * 3 + 1) & 0x1f) + 1);
+  for (long i = 0; i < n; i++)
+    hA[i][i] += (double)(n * 32);
+  for (long k = 0; k < n; k += B) {
+    long kk = (k + B > n) ? n : k + B;
+    for (long i = k; i < kk; i++) {
+      for (long j = k; j < i; j++) { double s = hA[i][j]; for (long p = k; p < j; p++) s -= hA[i][p] * hA[p][j]; hA[i][j] = s / hA[j][j]; }
+      for (long j = i; j < kk; j++) { double s = hA[i][j]; for (long p = k; p < i; p++) s -= hA[i][p] * hA[p][j]; hA[i][j] = s; }
+    }
+    for (long i = kk; i < n; i++) {
+      for (long j = k; j < kk; j++) { double s = hA[i][j]; for (long p = k; p < j; p++) s -= hA[i][p] * hA[p][j]; hA[i][j] = s / hA[j][j]; }
+      for (long j = kk; j < n; j++) { double s = hA[i][j]; for (long p = k; p < kk; p++) s -= hA[i][p] * hA[p][j]; hA[i][j] = s; }
+    }
+  }
+  uintptr_t acc = 1469598103u;
+  for (long i = 0; i < n; i++)
+    for (long j = 0; j < n; j++) { long v = (long)(hA[i][j] * 1000.0); acc ^= (uintptr_t)(unsigned long)v; acc *= 1099511628211u; }
+  return acc;
+}
+
+/* G>0 多线程 in-enclave LU：持久 worker 进入（克隆 run_persistent_matmul_test 的进入循环，
+ * 但只收一个 report）。thread0 spawn_seq 导出 G worker cap → host pthread 进入 → thread0 逐
+ * 块列串行对角+并行尾部(barrier via ptask_done)→ 报告。G=0 走 run_matmul_combo。 */
+static int
+run_lu_combo(const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params, long N, long G, struct slottee_matmul_combo_report* out)
+{
+  if (G == 0)
+    return run_matmul_combo(eapp_file, rt_file, ld_file, params, N, 0, out);
+  Keystone::Enclave enclave;
+  pthread_t th[SLOTTEE_MATMUL_WORKERS];
+  slottee_multihart_worker_arg args[SLOTTEE_MATMUL_WORKERS];
+  int started[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t sched_slot[SLOTTEE_MATMUL_WORKERS];
+  uintptr_t value = 0;
+  Keystone::Error ret;
+  int collected = 0, last_seq = 0;  /* last_seq 下面 reset 后重设 */
+  params.setFreeMemSize(24 * 1024 * 1024);
+  params.setUntrustedSize(256 * 1024);
+  set_matmul_config_ex(N, G, 1 /*persistent enter*/);
+  reset_matmul_report();
+  last_seq = get_matmul_report_seq();  /* reset 不清全局seq→从当前起,只收本combo新report */
+  reset_copied_slot_caps();
+  memset(th, 0, sizeof(th));
+  memset(args, 0, sizeof(args));
+  memset(started, 0, sizeof(started));
+  for (long g = 0; g < G; g++)
+    sched_slot[g] = SLOTTEE_MATMUL_FIRST_WORKER_SLOT + g;
+  if (enclave.init(eapp_file, rt_file, ld_file, params) != Keystone::Error::Success) {
+    printf("[FAIL] lu persistent init N=%ld G=%ld\n", N, G);
+    return 1;
+  }
+  edge_init(&enclave);
+  ret = enclave.runRaw(&value);
+  uintptr_t idle = 0;
+  for (uintptr_t retry = 0;
+       (ret == Keystone::Error::EdgeCallHost || ret == Keystone::Error::EnclaveInterrupted) &&
+       retry < (uintptr_t)100000000; retry++) {
+    if (ret == Keystone::Error::EdgeCallHost) {
+      incoming_call_dispatch(enclave.getSharedBuffer());
+      idle = 0;
+      int seq = get_matmul_report_seq();
+      if (seq > last_seq && collected < 1) { get_matmul_report(out); collected++; last_seq = seq; }
+    } else {
+      idle++;
+      if (idle > 4096) usleep(50);
+      else if (idle > 256) usleep(5);
+    }
+    for (long g = 0; g < G; g++) {
+      if (!started[g] && copied_slot_cap_ready_by_slot[sched_slot[g]]) {
+        memset(&args[g], 0, sizeof(args[g]));
+        args[g].enclave = &enclave;
+        args[g].cap = copied_slot_caps[sched_slot[g]];
+        args[g].slot_id = sched_slot[g];
+        args[g].resume_limit = (uintptr_t)100000000;
+        args[g].ret = Keystone::Error::DeviceError;
+        if (pthread_create(&th[g], NULL, slottee_multihart_worker, &args[g]) != 0) {
+          slottee_trace_destroy(enclave);
+          return 1;
+        }
+        started[g] = 1; idle = 257; sched_yield();
+      }
+    }
+    sched_yield();
+    ret = enclave.resume(&value);
+    if (ret == Keystone::Error::Success && value == SLOTTEE_LT_USER_OCALL_MAGIC) break;
+  }
+  for (long g = 0; g < G; g++)
+    if (started[g]) pthread_join(th[g], NULL);
+  slottee_trace_destroy(enclave);
+  return (collected == 1) ? 0 : 1;
+}
+
+static int
+run_slottee_lu_test(const char* eapp_file, const char* rt_file, const char* ld_file,
+    Keystone::Params params)
+{
+  long sizes[] = {64, 128, 256};
+  long Gs[4] = {0, 1, 2, 4};
+  int ok_all = 1;
+  printf("lu,setup,in-enclave SLOTTEE LU(no-pivot blocked block=16 double-FP),sizes=64/128/256,threads=0/1/2/4,metric=rdtime_in_enclave_compute\n");
+  printf("lu,result,N,g0,slottee1,s2,s4,speedup2,speedup4,csum,csum_ok\n");
+  for (int si = 0; si < 3; si++) {
+    long N = sizes[si];
+    uintptr_t expect = lu_host_checksum(N);
+    struct slottee_matmul_combo_report r[4];
+    int csok = 1;
+    for (int gi = 0; gi < 4; gi++) {
+      memset(&r[gi], 0, sizeof(r[gi]));
+      int rc = run_lu_combo(eapp_file, rt_file, ld_file, params, N, Gs[gi], &r[gi]);
+      if (rc != 0 || r[gi].checksum != expect) {
+        csok = 0; ok_all = 0;
+        printf("[FAIL] lu combo N=%ld G=%ld rc=%d csum_ok=%d (got=0x%lx expect=0x%lx)\n",
+            N, Gs[gi], rc, (int)(r[gi].checksum == expect), r[gi].checksum, expect);
+      }
+    }
+    double sp2 = r[2].max_compute ? (double)r[1].max_compute / (double)r[2].max_compute : 0.0;
+    double sp4 = r[3].max_compute ? (double)r[1].max_compute / (double)r[3].max_compute : 0.0;
+    printf("lu,result,%ld,%lu,%lu,%lu,%lu,%.3f,%.3f,0x%lx,%d\n",
+        N, r[0].max_compute, r[1].max_compute, r[2].max_compute, r[3].max_compute,
+        sp2, sp4, r[1].checksum, csok);
+    fflush(stdout);
+  }
+  printf("[slottee] lu in-enclave (multi-thread FP) done ok=%d\n", ok_all);
+  return ok_all ? 0 : 1;
+}
+
 static int
 run_slottee_revoke_ipi_test(const char* eapp_file, const char* rt_file,
     const char* ld_file, Keystone::Params params)
@@ -7241,6 +7384,36 @@ run_slottee_paper_eval(const char* eapp_file,
   if (run_slottee_eval_revoke_latency(eapp_file, rt_file, ld_file, params))
     return 1;
   return run_slottee_ticket_demo(eapp_file, rt_file, ld_file, params);
+}
+
+/* B1 生命周期微基准：host 侧精确计时 enclave.init()(create,含 SM 度量哈希) 与
+ * enclave.destroy()(destroy)。计数用 read_cycle_counter（VF2 经 SLOTTEE_BENCH_RDTIME
+ * 走 rdtime@4MHz；QEMU rdcycle）。不依赖 debug-mint。 */
+static const uintptr_t slottee_lifecycle_bench_iters = 12;
+static int
+run_slottee_lifecycle_bench(const char* eapp_file, const char* rt_file,
+    const char* ld_file, Keystone::Params params) {
+  params.setFreeMemSize(8 * 1024 * 1024);
+  params.setUntrustedSize(64 * 1024);
+  printf("lifecycle_bench,iter,create_cycles,destroy_cycles\n");
+  fflush(stdout);
+  for (uintptr_t iter = 0; iter < slottee_lifecycle_bench_iters; iter++) {
+    Keystone::Enclave enclave;
+    uintptr_t t0 = read_cycle_counter();
+    Keystone::Error ret = enclave.init(eapp_file, rt_file, ld_file, params);
+    uintptr_t create_cycles = read_cycle_counter() - t0;
+    if (ret != Keystone::Error::Success) {
+      printf("[FAIL] lifecycle_bench init failed iter %lu ret=%d\n", iter, (int)ret);
+      return 1;
+    }
+    uintptr_t t2 = read_cycle_counter();
+    enclave.destroy();
+    uintptr_t destroy_cycles = read_cycle_counter() - t2;
+    printf("lifecycle_bench,%lu,%lu,%lu\n", iter, create_cycles, destroy_cycles);
+    fflush(stdout);
+  }
+  printf("[slottee] lifecycle_bench iters=%lu ok=1\n", slottee_lifecycle_bench_iters);
+  return 0;
 }
 
 int
@@ -7356,10 +7529,12 @@ main(int argc, char** argv) {
   int enter_slot_preempt_bestvictim = 0;
   int enter_slot_ledger = 0;
   int enter_slot_matmul = 0;
+  int enter_slot_lu = 0;
   int enter_slot_revoke_ipi = 0;
   int slottee_debug_mint_gate = 0;
   int slottee_paper_eval = 0;
   int slottee_ticket_demo = 0;
+  int slottee_lifecycle_bench = 0;
   int slottee_multihart_ticket = 0;
   int slottee_multihart_ticket_max = 0;
   int slottee_edgecall_interference_stress = 0;
@@ -7444,11 +7619,13 @@ main(int argc, char** argv) {
           &enter_slot_preempt_bestvictim, 1},
       {"enter-slot-ledger", no_argument, &enter_slot_ledger, 1},
       {"enter-slot-matmul", no_argument, &enter_slot_matmul, 1},
+      {"enter-slot-lu", no_argument, &enter_slot_lu, 1},
       {"enter-slot-revoke-ipi", no_argument, &enter_slot_revoke_ipi, 1},
       {"slottee-trace-log", no_argument, &slottee_trace_log, 1},
       {"slottee-debug-mint-gate", no_argument, &slottee_debug_mint_gate, 1},
       {"slottee-paper-eval", no_argument, &slottee_paper_eval, 1},
       {"slottee-ticket-demo", no_argument, &slottee_ticket_demo, 1},
+      {"slottee-lifecycle-bench", no_argument, &slottee_lifecycle_bench, 1},
       {"slottee-multihart-ticket", no_argument, &slottee_multihart_ticket, 1},
       {"slottee-multihart-ticket-max", no_argument,
        &slottee_multihart_ticket_max, 1},
@@ -7685,6 +7862,9 @@ main(int argc, char** argv) {
   if (enter_slot_matmul) {
     return run_slottee_matmul_test(eapp_file, rt_file, ld_file, params);
   }
+  if (enter_slot_lu) {
+    return run_slottee_lu_test(eapp_file, rt_file, ld_file, params);
+  }
   if (enter_slot_revoke_ipi) {
     return run_slottee_revoke_ipi_test(eapp_file, rt_file, ld_file, params);
   }
@@ -7705,6 +7885,10 @@ main(int argc, char** argv) {
 
   if (slottee_ticket_demo) {
     return run_slottee_ticket_demo(eapp_file, rt_file, ld_file, params);
+  }
+
+  if (slottee_lifecycle_bench) {
+    return run_slottee_lifecycle_bench(eapp_file, rt_file, ld_file, params);
   }
 
   if (slottee_multihart_ticket) {
@@ -7736,7 +7920,7 @@ main(int argc, char** argv) {
   Keystone::Enclave enclave;
 
   if (self_timing) {
-    asm volatile("rdtime %0" : "=r"(cycles1));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles1));
   }
 
   enclave.init(eapp_file, rt_file, ld_file, params);
@@ -8018,13 +8202,13 @@ main(int argc, char** argv) {
   }
 
   if (self_timing) {
-    asm volatile("rdtime %0" : "=r"(cycles2));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles2));
   }
 
   edge_init(&enclave);
 
   if (self_timing) {
-    asm volatile("rdtime %0" : "=r"(cycles3));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles3));
   }
 
   uintptr_t encl_ret;
@@ -8035,7 +8219,7 @@ main(int argc, char** argv) {
   }
 
   if (self_timing) {
-    asm volatile("rdtime %0" : "=r"(cycles4));
+    asm volatile(SLOTTEE_RDCYCLE_INSN : "=r"(cycles4));
     printf("[keystone-test] Init: %lu cycles\r\n", cycles2 - cycles1);
     printf("[keystone-test] Runtime: %lu cycles\r\n", cycles4 - cycles3);
   }

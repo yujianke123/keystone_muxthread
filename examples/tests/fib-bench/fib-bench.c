@@ -4,10 +4,17 @@
 //------------------------------------------------------------------------------
 #include "app/eapp_utils.h"
 
+/* benchmark 周期读：VF2(U74) rdcycle 触发不可处理中断→rdtime；QEMU/generic→rdcycle。 */
+#ifdef SLOTTEE_BENCH_RDTIME
+#define SLOTTEE_RDCYCLE_INSN "rdtime %0"
+#else
+#define SLOTTEE_RDCYCLE_INSN "rdcycle %0"
+#endif
+
 unsigned long read_cycles(void)
 {
   unsigned long cycles;
-  asm volatile ("rdtime %0" : "=r" (cycles));
+  asm volatile (SLOTTEE_RDCYCLE_INSN : "=r" (cycles));
   return cycles;
 }
 

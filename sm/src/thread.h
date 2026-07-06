@@ -73,10 +73,16 @@ struct thread_state
   uintptr_t prev_mstatus;
   struct csrs prev_csrs;
   struct ctx prev_state;
+  /* FP 上下文: SM 直停(M_SOFT IPI/其它非 RT 中介停出)不经 RT,entry.S 的条件
+   * FP 保存不跑——host 侧 FP 使用会腐蚀 enclave FP(反向同理,须还 host 原样)。
+   * stop/resume 时在 M-mode 交换 f0-f31+fcsr。 */
+  uintptr_t prev_fpr[32];
+  uintptr_t prev_fcsr;
 };
 
 /* swap previous and current thread states */
 void swap_prev_state(struct thread_state* state, struct sbi_trap_regs* regs, int return_on_resume);
+void swap_prev_fp_state(struct thread_state* state);
 void swap_prev_mepc(struct thread_state* state, struct sbi_trap_regs* regs, uintptr_t mepc);
 void swap_prev_mstatus(struct thread_state* state, struct sbi_trap_regs* regs, uintptr_t mstatus);
 void swap_prev_smode_csrs(struct thread_state* thread);

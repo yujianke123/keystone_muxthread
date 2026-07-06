@@ -36,6 +36,46 @@
   STORE t4, 29*REGBYTES(sp)
   STORE t5, 30*REGBYTES(sp)
   STORE t6, 31*REGBYTES(sp)
+  /* FP 上下文条件保存：sstatus.FS!=Off 才存 f0-f31+fcsr（FS=Off 时 fsd 会陷阱）。t0/t1 已在上面GP块保存，可当scratch。 */
+  csrr t0, sstatus
+  srli t1, t0, 13
+  andi t1, t1, 3
+  beqz t1, 881f
+  fsd f0, 35*REGBYTES(sp)
+  fsd f1, 36*REGBYTES(sp)
+  fsd f2, 37*REGBYTES(sp)
+  fsd f3, 38*REGBYTES(sp)
+  fsd f4, 39*REGBYTES(sp)
+  fsd f5, 40*REGBYTES(sp)
+  fsd f6, 41*REGBYTES(sp)
+  fsd f7, 42*REGBYTES(sp)
+  fsd f8, 43*REGBYTES(sp)
+  fsd f9, 44*REGBYTES(sp)
+  fsd f10, 45*REGBYTES(sp)
+  fsd f11, 46*REGBYTES(sp)
+  fsd f12, 47*REGBYTES(sp)
+  fsd f13, 48*REGBYTES(sp)
+  fsd f14, 49*REGBYTES(sp)
+  fsd f15, 50*REGBYTES(sp)
+  fsd f16, 51*REGBYTES(sp)
+  fsd f17, 52*REGBYTES(sp)
+  fsd f18, 53*REGBYTES(sp)
+  fsd f19, 54*REGBYTES(sp)
+  fsd f20, 55*REGBYTES(sp)
+  fsd f21, 56*REGBYTES(sp)
+  fsd f22, 57*REGBYTES(sp)
+  fsd f23, 58*REGBYTES(sp)
+  fsd f24, 59*REGBYTES(sp)
+  fsd f25, 60*REGBYTES(sp)
+  fsd f26, 61*REGBYTES(sp)
+  fsd f27, 62*REGBYTES(sp)
+  fsd f28, 63*REGBYTES(sp)
+  fsd f29, 64*REGBYTES(sp)
+  fsd f30, 65*REGBYTES(sp)
+  fsd f31, 66*REGBYTES(sp)
+  frcsr t1
+  STORE t1, 67*REGBYTES(sp)
+881:
 .endm
 
 .macro CLEAR_ALL_BUT_SP
@@ -74,6 +114,46 @@
 .macro RESTORE_ALL_BUT_SP
 
   // restore context
+  /* FP 上下文条件恢复：按保存的 sstatus.FS 判定。t0/t1 尚未在本宏恢复，可当scratch。 */
+  LOAD t0, 32*REGBYTES(sp)
+  srli t1, t0, 13
+  andi t1, t1, 3
+  beqz t1, 882f
+  LOAD t1, 67*REGBYTES(sp)
+  fscsr t1
+  fld f0, 35*REGBYTES(sp)
+  fld f1, 36*REGBYTES(sp)
+  fld f2, 37*REGBYTES(sp)
+  fld f3, 38*REGBYTES(sp)
+  fld f4, 39*REGBYTES(sp)
+  fld f5, 40*REGBYTES(sp)
+  fld f6, 41*REGBYTES(sp)
+  fld f7, 42*REGBYTES(sp)
+  fld f8, 43*REGBYTES(sp)
+  fld f9, 44*REGBYTES(sp)
+  fld f10, 45*REGBYTES(sp)
+  fld f11, 46*REGBYTES(sp)
+  fld f12, 47*REGBYTES(sp)
+  fld f13, 48*REGBYTES(sp)
+  fld f14, 49*REGBYTES(sp)
+  fld f15, 50*REGBYTES(sp)
+  fld f16, 51*REGBYTES(sp)
+  fld f17, 52*REGBYTES(sp)
+  fld f18, 53*REGBYTES(sp)
+  fld f19, 54*REGBYTES(sp)
+  fld f20, 55*REGBYTES(sp)
+  fld f21, 56*REGBYTES(sp)
+  fld f22, 57*REGBYTES(sp)
+  fld f23, 58*REGBYTES(sp)
+  fld f24, 59*REGBYTES(sp)
+  fld f25, 60*REGBYTES(sp)
+  fld f26, 61*REGBYTES(sp)
+  fld f27, 62*REGBYTES(sp)
+  fld f28, 63*REGBYTES(sp)
+  fld f29, 64*REGBYTES(sp)
+  fld f30, 65*REGBYTES(sp)
+  fld f31, 66*REGBYTES(sp)
+882:
   LOAD ra, 1*REGBYTES(sp)
   LOAD gp, 3*REGBYTES(sp)
   LOAD tp, 4*REGBYTES(sp)
