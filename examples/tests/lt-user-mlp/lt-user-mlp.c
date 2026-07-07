@@ -137,7 +137,7 @@ static void mlp_worker(void* opaque) {
 static void mlp_sched_entry(void* opaque) {
   long g = (long)(uintptr_t)opaque;
   __sync_synchronize();
-  mlp_worker((void*)(uintptr_t)g);
+  mlp_worker((void*)(uintptr_t)(g + 1));   /* worker=切片1..G-1 */
 }
 
 void EAPP_ENTRY eapp_entry() {
@@ -174,8 +174,9 @@ void EAPP_ENTRY eapp_entry() {
     slottee_atomic_store(&ptask_k, -2);
     slottee_atomic_store(&ptask_done, 0);
     __sync_synchronize();
-    if (slottee_lt_spawn_seq(SLOTTEE_MATMUL_FIRST_WORKER_SLOT,
-            (uintptr_t)cfg_groups, mlp_sched_entry) != SBI_ERR_SM_ENCLAVE_SUCCESS)
+    long nw = cfg_groups - 1;   /* driver 兼切片0,spawn G-1 个 worker(切片1..G-1) */
+    if (nw > 0 && slottee_lt_spawn_seq(SLOTTEE_MATMUL_FIRST_WORKER_SLOT,
+            (uintptr_t)nw, mlp_sched_entry) != SBI_ERR_SM_ENCLAVE_SUCCESS)
       slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
     dbg_mark(0x3C0);
     t0 = read_cycles();
@@ -185,10 +186,15 @@ void EAPP_ENTRY eapp_entry() {
         slottee_atomic_store(&ptask_k, r * 3 + layer);
         __sync_synchronize();
         slottee_atomic_fetch_add(&ptask_epoch, 1);
+        {                                        /* driver 计算切片0 */
+          unsigned long ds = read_cycles();
+          mlp_do_layer(layer, cfg_n, 0, cfg_groups);
+          unsigned long de = read_cycles();
+          wdur[0] += de - ds;
+        }
         long dspin = 0;
-        while (slottee_atomic_load(&ptask_done) < cfg_groups) {
-          (void)slottee_lt_host_yield();
-          if (++dspin > BENCH_SPIN_LIMIT) {
+        while (slottee_atomic_load(&ptask_done) < nw) {   /* barrier(AMO) */
+          if (++dspin > 2000000000L) {
             if (!slottee_atomic_load(&dbg_deadlock)) slottee_atomic_store(&dbg_deadlock, 1);
             dbg_done_giveup = slottee_atomic_load(&ptask_done);
             dbg_k_giveup = r * 3 + layer;
@@ -213,9 +219,8 @@ void EAPP_ENTRY eapp_entry() {
     }
     report.checksum = mlp_checksum();
     long cspin = 0;
-    while (slottee_atomic_load(&group_done) < cfg_groups) {
-      (void)slottee_lt_host_yield();
-      if (++cspin > BENCH_SPIN_LIMIT) { if (!slottee_atomic_load(&dbg_deadlock)) slottee_atomic_store(&dbg_deadlock, 3); break; }
+    while (slottee_atomic_load(&group_done) < nw) {
+      if (++cspin > 2000000000L) { if (!slottee_atomic_load(&dbg_deadlock)) slottee_atomic_store(&dbg_deadlock, 3); break; }
     }
     if (slottee_atomic_load(&dbg_deadlock)) {
       report.failures = (uintptr_t)(0x0D00 | slottee_atomic_load(&dbg_deadlock));

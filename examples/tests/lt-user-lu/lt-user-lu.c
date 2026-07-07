@@ -178,7 +178,7 @@ static void lu_sched_entry(void* opaque) {
    */
   __sync_synchronize();
   slottee_atomic_store(&dbg_sched_stage, 1);
-  lu_worker((void*)(uintptr_t)g);             /* 不返回(EAPP_RETURN) */
+  lu_worker((void*)(uintptr_t)(g + 1));       /* worker=切片1..G-1(driver兼切片0),不返回 */
 }
 
 /*
@@ -296,8 +296,12 @@ void EAPP_ENTRY eapp_entry() {
     slottee_atomic_store(&ptask_k, -2);
     slottee_atomic_store(&ptask_done, 0);
     __sync_synchronize();
-    if (slottee_lt_spawn_seq(SLOTTEE_MATMUL_FIRST_WORKER_SLOT,
-            (uintptr_t)cfg_groups, lu_sched_entry) != SBI_ERR_SM_ENCLAVE_SUCCESS)
+    /* 口径整改: driver 兼任切片0(SPLASH 同构)——G=总计算线程,spawn G-1 个 worker,
+     * G 恰用 G 个 hart(无专职 idle driver/无超额订阅);屏障改 driver 在 enclave 内
+     * AMO 等待(消 host_yield 的 ms 级延迟)。G=1=纯 driver(隔离屏障机器开销基线)。 */
+    long nw = cfg_groups - 1;
+    if (nw > 0 && slottee_lt_spawn_seq(SLOTTEE_MATMUL_FIRST_WORKER_SLOT,
+            (uintptr_t)nw, lu_sched_entry) != SBI_ERR_SM_ENCLAVE_SUCCESS)
       slottee_return_with_tp(saved_tp, SLOTTEE_LT_USER_ILLEGAL_MAGIC);
     dbg_mark(0x2A0);                            /* 诊断: driver spawn 完成 */
     t0 = read_cycles();
@@ -308,15 +312,19 @@ void EAPP_ENTRY eapp_entry() {
       __sync_synchronize();                     /* release: 对角块+k 就绪后发布 */
       slottee_atomic_fetch_add(&ptask_epoch, 1);
       if (k == 0) dbg_mark(0x2E0);              /* 诊断: 首个 epoch 已发布 */
+      {                                         /* driver 计算切片0 */
+        unsigned long ds = read_cycles();
+        lu_update_rows(k, LU_BLOCK, cfg_n, 0, cfg_groups);
+        unsigned long de = read_cycles();
+        wdur[0] += de - ds;
+      }
       long dspin = 0;
-      while (slottee_atomic_load(&ptask_done) < cfg_groups) {  /* barrier */
-        (void)slottee_lt_host_yield();
-        if (++dspin > LU_SPIN_LIMIT) {          /* 死锁诊断: driver 屏障放弃 */
+      while (slottee_atomic_load(&ptask_done) < nw) {  /* barrier(enclave 内 AMO) */
+        if (++dspin > 2000000000L) {            /* 死锁诊断: driver 屏障放弃 */
           if (!slottee_atomic_load(&dbg_deadlock)) slottee_atomic_store(&dbg_deadlock, 1);
           dbg_done_giveup = slottee_atomic_load(&ptask_done);
           dbg_k_giveup = k;
           dbg_epoch_giveup = slottee_atomic_load(&ptask_epoch);
-          /* 诊断: 屏障放弃时把 stage/done 直接打到串口 */
           dbg_mark(0xD100 | (unsigned long)slottee_atomic_load(&dbg_worker_stage));
           dbg_mark(0xD200 | (unsigned long)dbg_done_giveup);
           dbg_mark(0xD300 | (unsigned long)slottee_atomic_load(&dbg_worker_entered));
@@ -339,13 +347,11 @@ void EAPP_ENTRY eapp_entry() {
       report.sum_compute += wdur[g];
     }
     report.checksum = lu_checksum(cfg_n);
-    /* 等 scheduler LT 收敛（有界） */
+    /* 等 worker LT 收敛（enclave 内 AMO,有界） */
     long cspin = 0;
-    while (slottee_atomic_load(&group_done) < cfg_groups) {
-      (void)slottee_lt_host_yield();
-      if (++cspin > LU_SPIN_LIMIT) {
+    while (slottee_atomic_load(&group_done) < nw) {
+      if (++cspin > 2000000000L) {
         if (!slottee_atomic_load(&dbg_deadlock)) slottee_atomic_store(&dbg_deadlock, 3);
-        /* 诊断: driver 中继上报 sched-LT 的纯AMO进度(区分 sret未送达 vs ecall死) */
         dbg_mark(0xE100 | (unsigned long)slottee_atomic_load(&dbg_sched_stage));
         dbg_mark(0xE200 | (unsigned long)slottee_atomic_load(&dbg_worker_stage));
         break;
